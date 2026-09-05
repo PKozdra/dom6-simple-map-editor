@@ -669,10 +669,8 @@ impl App {
         self.refresh_selection();
         self.status = if total > 0 && cave {
             format!("Raised {total} grey river pixels to the cave floor; the game carves the rivers there on load")
-        } else if total > 0 {
-            format!("Raised {total} old river pixels; the game carves fresh rivers on load")
         } else {
-            "No old river pixels on this plane".to_owned()
+            "No grey river pixels on this plane".to_owned()
         };
     }
 
@@ -1771,27 +1769,23 @@ impl App {
                 .doc()
                 .map(|d| (d.scar_count(), d.index == 2))
                 .unwrap_or((0, false));
-            ui.horizontal_wrapped(|ui| {
-                if scars > 0 && cave {
-                    ui.label(egui::RichText::new(format!("{scars} grey river pixels")).color(theme::WARN));
-                    if theme::boxed_button(ui, "Repair", true) {
-                        self.repair_scars();
+            if cave {
+                ui.horizontal_wrapped(|ui| {
+                    if scars > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("{scars} grey river pixels"))
+                                .color(theme::WARN),
+                        );
+                        if theme::boxed_button(ui, "Repair", true) {
+                            self.repair_scars();
+                        }
+                    } else {
+                        theme::dim(ui, "No grey river pixels");
                     }
-                } else if scars > 0 {
-                    theme::dim(ui, &format!("{scars} old river pixels"));
-                    if theme::boxed_button(ui, "Redraw rivers", true) {
-                        self.repair_scars();
-                    }
-                } else {
-                    theme::dim(ui, "No old river pixels");
-                }
-            })
-            .response
-            .on_hover_text(if cave {
-                "Rivers saved by the game's editor keep their channel in the height data, and on the cave plane that channel paints as plain rock with no river. Repair raises it to the cave floor; the game then carves a proper river there from the connection when the map loads"
-            } else {
-                "Rivers saved by the game's editor keep their channel in the height data. On the surface the game still shows them, as a slightly sunken river with the province border drawn across it, so nothing is broken here. Redraw rivers raises the old channel so the game carves fresh rivers on load, which then cover the border like a newly generated map"
-            });
+                })
+                .response
+                .on_hover_text("Rivers saved by the game's editor keep their channel in the height data, and on the cave plane that channel paints as plain rock with no river. Repair raises it to the cave floor; the game then carves a proper river there from the connection when the map loads. The surface needs nothing: the game paints an old channel as water anyway");
+            }
         });
     }
 
