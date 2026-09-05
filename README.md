@@ -1,4 +1,4 @@
-# dom6-simple-map-editor
+# Dominions 6 Simple Map Editor
 
 Edits `.d6m` maps for Dominions 6. The game's editor won't touch the height data, so this will have to do.
 
