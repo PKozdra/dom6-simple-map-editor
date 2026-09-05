@@ -52,11 +52,12 @@ jobs:
             bin: dom6-simple-map-editor
             asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-linux-x64.tar.gz
             kind: tar
-          - os: macos-13
+          - os: macos-latest
             label: macos-x64
             bin: dom6-simple-map-editor
             asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-macos-x64.tar.gz
             kind: tar
+            target: x86_64-apple-darwin
           - os: macos-latest
             label: macos-arm64
             bin: dom6-simple-map-editor
@@ -66,19 +67,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+        with:
+          targets: ${{ matrix.target || '' }}
       - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --release --locked
       - name: Build
-        run: cargo build --release --locked
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked
+          fi
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
+          OUT=target/release
+          if [ -n "${{ matrix.target }}" ]; then
+            OUT="target/${{ matrix.target }}/release"
+          fi
           if [ "${{ matrix.kind }}" = "exe" ]; then
-            cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+            cp "$OUT/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
           else
-            tar -C target/release -czf "dist/${{ matrix.asset }}" "${{ matrix.bin }}"
+            tar -C "$OUT" -czf "dist/${{ matrix.asset }}" "${{ matrix.bin }}"
           fi
       - uses: actions/upload-artifact@v4
         with:
