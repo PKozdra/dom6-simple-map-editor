@@ -2,6 +2,8 @@
 
 Edits `.d6m` maps for Dominions 6. The game's editor won't touch the height data, so this will have to do.
 
+![Editor](docs/screenshot.png)
+
 ## Run
 
 Grab the exe from releases. Open a `.d6m` or `.map`, or drop one on the window, or:
