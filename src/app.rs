@@ -1,13 +1,14 @@
 use crate::project::{union, FlagOp, HeightOp, PlaneDoc, Project};
 use crate::render::{Options, Rect};
 use crate::terrain::{self, *};
-use crate::textures::TexSet;
+use crate::textures::{decode_png, TexSet};
 use crate::theme;
 use egui::{Align2, Color32, FontId, Key, PointerButton, Pos2, Sense, StrokeKind, Vec2};
 use std::path::{Path, PathBuf};
 
 const TILE: usize = 1024;
 const PANEL_W: f32 = 340.0;
+const ICON_CELL: f32 = 48.0;
 
 struct TileGrid {
     w: usize,
@@ -242,6 +243,98 @@ const BORDER_KINDS: [(i64, &str); 6] = [
 
 const ROAD: i64 = 8;
 
+const ICONS: [(u16, &[u8]); 12] = [
+    (184, include_bytes!("../assets/icons/184.png")),
+    (185, include_bytes!("../assets/icons/185.png")),
+    (186, include_bytes!("../assets/icons/186.png")),
+    (187, include_bytes!("../assets/icons/187.png")),
+    (188, include_bytes!("../assets/icons/188.png")),
+    (189, include_bytes!("../assets/icons/189.png")),
+    (190, include_bytes!("../assets/icons/190.png")),
+    (228, include_bytes!("../assets/icons/228.png")),
+    (266, include_bytes!("../assets/icons/266.png")),
+    (272, include_bytes!("../assets/icons/272.png")),
+    (276, include_bytes!("../assets/icons/276.png")),
+    (277, include_bytes!("../assets/icons/277.png")),
+];
+
+fn load_icons(ctx: &egui::Context) -> Vec<(u16, egui::TextureHandle)> {
+    ICONS
+        .iter()
+        .filter_map(|(id, bytes)| {
+            let img = decode_png(bytes).ok()?;
+            let (mut x0, mut y0, mut x1, mut y1) = (img.w, img.h, 0usize, 0usize);
+            for y in 0..img.h {
+                for x in 0..img.w {
+                    if img.rgba[(y * img.w + x) * 4 + 3] > 8 {
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x);
+                        y1 = y1.max(y);
+                    }
+                }
+            }
+            if x1 < x0 {
+                return None;
+            }
+            let side = (x1 - x0 + 1).max(y1 - y0 + 1) + 2;
+            let cx = (x0 + x1).div_ceil(2);
+            let cy = (y0 + y1).div_ceil(2);
+            let mut out = vec![0u8; side * side * 4];
+            for y in 0..side {
+                for x in 0..side {
+                    let sx = (cx + x).checked_sub(side / 2);
+                    let sy = (cy + y).checked_sub(side / 2);
+                    if let (Some(sx), Some(sy)) = (sx, sy) {
+                        if sx < img.w && sy < img.h {
+                            let src = (sy * img.w + sx) * 4;
+                            out[(y * side + x) * 4..(y * side + x) * 4 + 4]
+                                .copy_from_slice(&img.rgba[src..src + 4]);
+                        }
+                    }
+                }
+            }
+            let ci = egui::ColorImage::from_rgba_unmultiplied([side, side], &out);
+            Some((
+                *id,
+                ctx.load_texture(format!("icon_{id}"), ci, egui::TextureOptions::LINEAR),
+            ))
+        })
+        .collect()
+}
+
+fn terrain_icons(f: u64) -> Vec<u16> {
+    let mut out = Vec::new();
+    let sea = f & SEA != 0;
+    if sea {
+        out.push(if f & DEEP_SEA != 0 { 190 } else { 189 });
+    }
+    if f & FOREST != 0 {
+        out.push(if sea { 276 } else { 184 });
+    }
+    if f & SWAMP != 0 {
+        out.push(185);
+    }
+    if f & CAVE != 0 {
+        out.push(228);
+    } else if f & MOUNTAIN != 0 {
+        out.push(186);
+    }
+    if f & HIGHLAND != 0 {
+        out.push(if sea { 277 } else { 272 });
+    }
+    if f & WASTE != 0 {
+        out.push(187);
+    }
+    if f & FARM != 0 {
+        out.push(188);
+    }
+    if f & FRESH_WATER != 0 && !sea {
+        out.push(266);
+    }
+    out
+}
+
 fn terrain_label(f: u64) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if f & UNKNOWN != 0 {
@@ -252,8 +345,11 @@ fn terrain_label(f: u64) -> String {
     }
     if f & SEA != 0 {
         parts.push(if f & DEEP_SEA != 0 { "Deep sea" } else { "Sea" });
-        if f & KELP_EXACT == KELP_EXACT {
+        if f & FOREST != 0 {
             parts.push("Kelp");
+        }
+        if f & HIGHLAND != 0 {
+            parts.push("Gorge");
         }
     } else if f & FRESH_WATER != 0 {
         parts.push("Fresh water");
@@ -269,7 +365,8 @@ fn terrain_label(f: u64) -> String {
         (WARMER, "Warmer"),
         (COLDER, "Colder"),
     ] {
-        if f & bit != 0 {
+        let at_sea = f & SEA != 0 && (bit == FOREST || bit == HIGHLAND);
+        if f & bit != 0 && !at_sea {
             parts.push(name);
         }
     }
@@ -360,6 +457,7 @@ pub struct App {
     show_markers: bool,
     show_links: bool,
     show_terrain: bool,
+    icons: Vec<(u16, egui::TextureHandle)>,
     flatten: bool,
     show_names: bool,
     custom: f32,
@@ -403,6 +501,7 @@ impl App {
             show_markers: true,
             show_links: false,
             show_terrain: false,
+            icons: load_icons(&cc.egui_ctx),
             flatten: false,
             show_names: false,
             custom: -20.0,
@@ -1239,7 +1338,7 @@ impl App {
                         if self.show_markers || self.show_terrain {
                             let f = doc.flags.get(id as usize).copied().unwrap_or(0);
                             let gate = doc.gate(id);
-                            let mut tags: Vec<(String, Color32)> = Vec::new();
+                            let mut tags: Vec<(String, Color32, Vec<u16>)> = Vec::new();
                             if self.show_terrain {
                                 let water = f & SEA != 0;
                                 tags.push((
@@ -1249,25 +1348,26 @@ impl App {
                                     } else {
                                         theme::TAG_LAND
                                     },
+                                    Vec::new(),
                                 ));
                             }
                             if self.show_markers && f & GOOD_START != 0 {
-                                tags.push(("Start".to_owned(), theme::TAG_START));
+                                tags.push(("Start".to_owned(), theme::TAG_START, Vec::new()));
                             }
                             if self.show_markers && f & NO_START != 0 {
-                                tags.push(("No start".to_owned(), theme::TAG_NO));
+                                tags.push(("No start".to_owned(), theme::TAG_NO, Vec::new()));
                             }
                             if self.show_markers && f & GOOD_THRONE != 0 {
-                                tags.push(("Throne".to_owned(), theme::TAG_THRONE));
+                                tags.push(("Throne".to_owned(), theme::TAG_THRONE, Vec::new()));
                             }
                             if self.show_markers && f & BAD_THRONE != 0 {
-                                tags.push(("No throne".to_owned(), theme::TAG_NO));
+                                tags.push(("No throne".to_owned(), theme::TAG_NO, Vec::new()));
                             }
                             if self.show_markers && f & MANY_SITES != 0 {
-                                tags.push(("Sites".to_owned(), theme::TAG_SITES));
+                                tags.push(("Sites".to_owned(), theme::TAG_SITES, Vec::new()));
                             }
                             if self.show_markers && gate != 0 {
-                                tags.push((format!("Gate {gate}"), theme::TAG_GATE));
+                                tags.push((format!("Gate {gate}"), theme::TAG_GATE, Vec::new()));
                             }
                             if self.show_markers {
                                 painter.circle(
@@ -1278,19 +1378,56 @@ impl App {
                                 );
                             }
                             let mut y = centre.y + 6.0;
-                            for (text, col) in tags {
+                            for (text, col, icons) in tags {
                                 let galley = painter.layout_no_wrap(
                                     text,
                                     FontId::proportional(badge),
                                     Color32::from_rgb(20, 18, 16),
                                 );
-                                let sz = galley.size() + Vec2::new(8.0, 2.0);
+                                let icon = badge * 1.7;
+                                let icons_w = if icons.is_empty() {
+                                    0.0
+                                } else {
+                                    icons.len() as f32 * (icon + 2.0) + 2.0
+                                };
+                                let text_h = galley.size().y + 2.0;
+                                let h = if icons.is_empty() {
+                                    text_h
+                                } else {
+                                    text_h.max(icon + 2.0)
+                                };
+                                let sz = Vec2::new(galley.size().x + 8.0 + icons_w, h);
                                 let r = egui::Rect::from_center_size(
                                     Pos2::new(centre.x, y + sz.y * 0.5),
                                     sz,
                                 );
                                 painter.rect_filled(r, 3.0, col);
-                                painter.galley(r.min + Vec2::new(4.0, 1.0), galley, Color32::BLACK);
+                                painter.galley(
+                                    r.min + Vec2::new(4.0, (h - galley.size().y) * 0.5),
+                                    galley,
+                                    Color32::BLACK,
+                                );
+                                let mut x = r.max.x - icons_w + 2.0;
+                                for id in icons {
+                                    if let Some((_, tex)) =
+                                        self.icons.iter().find(|(k, _)| *k == id)
+                                    {
+                                        let ir = egui::Rect::from_min_size(
+                                            Pos2::new(x, r.min.y + (h - icon) * 0.5),
+                                            Vec2::splat(icon),
+                                        );
+                                        painter.image(
+                                            tex.id(),
+                                            ir,
+                                            egui::Rect::from_min_max(
+                                                Pos2::ZERO,
+                                                Pos2::new(1.0, 1.0),
+                                            ),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                    x += icon + 2.0;
+                                }
                                 y += sz.y + 2.0;
                             }
                         }
@@ -1470,8 +1607,13 @@ impl App {
                     self.after_edit(res.unwrap_or(false), Some(Rect { x0: 0, y0: 0, x1: -1, y1: -1 }), "Renamed province");
                 }
             });
-            ui.label(terrain::describe(flags));
-            let look = if st.water_share >= 0.999 {
+            let icons = terrain_icons(flags);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    let cols = icons.len().min(3) as f32;
+                    ui.set_width(ui.available_width() - cols * ICON_CELL - 6.0);
+                    ui.label(terrain::describe(flags));
+                    let look = if st.water_share >= 0.999 {
                 "Painted as water".to_owned()
             } else if st.water_share <= 0.001 {
                 "Painted as land".to_owned()
@@ -1492,6 +1634,33 @@ impl App {
             } else {
                 theme::dim(ui, &look);
             }
+                });
+                if !icons.is_empty() {
+                    let cols = icons.len().min(3);
+                    let rows = icons.len().div_ceil(cols);
+                    ui.add_space(2.0);
+                    let (rect, _) = ui.allocate_exact_size(
+                        Vec2::new(cols as f32 * ICON_CELL, rows as f32 * ICON_CELL),
+                        Sense::hover(),
+                    );
+                    for (n, id) in icons.into_iter().enumerate() {
+                        if let Some((_, tex)) = self.icons.iter().find(|(k, _)| *k == id) {
+                            let cx = rect.min.x + (n % cols) as f32 * ICON_CELL;
+                            let cy = rect.min.y + (n / cols) as f32 * ICON_CELL;
+                            let ir = egui::Rect::from_min_size(
+                                Pos2::new(cx + 2.0, cy + 2.0),
+                                Vec2::splat(ICON_CELL - 4.0),
+                            );
+                            ui.painter().image(
+                                tex.id(),
+                                ir,
+                                egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+            });
 
             theme::section(ui, "Make it look like");
             ui.horizontal(|ui| {

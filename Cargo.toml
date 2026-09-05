@@ -33,3 +33,6 @@ opt-level = 3
 inherits = "release"
 strip = false
 debug = 1
+
+[build-dependencies]
+winresource = "0.1.31"
