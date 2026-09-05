@@ -212,6 +212,41 @@ fn main() {
             "no start {}",
             doc.set_no_starts(3.0, 0.5, &tex, &opts)
         ));
+        let np = doc.add_province(cx as i32 + 120, cy as i32 + 80, 12, &tex, &opts);
+        log.push(format!("new province {np:?}"));
+        if let Some(np) = np {
+            doc.paint_begin("Paint area");
+            for k in 0..8 {
+                doc.paint(np, cx as i32 + 120 + k * 6, cy as i32 + 80, 14, &tex, &opts);
+            }
+            doc.paint_end(&tex, &opts);
+            log.push(format!(
+                "new province pixels {}",
+                doc.pixel_counts[np as usize]
+            ));
+            log.push(format!(
+                "centre capital {}",
+                doc.centre_capital(np, &tex, &opts)
+            ));
+            log.push(format!("capital inside {}", doc.capital_inside(np)));
+            log.push(format!(
+                "link new {}",
+                doc.set_link(np, l0, true, &tex, &opts)
+            ));
+            log.push(format!(
+                "name new {}",
+                doc.set_name(np, "Added", &tex, &opts)
+            ));
+        }
+        log.push(format!(
+            "remove province 7: {}",
+            doc.remove_province(7, &tex, &opts)
+        ));
+        log.push(format!(
+            "provinces now {}, empty {:?}",
+            doc.province_count(),
+            doc.empty_provinces()
+        ));
         log.push(format!("undo {:?}", doc.undo_last(&tex, &opts)));
         log.push(format!("redo {:?}", doc.redo_last(&tex, &opts)));
     }
@@ -262,6 +297,11 @@ fn main() {
         assert_eq!(a.flags, b.flags, "flags differ on plane {}", a.index);
         assert_eq!(a.names, b.names, "names differ on plane {}", a.index);
         assert_eq!(a.gates, b.gates, "gates differ on plane {}", a.index);
+        assert_eq!(
+            a.capitals, b.capitals,
+            "capitals differ on plane {}",
+            a.index
+        );
         for p in 1..=a.province_count() as u32 {
             assert_eq!(
                 a.neighbours(p),

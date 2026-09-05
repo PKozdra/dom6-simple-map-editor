@@ -302,6 +302,83 @@ impl MapFile {
         }
     }
 
+    pub fn renumber(&mut self, map: impl Fn(u32) -> u32) {
+        const FIRST: [&str; 16] = [
+            "#terrain",
+            "#landname",
+            "#gate",
+            "#start",
+            "#nostart",
+            "#setland",
+            "#poptype",
+            "#population",
+            "#owner",
+            "#defence",
+            "#killfeatures",
+            "#feature",
+            "#fortress",
+            "#temple",
+            "#lab",
+            "#knownfeature",
+        ];
+        for line in &mut self.lines {
+            let Some((cmd, rest)) = command_of(line) else {
+                continue;
+            };
+            let slots: usize = if FIRST.contains(&cmd) {
+                1
+            } else if cmd == "#neighbour" || cmd == "#neighbourspec" {
+                2
+            } else if cmd == "#specstart" {
+                3
+            } else {
+                continue;
+            };
+            let mut parts: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+            let range = if slots == 3 { 1..2 } else { 0..slots };
+            let mut changed = false;
+            for i in range {
+                if let Some(v) = parts.get(i).and_then(|t| t.parse::<u32>().ok()) {
+                    let nv = map(v);
+                    if nv != v {
+                        parts[i] = nv.to_string();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                *line = format!("{cmd} {}", parts.join(" "));
+            }
+        }
+        let text = self.to_text();
+        let pb = self.pb_count;
+        *self = MapFile::parse(&text, &self.path);
+        self.pb_count = pb;
+        self.modified = true;
+    }
+
+    pub fn remove_province(&mut self, p: u32) {
+        self.terrain.remove(&p);
+        self.names.remove(&p);
+        self.gates.remove(&p);
+        self.neighbours.retain(|&(a, b)| a != p && b != p);
+        self.specs.retain(|&(a, b), _| a != p && b != p);
+        let ps = p.to_string();
+        self.remove_where(|c, r| {
+            let mut it = r.split_whitespace();
+            let first = it.next();
+            let second = it.next();
+            match c {
+                "#terrain" | "#landname" | "#gate" => first == Some(ps.as_str()),
+                "#neighbour" | "#neighbourspec" => {
+                    first == Some(ps.as_str()) || second == Some(ps.as_str())
+                }
+                _ => false,
+            }
+        });
+        self.modified = true;
+    }
+
     pub fn set_neighbour(&mut self, a: u32, b: u32, present: bool) {
         let (a, b) = pair(a, b);
         if a == b || self.are_neighbours(a, b) == present {

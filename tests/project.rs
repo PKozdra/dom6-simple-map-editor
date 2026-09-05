@@ -380,3 +380,128 @@ fn no_start_setter_counts_crossings_fractionally() {
         dom6_simple_map_editor::terrain::NO_START
     )));
 }
+
+#[test]
+fn provinces_can_be_added_and_capitals_moved() {
+    let dir = temp_dir("addprov");
+    let (p1, map_path) = make_map(&dir, "addprov", 1, true);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    assert_eq!(doc.province_count(), 2);
+    assert!(doc.capital_inside(1));
+    let p = doc.add_province(10, 6, 2, &t, &opts).unwrap();
+    assert_eq!(p, 3);
+    assert_eq!(doc.province_count(), 3);
+    assert_eq!(doc.owner_at(10, 6), 3);
+    assert!(doc.capital_inside(3));
+    assert_eq!(doc.capital(3), Some((10, 6)));
+    assert!(doc.pixel_counts[3] > 1);
+    assert!(doc.set_flags(
+        3,
+        dom6_simple_map_editor::terrain::FOREST,
+        "Terrain",
+        &t,
+        &opts
+    ));
+    assert!(doc.set_name(3, "Newland", &t, &opts));
+    assert!(doc.set_link(3, 1, true, &t, &opts));
+    assert!(!doc.set_capital(3, 0, 0, &t, &opts));
+    assert!(doc.set_capital(3, 11, 6, &t, &opts));
+    assert_eq!(doc.capital(3), Some((11, 6)));
+    assert!(doc.centre_capital(3, &t, &opts));
+    assert_eq!(doc.capital(3), Some((10, 6)));
+    for _ in 0..6 {
+        assert!(doc.undo_last(&t, &opts).is_some());
+    }
+    assert_eq!(doc.province_count(), 2);
+    assert_eq!(doc.owner_at(10, 6), 2);
+    assert!(doc.neighbours(1).iter().all(|&n| n != 3));
+    assert_eq!(doc.flags.len(), 3);
+    for _ in 0..6 {
+        assert!(doc.redo_last(&t, &opts).is_some());
+    }
+    assert_eq!(doc.province_count(), 3);
+    assert_eq!(doc.name(3), "Newland");
+    assert!(doc.linked(1, 3));
+    let files = doc.save().unwrap();
+    assert_eq!(files.len(), 2);
+    let text = std::fs::read_to_string(&map_path).unwrap();
+    assert!(text.contains(&format!(
+        "#terrain 3 {}",
+        dom6_simple_map_editor::terrain::FOREST
+    )));
+    assert!(text.contains("#landname 3 \"Newland\""));
+    assert!(text.contains("#neighbour 1 3"));
+    let again = Project::open(&p1, &t, &opts).unwrap();
+    let d = &again.planes[0];
+    assert_eq!(d.province_count(), 3);
+    assert_eq!(d.capital(3), Some((10, 6)));
+    assert_eq!(d.owner_at(10, 6), 3);
+}
+
+#[test]
+fn saving_refuses_an_empty_province() {
+    let dir = temp_dir("emptyprov");
+    let (p1, _) = make_map(&dir, "emptyprov", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    let p = doc.add_province(5, 5, 1, &t, &opts).unwrap();
+    doc.paint_begin("Paint area");
+    assert!(doc.paint(1, 5, 5, 3, &t, &opts).is_some());
+    doc.paint_end(&t, &opts);
+    assert_eq!(doc.pixel_counts[p as usize], 0);
+    assert!(doc.save().is_err());
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert!(doc.save().is_ok());
+}
+
+#[test]
+fn removing_a_province_fills_and_renumbers() {
+    let dir = temp_dir("rmprov");
+    let (p1, map_path) = make_map(&dir, "rmprov", 1, true);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    let p = doc.add_province(10, 6, 2, &t, &opts).unwrap();
+    assert_eq!(p, 3);
+    assert!(doc.set_name(3, "Gone", &t, &opts));
+    assert!(doc.set_link(3, 1, true, &t, &opts));
+    assert!(doc.set_spec(3, 1, BORDER_RIVER as i64, &t, &opts));
+    let before = doc.d6m.owners.clone();
+    assert!(doc.remove_province(3, &t, &opts));
+    assert_eq!(doc.province_count(), 2);
+    assert!(doc.d6m.owners.iter().all(|&o| o == 1 || o == 2));
+    assert_eq!(doc.owner_at(8, 6), 1);
+    assert_eq!(doc.owner_at(12, 6), 2);
+    assert!(doc.neighbours(1).iter().all(|&n| n != 3));
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert_eq!(doc.province_count(), 3);
+    assert_eq!(doc.d6m.owners, before);
+    assert_eq!(doc.name(3), "Gone");
+    assert!(doc.linked(1, 3));
+    assert_eq!(doc.spec(1, 3), BORDER_RIVER as i64);
+    assert!(doc.redo_last(&t, &opts).is_some());
+    assert!(doc.set_name(2, "Second", &t, &opts));
+    assert!(doc.remove_province(1, &t, &opts));
+    assert_eq!(doc.province_count(), 1);
+    assert!(doc.d6m.owners.iter().all(|&o| o == 1));
+    assert_eq!(doc.name(1), "Second");
+    assert_eq!(doc.flags[1] & SEA, SEA);
+    assert!(doc.save().is_ok());
+    let text = std::fs::read_to_string(&map_path).unwrap();
+    assert!(text.contains("#terrain 1 4"));
+    assert!(text.contains("#landname 1 \"Second\""));
+    assert!(!text.contains("#terrain 2 "));
+    assert!(!text.contains("#neighbour"));
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert_eq!(doc.province_count(), 2);
+    assert_eq!(doc.name(2), "Second");
+    assert_eq!(doc.owner_at(2, 2), 1);
+    assert!(!doc.remove_province(9, &t, &opts));
+}

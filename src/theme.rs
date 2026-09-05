@@ -14,6 +14,7 @@ pub const INK_HOT: Color32 = Color32::from_rgb(255, 246, 210);
 pub const INK_ACTIVE: Color32 = Color32::from_rgb(255, 214, 120);
 pub const BRASS: Color32 = Color32::from_rgb(205, 178, 112);
 pub const NAME_RED: Color32 = Color32::from_rgb(112, 22, 12);
+pub const NUMBER_BLUE: Color32 = Color32::from_rgb(20, 40, 110);
 pub const SELECT_EDGE: [u8; 3] = [255, 226, 70];
 pub const SELECT_FILL: [u8; 3] = [255, 220, 90];
 pub const WARN: Color32 = Color32::from_rgb(236, 160, 96);

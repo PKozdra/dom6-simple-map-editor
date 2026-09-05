@@ -457,6 +457,9 @@ pub struct App {
     show_markers: bool,
     show_links: bool,
     show_terrain: bool,
+    placing_capital: bool,
+    goto: u32,
+    placing_new: bool,
     icons: Vec<(u16, egui::TextureHandle)>,
     flatten: bool,
     show_names: bool,
@@ -501,6 +504,9 @@ impl App {
             show_markers: true,
             show_links: false,
             show_terrain: false,
+            placing_capital: false,
+            goto: 1,
+            placing_new: false,
             icons: load_icons(&cc.egui_ctx),
             flatten: false,
             show_names: false,
@@ -904,6 +910,10 @@ impl App {
         if esc {
             if self.show_help {
                 self.show_help = false;
+            } else if self.placing_capital || self.placing_new {
+                self.placing_capital = false;
+                self.placing_new = false;
+                self.status = "Cancelled".to_owned();
             } else if self.tool != Tool::Select {
                 self.tool = Tool::Select;
             } else {
@@ -949,6 +959,92 @@ impl App {
                 d.height(),
                 d.province_count()
             );
+        }
+    }
+
+    fn capital_near(&self, canvas: egui::Rect, pos: Pos2) -> Option<u32> {
+        let doc = self.doc()?;
+        let h = doc.height();
+        let mut best = None;
+        let mut best_d = 8.0_f32 * 8.0;
+        for (i, &(cx, cy)) in doc.capitals.iter().enumerate() {
+            let c = self.map_to_screen(canvas, cx as f32 + 0.5, (h - 1 - cy as i32) as f32 + 0.5);
+            let d = c.distance_sq(pos);
+            if d < best_d {
+                best_d = d;
+                best = Some(i as u32 + 1);
+            }
+        }
+        best
+    }
+
+    fn remove_province(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        let res = self.with_doc(|d, tex, opts| d.remove_province(sel, tex, opts));
+        if res == Some(true) {
+            self.select(None);
+            self.after_edit(true, None, &format!("Removed province {sel}; its area went to the neighbours and later provinces moved down by one"));
+        } else {
+            self.status = "The last province cannot be removed".to_owned();
+        }
+    }
+
+    fn place_capital(&mut self, x: i32, y: i32) {
+        self.placing_capital = false;
+        let Some(sel) = self.selected else {
+            return;
+        };
+        let under = self.doc().map(|d| d.owner_at(x, y)).unwrap_or(0);
+        if under != sel {
+            self.status = if under == 0 {
+                format!(
+                    "That pixel belongs to no province; the capital of {sel} must lie inside it"
+                )
+            } else {
+                format!("That pixel belongs to province {under}; the capital of {sel} must lie inside it")
+            };
+            return;
+        }
+        let res =
+            self.with_doc(|d, tex, opts| (d.set_capital(sel, x, y, tex, opts), d.rendered.touched));
+        if let Some((ok, rect)) = res {
+            self.after_edit(
+                ok,
+                Some(rect),
+                &format!("Moved the capital of {sel} to {x}, {y}"),
+            );
+        }
+    }
+
+    fn centre_capital(&mut self) {
+        let Some(sel) = self.selected else {
+            return;
+        };
+        let res =
+            self.with_doc(|d, tex, opts| (d.centre_capital(sel, tex, opts), d.rendered.touched));
+        if let Some((ok, rect)) = res {
+            self.after_edit(ok, Some(rect), &format!("Centred the capital of {sel}"));
+        }
+    }
+
+    fn place_new_province(&mut self, x: i32, y: i32) {
+        self.placing_new = false;
+        let r = self.brush;
+        let res = self
+            .with_doc(|d, tex, opts| d.add_province(x, y, r, tex, opts))
+            .flatten();
+        match res {
+            Some(p) => {
+                self.mark_tiles(None);
+                self.select(Some(p));
+                self.tool = Tool::Paint;
+                self.paint_empty = false;
+                self.status =
+                    format!("Province {p} added with its capital at {x}, {y}; paint its area now");
+            }
+            None => self.status = "Could not add a province there".to_owned(),
         }
     }
 
@@ -1145,14 +1241,28 @@ impl App {
                     }
                     let (x, y) = self.screen_to_map(canvas, pos);
                     self.hover = self.doc().map(|d| d.owner_at(x, y)).filter(|&p| p > 0);
-                    if !paint_tool && resp.clicked_by(PointerButton::Primary) {
-                        if let Some(p) = self.hover {
+                    let placing = self.placing_capital || self.placing_new;
+                    if placing && resp.clicked_by(PointerButton::Primary) {
+                        if self.placing_new {
+                            self.place_new_province(x, y);
+                        } else {
+                            self.place_capital(x, y);
+                        }
+                    } else if !paint_tool && resp.clicked_by(PointerButton::Primary) {
+                        let dot = if self.tool == Tool::Select {
+                            self.capital_near(canvas, pos)
+                        } else {
+                            None
+                        };
+                        if let Some(p) = dot {
+                            self.select(Some(p));
+                        } else if let Some(p) = self.hover {
                             self.canvas_click(p, x, y);
                         } else if self.tool == Tool::Select {
                             self.select(None);
                         }
                     }
-                    if paint_tool && !ctrl {
+                    if paint_tool && !ctrl && !placing {
                         let (primary, secondary) =
                             ctx.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
                         let button = if primary {
@@ -1317,23 +1427,30 @@ impl App {
                         }
                         if self.show_names {
                             let name = doc.name(id);
-                            let text = if name.is_empty() {
-                                format!("{id}")
-                            } else {
-                                name.to_owned()
+                            let mut p = centre - Vec2::new(0.0, 8.0);
+                            let outlined = |p: Pos2, text: &str, font: FontId, col: Color32| {
+                                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                                    painter.text(
+                                        p + Vec2::new(dx, dy),
+                                        Align2::CENTER_BOTTOM,
+                                        text,
+                                        font.clone(),
+                                        halo,
+                                    );
+                                }
+                                painter.text(p, Align2::CENTER_BOTTOM, text, font, col)
                             };
-                            let p = centre - Vec2::new(0.0, 8.0);
-                            let font = FontId::proportional(size);
-                            for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                                painter.text(
-                                    p + Vec2::new(dx, dy),
-                                    Align2::CENTER_BOTTOM,
-                                    &text,
-                                    font.clone(),
-                                    halo,
-                                );
+                            if !name.is_empty() {
+                                let r =
+                                    outlined(p, name, FontId::proportional(size), theme::NAME_RED);
+                                p.y -= r.height() - 2.0;
                             }
-                            painter.text(p, Align2::CENTER_BOTTOM, &text, font, theme::NAME_RED);
+                            outlined(
+                                p,
+                                &format!("{id}"),
+                                FontId::proportional(size * 0.85),
+                                theme::NUMBER_BLUE,
+                            );
                         }
                         if self.show_markers || self.show_terrain {
                             let f = doc.flags.get(id as usize).copied().unwrap_or(0);
@@ -1661,6 +1778,26 @@ impl App {
                     }
                 }
             });
+            let inside = self.doc().map(|d| d.capital_inside(prov)).unwrap_or(true);
+            ui.horizontal_wrapped(|ui| {
+                if !inside {
+                    ui.label(egui::RichText::new("Capital outside the province").color(theme::WARN)).on_hover_text("The game places the province's flag, armies and name at the capital pixel, so it should lie inside the province's own area");
+                }
+                if theme::boxed_button_hint(ui, if self.placing_capital { "Click the map..." } else { "Move capital" }, !self.placing_capital, "Click a pixel inside this province to make it the capital: where the game puts the flag, the armies and the name. Escape cancels") {
+                    self.placing_capital = true;
+                    self.placing_new = false;
+                    if matches!(self.tool, Tool::Paint | Tool::Height) {
+                        self.tool = Tool::Select;
+                    }
+                    self.status = format!("Click inside province {prov} to place its capital");
+                }
+                if theme::boxed_button_hint(ui, "Centre", true, "Moves the capital to the province's own pixel nearest the middle of its area") {
+                    self.centre_capital();
+                }
+                if theme::boxed_button_hint(ui, "Remove", true, "Removes this province the way the game's editor does: its area goes to the neighbouring provinces pixel by pixel, nearest first, and every later province moves down one number, with names, gates and connections following. One undo step") {
+                    self.remove_province();
+                }
+            });
 
             theme::section(ui, "Make it look like");
             ui.horizontal(|ui| {
@@ -1881,7 +2018,17 @@ impl App {
             .on_hover_text("Tab cycles the tools; P or H pressed again goes back to Select");
             match self.tool {
                 Tool::Select => {
-                    theme::dim(ui, "Click a province to select it (S)");
+                    theme::dim(ui, "Click a province or its capital dot to select it (S)");
+                    ui.horizontal(|ui| {
+                        theme::dim(ui, "Number");
+                        let n = self.doc().map(|d| d.province_count() as u32).unwrap_or(1).max(1);
+                        ui.add(egui::DragValue::new(&mut self.goto).range(1..=n).speed(0.2));
+                        if theme::boxed_button_hint(ui, "Go", self.project.is_some(), "Selects the province with this number even when it has no area left to click") {
+                            let g = self.goto.min(n);
+                            self.select(Some(g));
+                            self.status = format!("Selected province {g}");
+                        }
+                    });
                 }
                 Tool::Link => {
                     theme::dim(
@@ -1909,6 +2056,11 @@ impl App {
                         ui.add(egui::Slider::new(&mut self.brush, 1..=60).suffix(" px"));
                     });
                     theme::check(ui, &mut self.paint_empty, "Paint no province").on_hover_text("The left button takes pixels away from every province instead of giving them to the selected one; the right button still restores what was there when the map was opened");
+                    if theme::boxed_button_hint(ui, if self.placing_new { "Click the map..." } else { "New province" }, self.project.is_some() && !self.placing_new, "Adds a province numbered after the last one. Click where its capital should be; a disc of the brush size around that point becomes its first area, and it takes the sea or cave marks of the province it was cut from. Then paint the rest of it. Escape cancels") {
+                        self.placing_new = true;
+                        self.placing_capital = false;
+                        self.status = "Click on the map where the new province's capital should be".to_owned();
+                    }
                     theme::dim(
                         ui,
                         "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans (P)",
@@ -1933,6 +2085,20 @@ impl App {
             });
             if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start, the way the Random Map NoStart setter does. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
                 self.set_no_starts();
+            }
+            let empty = self.doc().map(|d| d.empty_provinces()).unwrap_or_default();
+            if !empty.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("No area:").color(theme::WARN)).on_hover_text("These provinces have no pixels left. Paint some, remove them, or undo; the map cannot be saved like this");
+                    for p in empty.iter().take(12) {
+                        if theme::text_button(ui, &p.to_string(), true) {
+                            self.select(Some(*p));
+                        }
+                    }
+                    if empty.len() > 12 {
+                        theme::dim(ui, &format!("and {} more", empty.len() - 12));
+                    }
+                });
             }
             let (scars, cave) = self
                 .doc()
@@ -1968,15 +2134,14 @@ impl App {
                 .spacing([16.0, 2.0])
                 .show(ui, |ui| {
                     changed |= theme::check(ui, &mut self.opts.borders, "Borders").clicked();
-                    changed |= theme::check(ui, &mut self.opts.rivers, "Rivers").clicked();
-                    ui.end_row();
                     changed |= theme::check(ui, &mut self.opts.edge_fade, "Dark edges").clicked();
+                    ui.end_row();
                     changed |= theme::check(ui, &mut self.opts.decor, "Trees and rocks").on_hover_text("Forests, mountains, huts, sites and other sprites the game scatters over a map. The game places them at random on every load, so they never match exactly").clicked();
-                    ui.end_row();
                     theme::check(ui, &mut self.show_names, "Names").on_hover_text("Province names, or the number where a province has no name");
-                    theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate");
                     ui.end_row();
+                    theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate");
                     theme::check(ui, &mut self.show_links, "Connections").on_hover_text("Every connection on the plane as a line between capitals: yellow normal, blue river, orange mountain pass, red impassable. The Link tool always shows the selected province's own");
+                    ui.end_row();
                     theme::check(ui, &mut self.show_terrain, "Terrain").on_hover_text("The terrain marks of every province in words at its capital, so a province painted as water can be told from one the game treats as sea");
                     ui.end_row();
                 });

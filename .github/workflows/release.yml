@@ -14,11 +14,12 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Resolve version
         id: ver
         shell: bash
@@ -35,38 +36,98 @@ jobs:
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            bin: dom6-simple-map-editor.exe
+            asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-windows-x64.exe
+            kind: exe
+          - os: ubuntu-22.04
+            label: linux-x64
+            bin: dom6-simple-map-editor
+            asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-linux-x64.tar.gz
+            kind: tar
+          - os: macos-13
+            label: macos-x64
+            bin: dom6-simple-map-editor
+            asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-macos-x64.tar.gz
+            kind: tar
+          - os: macos-latest
+            label: macos-arm64
+            bin: dom6-simple-map-editor
+            asset: dom6-simple-map-editor-v${{ needs.version.outputs.version }}-macos-arm64.tar.gz
+            kind: tar
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
-
       - uses: Swatinem/rust-cache@v2
-
       - name: Test
         run: cargo test --release --locked
-
       - name: Build
         run: cargo build --release --locked
-
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/dom6-simple-map-editor.exe "dist/dom6-simple-map-editor-v${{ steps.ver.outputs.version }}-windows-x64.exe"
-          cd dist && sha256sum *.exe > SHA256SUMS.txt
+          if [ "${{ matrix.kind }}" = "exe" ]; then
+            cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          else
+            tar -C target/release -czf "dist/${{ matrix.asset }}" "${{ matrix.bin }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: dist/*
 
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        shell: bash
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Tag (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${{ steps.ver.outputs.version }}" -m "v${{ steps.ver.outputs.version }}"
-          git push origin "v${{ steps.ver.outputs.version }}"
+          git tag -a "v${{ needs.version.outputs.version }}" -m "v${{ needs.version.outputs.version }}"
+          git push origin "v${{ needs.version.outputs.version }}"
+      - name: Release notes header
+        shell: bash
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          cat > notes.md <<EOF
+          ## Which file to download
 
+          | You use | Download | Then |
+          |---|---|---|
+          | Windows | \`dom6-simple-map-editor-v$V-windows-x64.exe\` | Run it. SmartScreen may ask once; choose More info, Run anyway. |
+          | Linux | \`dom6-simple-map-editor-v$V-linux-x64.tar.gz\` | \`tar xzf\` it, then \`./dom6-simple-map-editor\`. Needs a desktop session with OpenGL. |
+          | Mac, Apple silicon | \`dom6-simple-map-editor-v$V-macos-arm64.tar.gz\` | \`tar xzf\` it, then \`xattr -d com.apple.quarantine dom6-simple-map-editor\` once, then run it. |
+          | Mac, Intel | \`dom6-simple-map-editor-v$V-macos-x64.tar.gz\` | Same as above. |
+
+          The binaries are not signed. \`SHA256SUMS.txt\` lists the checksums.
+
+          EOF
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          name: v${{ steps.ver.outputs.version }}
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
+          body_path: notes.md
           generate_release_notes: true
           files: |
-            dist/*.exe
-            dist/SHA256SUMS.txt
+            dist/*

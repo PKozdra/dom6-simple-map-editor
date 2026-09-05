@@ -52,6 +52,28 @@ pub enum MapChange {
         old: i64,
         new: i64,
     },
+    Capital {
+        p: u32,
+        old: (i16, i16),
+        new: (i16, i16),
+    },
+    AddProvince {
+        p: u32,
+        x: i16,
+        y: i16,
+        terrain: u64,
+    },
+    RemoveProvince {
+        p: u32,
+        x: i16,
+        y: i16,
+        terrain: u64,
+        name: String,
+        gate: i32,
+        links: Vec<(u32, i64)>,
+        pixels: Vec<(u32, i16)>,
+        baseline: Vec<u32>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +122,16 @@ pub struct PlaneDoc {
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
     stroke: Option<Edit>,
+}
+
+fn count_pixels(owners: &[i16], n: usize) -> Vec<u32> {
+    let mut counts = vec![0u32; n + 1];
+    for &o in owners {
+        if o > 0 && (o as usize) <= n {
+            counts[o as usize] += 1;
+        }
+    }
+    counts
 }
 
 pub fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
@@ -280,6 +312,372 @@ impl PlaneDoc {
 
     pub fn spec(&self, a: u32, b: u32) -> i64 {
         self.map.as_ref().map(|m| m.spec_between(a, b)).unwrap_or(0)
+    }
+
+    pub fn capital(&self, prov: u32) -> Option<(i32, i32)> {
+        self.capitals
+            .get(prov as usize - 1)
+            .map(|&(x, y)| (x as i32, y as i32))
+    }
+
+    pub fn capital_inside(&self, prov: u32) -> bool {
+        self.capital(prov)
+            .map(|(x, y)| self.owner_at(x, y) == prov)
+            .unwrap_or(false)
+    }
+
+    pub fn area_centre(&self, prov: u32) -> Option<(i32, i32)> {
+        let r = self.bbox(prov)?;
+        let w = self.d6m.width;
+        let (mut sx, mut sy, mut n) = (0i64, 0i64, 0i64);
+        for y in r.y0..=r.y1 {
+            for x in r.x0..=r.x1 {
+                if self.d6m.owners[(y * w + x) as usize] as u32 == prov {
+                    sx += x as i64;
+                    sy += y as i64;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            return None;
+        }
+        let (cx, cy) = ((sx / n) as i32, (sy / n) as i32);
+        let mut best = None;
+        let mut best_d = i64::MAX;
+        for y in r.y0..=r.y1 {
+            for x in r.x0..=r.x1 {
+                if self.d6m.owners[(y * w + x) as usize] as u32 != prov {
+                    continue;
+                }
+                let d = ((x - cx) as i64).pow(2) + ((y - cy) as i64).pow(2);
+                if d < best_d {
+                    best_d = d;
+                    best = Some((x, y));
+                }
+            }
+        }
+        best
+    }
+
+    pub fn set_capital(&mut self, prov: u32, x: i32, y: i32, tex: &TexSet, opts: &Options) -> bool {
+        let Some(old) = self.capitals.get(prov as usize - 1).copied() else {
+            return false;
+        };
+        if self.owner_at(x, y) != prov {
+            return false;
+        }
+        let new = (x as i16, y as i16);
+        if new == old {
+            return false;
+        }
+        let around = |(px, py): (i16, i16)| Rect {
+            x0: px as i32 - 2,
+            y0: py as i32 - 2,
+            x1: px as i32 + 2,
+            y1: py as i32 + 2,
+        };
+        let edit = Edit {
+            label: "Move capital".to_string(),
+            map: vec![MapChange::Capital { p: prov, old, new }],
+            rect: Some(
+                around(old)
+                    .union(around(new))
+                    .clamp_to(self.d6m.width, self.d6m.height),
+            ),
+            ..Default::default()
+        };
+        self.push(edit, tex, opts)
+    }
+
+    pub fn centre_capital(&mut self, prov: u32, tex: &TexSet, opts: &Options) -> bool {
+        match self.area_centre(prov) {
+            Some((x, y)) => self.set_capital(prov, x, y, tex, opts),
+            None => false,
+        }
+    }
+
+    pub fn add_province(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<u32> {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        if cx < 0 || cy < 0 || cx >= w || cy >= h || self.d6m.provinces.len() >= 32000 {
+            return None;
+        }
+        let p = self.d6m.provinces.len() as u32 + 1;
+        let under = self.owner_at(cx, cy);
+        let inherit = SEA
+            | terrain::DEEP_SEA
+            | terrain::CAVE
+            | terrain::CAVE_LOOK
+            | terrain::WARMER
+            | terrain::COLDER;
+        let terrain = self.flags.get(under as usize).copied().unwrap_or(0) & inherit;
+        let mut owners = Vec::new();
+        let r = radius.max(1);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let (x, y) = (cx + dx, cy + dy);
+                if x < 0 || y < 0 || x >= w || y >= h {
+                    continue;
+                }
+                let i = (y * w + x) as usize;
+                owners.push((i as u32, self.d6m.owners[i], p as i16));
+            }
+        }
+        let rect = Rect {
+            x0: (cx - r).max(0),
+            y0: (cy - r).max(0),
+            x1: (cx + r).min(w - 1),
+            y1: (cy + r).min(h - 1),
+        };
+        let edit = Edit {
+            label: format!("New province {p}"),
+            owners,
+            map: vec![MapChange::AddProvince {
+                p,
+                x: cx as i16,
+                y: cy as i16,
+                terrain,
+            }],
+            rect: Some(rect),
+            ..Default::default()
+        };
+        if self.push(edit, tex, opts) {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    pub fn remove_province(&mut self, p: u32, tex: &TexSet, opts: &Options) -> bool {
+        let n = self.d6m.provinces.len() as u32;
+        if p == 0 || p > n || n < 2 {
+            return false;
+        }
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let owners = &self.d6m.owners;
+        let mut fill: Vec<i16> = Vec::new();
+        let mut idx: Vec<usize> = Vec::new();
+        let mut pos: Vec<usize> = vec![usize::MAX; owners.len()];
+        for (i, &o) in owners.iter().enumerate() {
+            if o as u32 == p {
+                pos[i] = idx.len();
+                idx.push(i);
+                fill.push(0);
+            }
+        }
+        let mut queue = std::collections::VecDeque::new();
+        let near = |i: usize| -> [Option<usize>; 4] {
+            let x = (i as i32) % w;
+            let y = (i as i32) / w;
+            [
+                (x > 0).then(|| i - 1),
+                (x + 1 < w).then(|| i + 1),
+                (y > 0).then(|| i - w as usize),
+                (y + 1 < h).then(|| i + w as usize),
+            ]
+        };
+        for (k, &i) in idx.iter().enumerate() {
+            let mut best: Option<i16> = None;
+            for j in near(i).into_iter().flatten() {
+                let o = owners[j];
+                if o as u32 != p && o > 0 {
+                    best = Some(best.map_or(o, |b: i16| b.min(o)));
+                }
+            }
+            if let Some(o) = best {
+                fill[k] = o;
+                queue.push_back(i);
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let o = fill[pos[i]];
+            for j in near(i).into_iter().flatten() {
+                let k = pos[j];
+                if k != usize::MAX && fill[k] == 0 {
+                    fill[k] = o;
+                    queue.push_back(j);
+                }
+            }
+        }
+        let rec = self.d6m.provinces[p as usize - 1].clone();
+        let links: Vec<(u32, i64)> = self
+            .neighbours(p)
+            .into_iter()
+            .map(|q| (q, self.spec(p, q)))
+            .collect();
+        let pixels: Vec<(u32, i16)> = idx
+            .iter()
+            .zip(fill.iter())
+            .map(|(&i, &f)| (i as u32, f))
+            .collect();
+        let baseline: Vec<u32> = self
+            .baseline
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b as u32 == p)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let edit = Edit {
+            label: format!("Remove province {p}"),
+            map: vec![MapChange::RemoveProvince {
+                p,
+                x: rec.x,
+                y: rec.y,
+                terrain: self.flags[p as usize],
+                name: self.names[p as usize].clone(),
+                gate: self.gates[p as usize],
+                links,
+                pixels,
+                baseline,
+            }],
+            rect: Some(Rect::full(w, h)),
+            ..Default::default()
+        };
+        self.push(edit, tex, opts)
+    }
+
+    fn drop_province(&mut self, p: u32, pixels: &[(u32, i16)], baseline: &[u32]) {
+        for &(i, f) in pixels {
+            self.d6m.owners[i as usize] = f;
+        }
+        for o in self.d6m.owners.iter_mut() {
+            if *o as u32 > p {
+                *o -= 1;
+            }
+        }
+        for &i in baseline {
+            self.baseline[i as usize] = self.d6m.owners[i as usize];
+        }
+        for b in self.baseline.iter_mut() {
+            if *b as u32 > p {
+                *b -= 1;
+            }
+        }
+        let n = p as usize;
+        self.d6m.provinces.remove(n - 1);
+        self.flags.remove(n);
+        self.names.remove(n);
+        self.gates.remove(n);
+        self.capitals.remove(n - 1);
+        self.pixel_counts = count_pixels(&self.d6m.owners, self.d6m.provinces.len());
+        if let Some(m) = &mut self.map {
+            m.remove_province(p);
+            m.renumber(|q| if q > p { q - 1 } else { q });
+        }
+        self.owners_changed = true;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_province(
+        &mut self,
+        p: u32,
+        x: i16,
+        y: i16,
+        terrain: u64,
+        name: &str,
+        gate: i32,
+        links: &[(u32, i64)],
+        pixels: &[(u32, i16)],
+        baseline: &[u32],
+    ) {
+        for o in self.d6m.owners.iter_mut() {
+            if *o as u32 >= p {
+                *o += 1;
+            }
+        }
+        for &(i, _) in pixels {
+            self.d6m.owners[i as usize] = p as i16;
+        }
+        for b in self.baseline.iter_mut() {
+            if *b as u32 >= p {
+                *b += 1;
+            }
+        }
+        for &i in baseline {
+            self.baseline[i as usize] = p as i16;
+        }
+        let n = p as usize;
+        self.d6m.provinces.insert(
+            n - 1,
+            crate::d6m::Province {
+                x,
+                y,
+                terrain: terrain as i64,
+            },
+        );
+        self.flags.insert(n, terrain);
+        self.names.insert(n, name.to_string());
+        self.gates.insert(n, gate);
+        self.capitals.insert(n - 1, (x, y));
+        self.pixel_counts = count_pixels(&self.d6m.owners, self.d6m.provinces.len());
+        if let Some(m) = &mut self.map {
+            m.renumber(|q| if q >= p { q + 1 } else { q });
+            m.set_terrain(p, terrain as i64);
+            if !name.is_empty() {
+                m.set_name(p, Some(name));
+            }
+            if gate != 0 {
+                m.set_gate(p, gate);
+            }
+            for &(q, spec) in links {
+                m.set_neighbour(p, q, true);
+                if spec != 0 {
+                    m.set_spec(p, q, spec);
+                }
+            }
+        }
+        self.owners_changed = true;
+    }
+
+    pub fn empty_provinces(&self) -> Vec<u32> {
+        (1..=self.d6m.provinces.len() as u32)
+            .filter(|&p| self.pixel_counts.get(p as usize).copied().unwrap_or(0) == 0)
+            .collect()
+    }
+
+    fn grow_province(&mut self, p: u32, x: i16, y: i16, terrain: u64) {
+        let n = p as usize;
+        self.d6m.provinces.truncate(n - 1);
+        self.d6m.provinces.push(crate::d6m::Province {
+            x,
+            y,
+            terrain: terrain as i64,
+        });
+        self.flags.resize(n + 1, 0);
+        self.flags[n] = terrain;
+        self.names.resize(n + 1, String::new());
+        self.gates.resize(n + 1, 0);
+        self.capitals.truncate(n - 1);
+        self.capitals.push((x, y));
+        self.pixel_counts.resize(n + 1, 0);
+        if let Some(m) = &mut self.map {
+            m.set_terrain(p, terrain as i64);
+        }
+    }
+
+    fn shrink_province(&mut self, p: u32) {
+        let n = p as usize;
+        self.d6m.provinces.truncate(n - 1);
+        self.flags.truncate(n);
+        self.names.truncate(n);
+        self.gates.truncate(n);
+        self.capitals.truncate(n - 1);
+        self.pixel_counts.truncate(n);
+        if let Some(m) = &mut self.map {
+            m.remove_province(p);
+        }
     }
 
     pub fn bbox(&self, prov: u32) -> Option<Rect> {
@@ -1144,6 +1542,35 @@ impl PlaneDoc {
             self.d6m.heights[i as usize] = v;
             self.heights[i as usize] = units_from_stored(v);
         }
+        let mut renumbered = false;
+        for c in &e.map {
+            match c {
+                MapChange::AddProvince { p, x, y, terrain } if !reverse => {
+                    self.grow_province(*p, *x, *y, *terrain);
+                }
+                MapChange::RemoveProvince {
+                    p,
+                    x,
+                    y,
+                    terrain,
+                    name,
+                    gate,
+                    links,
+                    pixels,
+                    baseline,
+                } => {
+                    if reverse {
+                        self.restore_province(
+                            *p, *x, *y, *terrain, name, *gate, links, pixels, baseline,
+                        );
+                    } else {
+                        self.drop_province(*p, pixels, baseline);
+                    }
+                    renumbered = true;
+                }
+                _ => {}
+            }
+        }
         if !e.owners.is_empty() {
             for k in order(e.owners.len()) {
                 let (i, old, new) = e.owners[k];
@@ -1205,6 +1632,35 @@ impl PlaneDoc {
                     }
                     rect = union(rect, union(self.bbox(*a), self.bbox(*b)));
                 }
+                MapChange::Capital { p, old, new } => {
+                    let v = if reverse { *old } else { *new };
+                    let i = *p as usize - 1;
+                    if let Some(c) = self.capitals.get_mut(i) {
+                        *c = v;
+                    }
+                    if let Some(rec) = self.d6m.provinces.get_mut(i) {
+                        rec.x = v.0;
+                        rec.y = v.1;
+                    }
+                }
+                MapChange::AddProvince { .. } | MapChange::RemoveProvince { .. } => {}
+            }
+        }
+        if renumbered {
+            full = true;
+            self.rendered.bboxes = province_bboxes(&self.plane());
+        }
+        if reverse {
+            for c in e.map.iter().rev() {
+                if let MapChange::AddProvince { p, .. } = c {
+                    self.shrink_province(*p);
+                }
+            }
+            if e.map
+                .iter()
+                .any(|c| matches!(c, MapChange::AddProvince { .. }))
+            {
+                self.rendered.bboxes = province_bboxes(&self.plane());
             }
         }
         if !e.map.is_empty() {
@@ -1243,6 +1699,12 @@ impl PlaneDoc {
     }
 
     pub fn save(&mut self) -> Result<Vec<PathBuf>, String> {
+        let empty = self.empty_provinces();
+        if let Some(p) = empty.first() {
+            return Err(format!(
+                "Province {p} has no area. Paint some pixels for it or undo before saving"
+            ));
+        }
         let mut written = Vec::new();
         let bytes = self.d6m.to_bytes();
         write_with_backup(&self.d6m_path, &bytes)?;

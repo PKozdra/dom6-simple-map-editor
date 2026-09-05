@@ -2,6 +2,7 @@
 name = "dom6-simple-map-editor"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 rust-version = "1.85"
 description = "Map editor for Dominions 6 .d6m recipes: heights, terrain, connections, rivers"
 default-run = "dom6-simple-map-editor"
