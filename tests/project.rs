@@ -251,7 +251,7 @@ fn painting_ownership_rewrites_pb_runs() {
     assert_eq!(doc.pixel_counts[1], 120);
     doc.paint_begin("Paint area");
     assert!(doc.paint(1, 12, 5, 1, &t, &opts).is_some());
-    doc.paint_end();
+    doc.paint_end(&t, &opts);
     assert_eq!(doc.owner_at(12, 5), 1);
     assert_eq!(doc.owner_at(13, 5), 1);
     assert_eq!(doc.owner_at(14, 5), 2);
@@ -287,7 +287,7 @@ fn height_brush_random_terrain_and_planes() {
     doc.paint_begin("Height brush");
     assert!(doc.paint_height(4, 5, 2, 50.0, &t, &opts).is_some());
     assert!(doc.paint_height(4, 5, 2, 50.0, &t, &opts).is_some());
-    doc.paint_end();
+    doc.paint_end(&t, &opts);
     assert_eq!(doc.undo.len(), 1);
     let after = doc.stats(1);
     assert!(after.max > before.max + 90.0);
@@ -306,17 +306,26 @@ fn height_brush_random_terrain_and_planes() {
     assert_eq!(doc.flags[2] & SEA, SEA);
     doc.paint_begin("Paint area");
     assert!(doc.paint(1, 12, 5, 1, &t, &opts).is_some());
-    doc.paint_end();
+    doc.paint_end(&t, &opts);
     assert_eq!(doc.owner_at(12, 5), 1);
     doc.paint_begin("Remove area");
-    assert!(doc.paint_restore(1, 12, 5, 1, &t, &opts).is_some());
-    doc.paint_end();
+    assert!(doc.paint_restore(12, 5, 1, &t, &opts).is_some());
+    doc.paint_end(&t, &opts);
     assert_eq!(doc.owner_at(12, 5), 2);
     assert_eq!(doc.owner_at(9, 5), 1);
     doc.paint_begin("Remove area");
-    assert!(doc.paint_restore(1, 9, 5, 0, &t, &opts).is_some());
-    doc.paint_end();
-    assert_eq!(doc.owner_at(9, 5), 0);
+    assert!(doc.paint_restore(9, 5, 0, &t, &opts).is_none());
+    doc.paint_end(&t, &opts);
+    assert_eq!(doc.owner_at(9, 5), 1);
+    let steps = doc.undo.len();
+    assert!(steps >= 2);
+    assert_eq!(doc.undo_all(&t, &opts), steps);
+    assert!(doc.undo.is_empty());
+    assert_eq!(doc.redo.len(), steps);
+    assert_eq!(doc.owner_at(12, 5), 2);
+    assert_eq!(doc.flags[1] & (1 << 13), 1 << 13);
+    while doc.redo_last(&t, &opts).is_some() {}
+    assert_eq!(doc.flags[1] & (1 << 13), 0);
     let src = temp_dir("extra_src");
     let (s1, _) = make_map(&src, "cave", 1, false);
     std::fs::remove_file(src.join("cave.map")).unwrap();
@@ -370,33 +379,4 @@ fn no_start_setter_counts_crossings_fractionally() {
         "#terrain 1 {}",
         dom6_simple_map_editor::terrain::NO_START
     )));
-}
-
-#[test]
-fn export_writes_an_image_map_beside_the_recipe() {
-    let dir = temp_dir("image");
-    let (p1, _) = make_map(&dir, "bake", 1, false);
-    make_map(&dir, "bake", 2, false);
-    let t = tex();
-    let opts = Options::default();
-    let proj = Project::open(&p1, &t, &opts).unwrap();
-    let files = proj.export_image_map().unwrap();
-    assert_eq!(files.len(), 4);
-    let text = std::fs::read_to_string(dir.join("bake_image.map")).unwrap();
-    assert!(text.contains("#imagefile bake_image.tga"));
-    assert!(text.contains("#dom2title bake (image)"));
-    assert!(text.contains("#pb 0 0 10 1"));
-    assert!(text.contains("#terrain 2 4"));
-    let text2 = std::fs::read_to_string(dir.join("bake_image_plane2.map")).unwrap();
-    assert!(text2.contains("#imagefile bake_image_plane2.tga"));
-    let tga = std::fs::read(dir.join("bake_image.tga")).unwrap();
-    let img = dom6_simple_map_editor::tga::decode(&tga).unwrap();
-    assert_eq!((img.w, img.h), (20, 12));
-    let white = img
-        .rgba
-        .chunks_exact(4)
-        .filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255)
-        .count();
-    assert_eq!(white, 2);
-    assert!(img.rgba.chunks_exact(4).all(|p| p[3] == 255));
 }

@@ -23,6 +23,8 @@ pub const TAG_NO: Color32 = Color32::from_rgb(190, 180, 170);
 pub const TAG_THRONE: Color32 = Color32::from_rgb(255, 214, 120);
 pub const TAG_SITES: Color32 = Color32::from_rgb(200, 160, 240);
 pub const TAG_GATE: Color32 = Color32::from_rgb(120, 210, 230);
+pub const TAG_WATER: Color32 = Color32::from_rgb(120, 170, 230);
+pub const TAG_LAND: Color32 = Color32::from_rgb(170, 200, 120);
 
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();

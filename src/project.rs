@@ -426,7 +426,7 @@ impl PlaneDoc {
 
     pub fn set_name(&mut self, prov: u32, name: &str, tex: &TexSet, opts: &Options) -> bool {
         let old = self.name(prov).to_string();
-        let new = name.trim().to_string();
+        let new = name.trim().replace('"', "'");
         if old == new {
             return false;
         }
@@ -815,7 +815,6 @@ impl PlaneDoc {
 
     pub fn paint_restore(
         &mut self,
-        prov: u32,
         cx: i32,
         cy: i32,
         radius: i32,
@@ -837,12 +836,11 @@ impl PlaneDoc {
                 }
                 let i = (y * w + x) as usize;
                 let old = self.d6m.owners[i];
-                if old as u32 != prov {
+                let back = self.baseline[i];
+                if old == back {
                     continue;
                 }
-                let back = self.baseline[i];
-                let new = if back as u32 == prov { 0 } else { back };
-                changes.push((i as u32, old, new));
+                changes.push((i as u32, old, back));
             }
         }
         if changes.is_empty() {
@@ -1077,13 +1075,31 @@ impl PlaneDoc {
         }
     }
 
-    pub fn paint_end(&mut self) {
-        if let Some(s) = self.stroke.take() {
-            if !s.is_empty() {
-                self.redo.clear();
-                self.undo.push(s);
-            }
+    pub fn paint_end(&mut self, tex: &TexSet, opts: &Options) -> Option<Rect> {
+        let s = self.stroke.take()?;
+        if s.is_empty() {
+            return None;
         }
+        let rect = s.rect?;
+        self.redo.clear();
+        self.undo.push(s);
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.refresh_decor(&self.plane(), tex, opts, rect);
+        self.rendered = r;
+        Some(self.rendered.touched)
+    }
+
+    pub fn undo_all(&mut self, tex: &TexSet, opts: &Options) -> usize {
+        let n = self.undo.len();
+        if n == 0 {
+            return 0;
+        }
+        while let Some(e) = self.undo.pop() {
+            self.perform(&e, true);
+            self.redo.push(e);
+        }
+        self.rerender(tex, opts);
+        n
     }
 
     fn push(&mut self, edit: Edit, tex: &TexSet, opts: &Options) -> bool {
@@ -1097,6 +1113,22 @@ impl PlaneDoc {
     }
 
     fn commit(&mut self, e: &Edit, reverse: bool, tex: &TexSet, opts: &Options) {
+        let Some(rect) = self.perform(e, reverse) else {
+            return;
+        };
+        if rect.is_empty() {
+            return;
+        }
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        if self.stroke.is_some() {
+            r.render_quick(&self.plane(), tex, opts, rect);
+        } else {
+            r.render(&self.plane(), tex, opts, rect);
+        }
+        self.rendered = r;
+    }
+
+    fn perform(&mut self, e: &Edit, reverse: bool) -> Option<Rect> {
         let mut rect = e.rect;
         let mut full = false;
         let order = |n: usize| -> Box<dyn Iterator<Item = usize>> {
@@ -1179,17 +1211,12 @@ impl PlaneDoc {
             self.rebuild_links();
         }
         self.dirty = true;
-        let rect = if full {
-            Rect::full(self.d6m.width, self.d6m.height)
+        let pixels = !e.heights.is_empty() || !e.owners.is_empty();
+        if full || (pixels && rect.is_none()) {
+            Some(Rect::full(self.d6m.width, self.d6m.height))
         } else {
-            rect.unwrap_or(Rect::full(self.d6m.width, self.d6m.height))
-        };
-        if rect.is_empty() {
-            return;
+            rect
         }
-        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
-        r.render(&self.plane(), tex, opts, rect);
-        self.rendered = r;
     }
 
     pub fn undo_last(&mut self, tex: &TexSet, opts: &Options) -> Option<String> {
@@ -1346,44 +1373,6 @@ impl Project {
 
     pub fn scar_total(&self) -> usize {
         self.planes.iter().map(|p| p.scar_count()).sum()
-    }
-
-    pub fn export_image_map(&self) -> Result<Vec<PathBuf>, String> {
-        let base = format!("{}_image", self.base);
-        let mut written = Vec::new();
-        for doc in &self.planes {
-            let tga_name = plane_file_name(&base, doc.index, "tga");
-            let map_name = plane_file_name(&base, doc.index, "map");
-            let img = crate::textures::Image {
-                w: doc.width() as usize,
-                h: doc.height() as usize,
-                rgba: doc.rendered.composed(&doc.capitals),
-            };
-            let tga_path = self.dir.join(&tga_name);
-            std::fs::write(&tga_path, crate::tga::encode_rgba_bottom_up(&img))
-                .map_err(|e| format!("write {}: {e}", tga_path.display()))?;
-            written.push(tga_path);
-            let map_path = self.dir.join(&map_name);
-            let mut map = match &doc.map {
-                Some(m) => m.clone(),
-                None => MapFile::parse(&generated_map_text(&self.base, &doc.d6m), &map_path),
-            };
-            map.path = map_path.clone();
-            map.set_imagefile(&tga_name);
-            if doc.index == 1 {
-                let title = if map.title.is_empty() {
-                    self.base.clone()
-                } else {
-                    map.title.clone()
-                };
-                map.set_title(&format!("{title} (image)"));
-            }
-            map.replace_pb(doc.width(), doc.height(), &doc.d6m.owners);
-            std::fs::write(&map_path, map.to_text())
-                .map_err(|e| format!("write {}: {e}", map_path.display()))?;
-            written.push(map_path);
-        }
-        Ok(written)
     }
 
     pub fn next_plane_index(&self) -> u32 {

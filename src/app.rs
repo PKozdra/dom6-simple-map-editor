@@ -231,7 +231,7 @@ const BORDER_KINDS: [(i64, &str); 6] = [
     (BORDER_BRIDGE as i64, "Bridge"),
     (
         (BORDER_MOUNTAIN_LINE | BORDER_IMPASSABLE) as i64,
-        "Border mountains",
+        "Mountains",
     ),
     (
         (BORDER_MOUNTAIN_LINE | BORDER_MOUNTAIN_PASS) as i64,
@@ -241,6 +241,55 @@ const BORDER_KINDS: [(i64, &str); 6] = [
 ];
 
 const ROAD: i64 = 8;
+
+fn terrain_label(f: u64) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if f & UNKNOWN != 0 {
+        parts.push("Unknown");
+    }
+    if f & CAVE_WALL != 0 {
+        parts.push("Cave wall");
+    }
+    if f & SEA != 0 {
+        parts.push(if f & DEEP_SEA != 0 { "Deep sea" } else { "Sea" });
+        if f & KELP_EXACT == KELP_EXACT {
+            parts.push("Kelp");
+        }
+    } else if f & FRESH_WATER != 0 {
+        parts.push("Fresh water");
+    }
+    for (bit, name) in [
+        (CAVE, "Cave"),
+        (HIGHLAND, "Highlands"),
+        (SWAMP, "Swamp"),
+        (WASTE, "Waste"),
+        (FOREST, "Forest"),
+        (FARM, "Farm"),
+        (MOUNTAIN, "Mountain"),
+        (WARMER, "Warmer"),
+        (COLDER, "Colder"),
+    ] {
+        if f & bit != 0 {
+            parts.push(name);
+        }
+    }
+    if parts.is_empty() {
+        parts.push("Plains");
+    }
+    parts.join(", ")
+}
+
+fn link_colour(spec: i64) -> Color32 {
+    if spec & (BORDER_RIVER as i64) != 0 {
+        Color32::from_rgb(90, 160, 255)
+    } else if spec & (BORDER_IMPASSABLE as i64) != 0 {
+        Color32::from_rgb(230, 80, 60)
+    } else if spec & (BORDER_MOUNTAIN_PASS as i64) != 0 {
+        Color32::from_rgb(230, 150, 60)
+    } else {
+        Color32::from_rgb(240, 220, 60)
+    }
+}
 
 const BASIC_FLAGS: [(u64, &str); 11] = [
     (SEA, "Sea"),
@@ -309,9 +358,10 @@ pub struct App {
     paint_empty: bool,
     painting: Option<PointerButton>,
     show_markers: bool,
+    show_links: bool,
+    show_terrain: bool,
     flatten: bool,
     show_names: bool,
-    advanced: bool,
     custom: f32,
     step: f32,
     nostart_min: f32,
@@ -351,9 +401,10 @@ impl App {
             paint_empty: false,
             painting: None,
             show_markers: true,
+            show_links: false,
+            show_terrain: false,
             flatten: false,
             show_names: false,
-            advanced: false,
             custom: -20.0,
             step: 10.0,
             nostart_min: 4.0,
@@ -826,6 +877,13 @@ impl App {
         }
     }
 
+    fn undo_all(&mut self) {
+        let n = self
+            .with_doc(|d, tex, opts| d.undo_all(tex, opts))
+            .unwrap_or(0);
+        self.after_edit(n > 0, None, &format!("Undid all {n} edits on this plane"));
+    }
+
     fn randomize_terrain(&mut self) {
         let res = self.with_doc(|d, tex, opts| d.randomize_terrain(tex, opts));
         let n = res.unwrap_or(0);
@@ -845,23 +903,6 @@ impl App {
             None,
             &format!("No start set on {n} provinces with fewer than {min:.1} connections"),
         );
-    }
-
-    fn export_image_map(&mut self) {
-        let Some(p) = &self.project else {
-            return;
-        };
-        match p.export_image_map() {
-            Ok(files) => {
-                let names: Vec<String> = files
-                    .iter()
-                    .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .collect();
-                self.status = format!("Exported image map: {}", names.join(", "));
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
     }
 
     fn add_plane(&mut self) {
@@ -933,10 +974,7 @@ impl App {
             self.with_doc(|d, tex, opts| d.paint_height(x, y, r, delta, tex, opts))
                 .flatten()
         } else if remove {
-            let Some(prov) = self.selected else {
-                return;
-            };
-            self.with_doc(|d, tex, opts| d.paint_restore(prov, x, y, r, tex, opts))
+            self.with_doc(|d, tex, opts| d.paint_restore(x, y, r, tex, opts))
                 .flatten()
         } else {
             let prov = if self.paint_empty {
@@ -1041,7 +1079,12 @@ impl App {
                     let still = ctx.input(|i| i.pointer.button_down(b));
                     if !still {
                         self.painting = None;
-                        self.with_doc(|d, _, _| d.paint_end());
+                        let done = self
+                            .with_doc(|d, tex, opts| d.paint_end(tex, opts))
+                            .flatten();
+                        if let Some(rect) = done {
+                            self.mark_tiles(Some(rect));
+                        }
                         self.refresh_selection();
                     }
                 }
@@ -1098,6 +1141,37 @@ impl App {
                         }
                     }
                 }
+                if self.show_links {
+                    let thin = 2.0_f32 * self.zoom.sqrt().clamp(0.6, 1.5);
+                    for p in 1..=doc.province_count() as u32 {
+                        let (ax, ay) = doc.capitals[p as usize - 1];
+                        for nb in doc.neighbours(p) {
+                            if nb <= p {
+                                continue;
+                            }
+                            let Some(&(bx, by)) = doc.capitals.get(nb as usize - 1) else {
+                                continue;
+                            };
+                            let a = self.map_to_screen(
+                                canvas,
+                                ax as f32 + 0.5,
+                                (h - 1 - ay as i32) as f32 + 0.5,
+                            );
+                            let b = self.map_to_screen(
+                                canvas,
+                                bx as f32 + 0.5,
+                                (h - 1 - by as i32) as f32 + 0.5,
+                            );
+                            if !canvas.intersects(egui::Rect::from_two_pos(a, b)) {
+                                continue;
+                            }
+                            painter.line_segment(
+                                [a, b],
+                                egui::Stroke::new(thin, link_colour(doc.spec(p, nb))),
+                            );
+                        }
+                    }
+                }
                 if self.tool == Tool::Link {
                     if let Some(sel) = self.selected {
                         for nb in doc.neighbours(sel) {
@@ -1115,20 +1189,13 @@ impl App {
                                 bx as f32 + 0.5,
                                 (h - 1 - by as i32) as f32 + 0.5,
                             );
-                            let spec = doc.spec(sel, nb);
-                            let col = if spec & (BORDER_RIVER as i64) != 0 {
-                                Color32::from_rgb(90, 160, 255)
-                            } else if spec & (BORDER_IMPASSABLE as i64) != 0 {
-                                Color32::from_rgb(230, 80, 60)
-                            } else {
-                                Color32::from_rgb(240, 220, 60)
-                            };
+                            let col = link_colour(doc.spec(sel, nb));
                             painter.line_segment([a, b], egui::Stroke::new(3.0_f32, col));
                             painter.circle_filled(b, 6.0, col);
                         }
                     }
                 }
-                if self.show_names || self.show_markers {
+                if self.show_names || self.show_markers || self.show_terrain {
                     let size = (14.0 * self.zoom.sqrt()).clamp(11.0, 26.0);
                     let badge = (12.0 * self.zoom.sqrt()).clamp(10.0, 18.0);
                     let halo = Color32::from_rgba_unmultiplied(255, 244, 214, 150);
@@ -1162,34 +1229,47 @@ impl App {
                             }
                             painter.text(p, Align2::CENTER_BOTTOM, &text, font, theme::NAME_RED);
                         }
-                        if self.show_markers {
+                        if self.show_markers || self.show_terrain {
                             let f = doc.flags.get(id as usize).copied().unwrap_or(0);
                             let gate = doc.gate(id);
                             let mut tags: Vec<(String, Color32)> = Vec::new();
-                            if f & GOOD_START != 0 {
+                            if self.show_terrain {
+                                let water = f & SEA != 0;
+                                tags.push((
+                                    terrain_label(f),
+                                    if water {
+                                        theme::TAG_WATER
+                                    } else {
+                                        theme::TAG_LAND
+                                    },
+                                ));
+                            }
+                            if self.show_markers && f & GOOD_START != 0 {
                                 tags.push(("Start".to_owned(), theme::TAG_START));
                             }
-                            if f & NO_START != 0 {
+                            if self.show_markers && f & NO_START != 0 {
                                 tags.push(("No start".to_owned(), theme::TAG_NO));
                             }
-                            if f & GOOD_THRONE != 0 {
+                            if self.show_markers && f & GOOD_THRONE != 0 {
                                 tags.push(("Throne".to_owned(), theme::TAG_THRONE));
                             }
-                            if f & BAD_THRONE != 0 {
+                            if self.show_markers && f & BAD_THRONE != 0 {
                                 tags.push(("No throne".to_owned(), theme::TAG_NO));
                             }
-                            if f & MANY_SITES != 0 {
+                            if self.show_markers && f & MANY_SITES != 0 {
                                 tags.push(("Sites".to_owned(), theme::TAG_SITES));
                             }
-                            if gate != 0 {
+                            if self.show_markers && gate != 0 {
                                 tags.push((format!("Gate {gate}"), theme::TAG_GATE));
                             }
-                            painter.circle(
-                                centre,
-                                3.0,
-                                Color32::WHITE,
-                                egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 30, 20)),
-                            );
+                            if self.show_markers {
+                                painter.circle(
+                                    centre,
+                                    3.0,
+                                    Color32::WHITE,
+                                    egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 30, 20)),
+                                );
+                            }
                             let mut y = centre.y + 6.0;
                             for (text, col) in tags {
                                 let galley = painter.layout_no_wrap(
@@ -1271,6 +1351,10 @@ impl App {
                         }
                         self.tools_section(ui);
                         ui.add_space(8.0);
+                        if self.project.is_some() {
+                            self.plane_section(ui);
+                            ui.add_space(8.0);
+                        }
                         self.view_section(ui);
                     });
             });
@@ -1311,7 +1395,6 @@ impl App {
                 }
             }
             theme::rule(ui);
-            let has = self.project.is_some();
             let dirty = self.project.as_ref().map(|p| p.any_dirty()).unwrap_or(false);
             let can_undo = self.doc().map(|d| !d.undo.is_empty()).unwrap_or(false);
             let can_redo = self.doc().map(|d| !d.redo.is_empty()).unwrap_or(false);
@@ -1328,43 +1411,16 @@ impl App {
                 if theme::boxed_button(ui, "Redo", can_redo) {
                     self.redo();
                 }
+                if theme::boxed_button_hint(ui, "Undo all", can_undo, "Takes back every edit made to this plane since it was opened; Redo brings them back one by one") {
+                    self.undo_all();
+                }
                 if theme::boxed_button(ui, "Help", true) {
                     self.show_help = !self.show_help;
                 }
                 if theme::boxed_button(ui, "Exit", true) {
                     self.pending = Pending::Close;
                 }
-                if theme::boxed_button_hint(ui, "Random terrain", has, "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds") {
-                    self.randomize_terrain();
-                }
-                if theme::boxed_button_hint(ui, "Export image map", has, "Writes a copy of this map as an image map: one .tga per plane with the picture exactly as shown here, sprites included, and a matching .map that points at it. The game then shows this picture instead of rebuilding one from the recipe. Height data is not part of an image map, so keep the .d6m if you want to keep editing heights") {
-                    self.export_image_map();
-                }
             });
-            if has {
-                ui.horizontal(|ui| {
-                    theme::dim(ui, "No start below");
-                    ui.add(egui::DragValue::new(&mut self.nostart_min).range(1.0..=12.0).speed(0.1).fixed_decimals(1));
-                    theme::dim(ui, "links, crossing =");
-                    ui.add(egui::DragValue::new(&mut self.nostart_crossing).range(0.0..=1.0).speed(0.05).fixed_decimals(2));
-                    if theme::boxed_button_hint(ui, "Apply", true, "Marks every province on this plane with fewer connections than this as No start, the way the Random Map NoStart setter does. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the crossing value instead of 1; impassable borders count 0") {
-                        self.set_no_starts();
-                    }
-                });
-                let scars = self.project.as_ref().map(|p| p.scar_total()).unwrap_or(0);
-                ui.horizontal(|ui| {
-                    if scars > 0 {
-                        ui.label(egui::RichText::new(format!("{scars} river scar pixels")).color(theme::WARN));
-                        if theme::boxed_button(ui, "Repair", true) {
-                            self.repair_scars();
-                        }
-                    } else {
-                        theme::dim(ui, "No river scars");
-                    }
-                })
-                .response
-                .on_hover_text("Rivers saved by the game's editor leave trenches that paint as bare rock. Repair raises them back to the terrain; the game then redraws every river from its connections when the map loads.");
-            }
             theme::rule(ui);
             if let Some(e) = &self.error {
                 ui.label(egui::RichText::new(e).color(theme::WARN));
@@ -1488,21 +1544,35 @@ impl App {
 
             theme::section(ui, "Terrain");
             let mut new_flags = flags;
+            let mut water_preset: Option<Preset> = None;
             egui::Grid::new("basic_flags").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
                 for (i, (bit, label)) in BASIC_FLAGS.iter().enumerate() {
                     let mut on = flags & bit != 0;
                     let enabled = *bit != FRESH_WATER || flags & SEA == 0;
-                    if theme::check_enabled(ui, &mut on, label, enabled).clicked() {
-                        new_flags = toggle_flag(flags, *bit);
+                    let r = theme::check_enabled(ui, &mut on, label, enabled);
+                    let r = if *bit == SEA || *bit == DEEP_SEA {
+                        r.on_hover_text("Also moves the ground to the matching depth, like the buttons above, so the picture and the rules agree")
+                    } else {
+                        r
+                    };
+                    if r.clicked() {
+                        if *bit == SEA {
+                            water_preset = Some(if on { Preset::Sea } else { Preset::Land });
+                        } else if *bit == DEEP_SEA {
+                            water_preset = Some(if on { Preset::DeepSea } else { Preset::Sea });
+                        } else {
+                            new_flags = toggle_flag(flags, *bit);
+                        }
                     }
                     if i % 2 == 1 {
                         ui.end_row();
                     }
                 }
             });
+            if let Some(p) = water_preset {
+                self.preset(p);
+            }
             ui.horizontal(|ui| {
-                theme::check(ui, &mut self.advanced, "Advanced terrain").on_hover_text("The terrain kinds behind the game's look buttons: they pick the ground picture and the province's income, sites and movement rules. Highlands, Swamp, Waste, Forest and Farm are the land types; Cave and Cave wall belong to the cave plane; Warmer and Colder shift the climate and pick the winter art");
-                theme::dim(ui, "·");
                 theme::dim(ui, "Gate").on_hover_text("Gateway number. A gateway connects to every other gateway with the same number, also on other planes, so armies can travel between them. 0 means no gateway");
                 let r = ui.add(egui::DragValue::new(&mut self.gate_edit).range(0..=999).speed(0.1)).on_hover_text("Gateway number. A gateway connects to every other gateway with the same number, also on other planes. 0 means no gateway");
                 if r.lost_focus() || (r.changed() && !r.has_focus()) {
@@ -1513,19 +1583,19 @@ impl App {
                     }
                 }
             });
-            if self.advanced {
-                egui::Grid::new("advanced_flags").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
-                    for (i, (bit, label)) in ADVANCED_FLAGS.iter().enumerate() {
-                        let mut on = flags & bit != 0;
-                        if theme::check(ui, &mut on, label).clicked() {
-                            new_flags = toggle_flag(flags, *bit);
-                        }
-                        if i % 2 == 1 {
-                            ui.end_row();
-                        }
+            egui::Grid::new("advanced_flags").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+                for (i, (bit, label)) in ADVANCED_FLAGS.iter().enumerate() {
+                    let mut on = flags & bit != 0;
+                    if theme::check(ui, &mut on, label).clicked() {
+                        new_flags = toggle_flag(flags, *bit);
                     }
-                });
-            }
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("The terrain kinds behind the game's look buttons: they pick the ground picture and the province's income, sites and movement rules. Highlands, Swamp, Waste, Forest and Farm are the land types; Cave and Cave wall belong to the cave plane; Warmer and Colder shift the climate and pick the winter art");
             if new_flags != flags {
                 self.set_flags(prov, new_flags, "Terrain");
             }
@@ -1539,14 +1609,14 @@ impl App {
             let mut spec_change: Option<(u32, i64)> = None;
             let mut unlink: Option<u32> = None;
             for (nb, nb_name, spec) in &neighbours {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let label = if nb_name.is_empty() {
                         format!("{nb}")
                     } else {
                         format!("{nb}  {nb_name}")
                     };
                     ui.scope(|ui| {
-                        ui.set_width(74.0);
+                        ui.set_width(66.0);
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         if theme::text_button(ui, &label, true) {
                             self.select(Some(*nb));
@@ -1559,7 +1629,7 @@ impl App {
                         .unwrap_or(0);
                     egui::ComboBox::from_id_salt(("spec", prov, *nb))
                         .selected_text(BORDER_KINDS[kind].1)
-                        .width(106.0)
+                        .width(100.0)
                         .truncate()
                         .show_ui(ui, |ui| {
                             for (i, (_, name)) in BORDER_KINDS.iter().enumerate() {
@@ -1618,21 +1688,21 @@ impl App {
             ui.set_width(PANEL_W - 50.0);
             theme::section_first(ui, "Tool");
             ui.horizontal_wrapped(|ui| {
-                if theme::tab(ui, self.tool == Tool::Select, "Select") {
+                if theme::tab(ui, self.tool == Tool::Select, "Select (S)") {
                     self.tool = Tool::Select;
                 }
-                if theme::tab(ui, self.tool == Tool::Link, "Link") {
+                if theme::tab(ui, self.tool == Tool::Link, "Link (L)") {
                     self.tool = Tool::Link;
                 }
-                if theme::tab(ui, self.tool == Tool::Paint, "Paint area") {
+                if theme::tab(ui, self.tool == Tool::Paint, "Paint area (P)") {
                     self.tool = Tool::Paint;
                 }
-                if theme::tab(ui, self.tool == Tool::Height, "Heights") {
+                if theme::tab(ui, self.tool == Tool::Height, "Heights (H)") {
                     self.tool = Tool::Height;
                 }
             })
             .response
-            .on_hover_text("Keys: S select, L link, P paint, H heights (P and H again go back), Tab cycles");
+            .on_hover_text("Tab cycles the tools; P or H pressed again goes back to Select");
             match self.tool {
                 Tool::Select => {
                     theme::dim(ui, "Click a province to select it (S)");
@@ -1662,13 +1732,45 @@ impl App {
                         theme::dim(ui, "Brush");
                         ui.add(egui::Slider::new(&mut self.brush, 1..=60).suffix(" px"));
                     });
-                    theme::check(ui, &mut self.paint_empty, "Paint no province").on_hover_text("The left button takes pixels away from every province instead of giving them to the selected one");
+                    theme::check(ui, &mut self.paint_empty, "Paint no province").on_hover_text("The left button takes pixels away from every province instead of giving them to the selected one; the right button still restores what was there when the map was opened");
                     theme::dim(
                         ui,
-                        "Left button: give pixels to the selected province. Right button: take them back from it, returning them to the province that had them when the map was opened. Middle or Ctrl+left drag pans (P)",
+                        "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans (P)",
                     );
                 }
             }
+        });
+    }
+
+    fn plane_section(&mut self, ui: &mut egui::Ui) {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(PANEL_W - 50.0);
+            theme::section_first(ui, "Whole plane");
+            if theme::boxed_button_hint(ui, "Random terrain", true, "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds") {
+                self.randomize_terrain();
+            }
+            ui.horizontal_wrapped(|ui| {
+                theme::dim(ui, "No start below");
+                ui.add(egui::DragValue::new(&mut self.nostart_min).range(1.0..=12.0).speed(0.1).fixed_decimals(1));
+                theme::dim(ui, "links, a river or pass counts");
+                ui.add(egui::DragValue::new(&mut self.nostart_crossing).range(0.0..=1.0).speed(0.05).fixed_decimals(2));
+            });
+            if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start, the way the Random Map NoStart setter does. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
+                self.set_no_starts();
+            }
+            let scars = self.project.as_ref().map(|p| p.scar_total()).unwrap_or(0);
+            ui.horizontal_wrapped(|ui| {
+                if scars > 0 {
+                    ui.label(egui::RichText::new(format!("{scars} river scar pixels")).color(theme::WARN));
+                    if theme::boxed_button(ui, "Repair", true) {
+                        self.repair_scars();
+                    }
+                } else {
+                    theme::dim(ui, "No river scars");
+                }
+            })
+            .response
+            .on_hover_text("Rivers saved by the game's editor leave trenches that paint as bare rock. Repair raises them back to the terrain; the game then redraws every river from its connections when the map loads.");
         });
     }
 
@@ -1689,6 +1791,9 @@ impl App {
                     ui.end_row();
                     theme::check(ui, &mut self.show_names, "Names").on_hover_text("Province names, or the number where a province has no name");
                     theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate");
+                    ui.end_row();
+                    theme::check(ui, &mut self.show_links, "Connections").on_hover_text("Every connection on the plane as a line between capitals: yellow normal, blue river, orange mountain pass, red impassable. The Link tool always shows the selected province's own");
+                    theme::check(ui, &mut self.show_terrain, "Terrain").on_hover_text("The terrain marks of every province in words at its capital, so a province painted as water can be told from one the game treats as sea");
                     ui.end_row();
                 });
             if changed {

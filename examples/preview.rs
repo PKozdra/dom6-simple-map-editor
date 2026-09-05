@@ -41,6 +41,10 @@ fn main() {
     let mut project = Project::open(map_path, &tex, &plain).unwrap();
     let t_open = t1.elapsed();
     let opts = Options::default();
+    if args.get(4).map(|a| a == "repair").unwrap_or(false) {
+        let n = project.planes[0].repair_scars(&tex, &plain);
+        println!("repaired {n} scar pixels");
+    }
     let t2 = Instant::now();
     project.planes[0].rerender(&tex, &opts);
     let t_decor = t2.elapsed();
@@ -99,12 +103,19 @@ fn main() {
     bench("paint stroke step r=10", &mut |d| {
         d.paint_begin("Paint area");
         d.paint(prov, cx as i32 + 30, cy as i32, 10, &tex, &opts);
-        d.paint_end();
+        d.paint_end(&tex, &opts);
     });
     bench("height brush step r=10", &mut |d| {
         d.paint_begin("Height brush");
         d.paint_height(cx as i32, cy as i32, 10, 10.0, &tex, &opts);
-        d.paint_end();
+    });
+    bench("height stroke 20 steps r=30", &mut |d| {
+        for k in 0..20 {
+            d.paint_height(cx as i32 + k * 6, cy as i32, 30, 10.0, &tex, &opts);
+        }
+    });
+    bench("height stroke end", &mut |d| {
+        d.paint_end(&tex, &opts);
     });
     bench("random terrain (plane)", &mut |d| {
         d.randomize_terrain(&tex, &opts);

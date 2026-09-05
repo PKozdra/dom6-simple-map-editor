@@ -767,6 +767,23 @@ impl Rendered {
     }
 
     pub fn render(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
+        self.render_with(p, tex, opts, rect, true);
+    }
+
+    pub fn render_quick(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
+        self.render_with(p, tex, opts, rect, false);
+    }
+
+    pub fn refresh_decor(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
+        if !opts.decor || rect.is_empty() {
+            return;
+        }
+        let inner = rect.expand(self.margin(), p.w, p.h);
+        self.touched = inner;
+        self.decorate(p, tex, inner, false);
+    }
+
+    fn render_with(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect, scatter: bool) {
         if rect.is_empty() {
             return;
         }
@@ -809,8 +826,33 @@ impl Rendered {
         self.touched = inner;
         if opts.decor {
             let full = rect.x0 <= 0 && rect.y0 <= 0 && rect.x1 >= p.w - 1 && rect.y1 >= p.h - 1;
-            self.decorate(p, tex, inner, full);
+            if scatter || full || self.decor.len() != (p.w * p.h * 4) as usize {
+                self.decorate(p, tex, inner, full);
+            } else {
+                self.redraw_decor(p, tex, inner);
+            }
         }
+    }
+
+    fn redraw_decor(&mut self, p: &Plane, tex: &TexSet, rect: Rect) {
+        let (dx, dy) = (if p.hwrap { p.w } else { 0 }, if p.vwrap { p.h } else { 0 });
+        let mut near: Vec<Sprite> = Vec::new();
+        for v in self.sprites.iter().chain(self.mountains.iter()) {
+            for s in v {
+                let r = s.rect();
+                let wide = Rect {
+                    x0: r.x0 - dx,
+                    y0: r.y0 - dy,
+                    x1: r.x1 + dx,
+                    y1: r.y1 + dy,
+                };
+                if wide.intersects(rect) {
+                    near.push(*s);
+                }
+            }
+        }
+        decor::order(&mut near);
+        decor::draw_sprites(p, tex, &near, rect, &mut self.decor);
     }
 
     pub fn composed(&self, capitals: &[(i16, i16)]) -> Vec<u8> {
