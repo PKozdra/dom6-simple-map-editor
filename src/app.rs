@@ -453,7 +453,12 @@ impl App {
                     .map(|d| TileGrid::new(d.width(), d.height()))
                     .collect();
                 let notes = p.notes.clone();
-                let scars = p.scar_total();
+                let scars: usize = p
+                    .planes
+                    .iter()
+                    .filter(|d| d.index == 2)
+                    .map(|d| d.scar_count())
+                    .sum();
                 self.status = if planes > 1 {
                     format!("Loaded {} with {} planes", p.base, planes)
                 } else {
@@ -461,7 +466,7 @@ impl App {
                 };
                 if scars > 0 {
                     self.status = format!(
-                        "{}. {} river scar pixels found, see Repair",
+                        "{}. {} grey river pixels on the cave plane, see Repair there",
                         self.status, scars
                     );
                 }
@@ -650,9 +655,11 @@ impl App {
         let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
         let opts = self.opts;
         let mut total = 0;
+        let mut cave = false;
         if let Some(p) = &mut self.project {
-            for d in &mut p.planes {
-                total += d.repair_scars(&tex, &opts);
+            if let Some(d) = p.planes.get_mut(self.active) {
+                cave = d.index == 2;
+                total = d.repair_scars(&tex, &opts);
             }
         }
         self.tex = tex;
@@ -660,10 +667,12 @@ impl App {
             t.mark_all();
         }
         self.refresh_selection();
-        self.status = if total > 0 {
-            format!("Raised {total} river scar pixels back to the terrain; the game redraws rivers from the connections on load")
+        self.status = if total > 0 && cave {
+            format!("Raised {total} grey river pixels to the cave floor; the game carves the rivers there on load")
+        } else if total > 0 {
+            format!("Raised {total} old river pixels; the game carves fresh rivers on load")
         } else {
-            "No river scars to repair".to_owned()
+            "No old river pixels on this plane".to_owned()
         };
     }
 
@@ -1758,19 +1767,31 @@ impl App {
             if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start, the way the Random Map NoStart setter does. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
                 self.set_no_starts();
             }
-            let scars = self.project.as_ref().map(|p| p.scar_total()).unwrap_or(0);
+            let (scars, cave) = self
+                .doc()
+                .map(|d| (d.scar_count(), d.index == 2))
+                .unwrap_or((0, false));
             ui.horizontal_wrapped(|ui| {
-                if scars > 0 {
-                    ui.label(egui::RichText::new(format!("{scars} river scar pixels")).color(theme::WARN));
+                if scars > 0 && cave {
+                    ui.label(egui::RichText::new(format!("{scars} grey river pixels")).color(theme::WARN));
                     if theme::boxed_button(ui, "Repair", true) {
                         self.repair_scars();
                     }
+                } else if scars > 0 {
+                    theme::dim(ui, &format!("{scars} old river pixels"));
+                    if theme::boxed_button(ui, "Redraw rivers", true) {
+                        self.repair_scars();
+                    }
                 } else {
-                    theme::dim(ui, "No river scars");
+                    theme::dim(ui, "No old river pixels");
                 }
             })
             .response
-            .on_hover_text("Rivers saved by the game's editor leave trenches that paint as bare rock. Repair raises them back to the terrain; the game then redraws every river from its connections when the map loads.");
+            .on_hover_text(if cave {
+                "Rivers saved by the game's editor keep their channel in the height data, and on the cave plane that channel paints as plain rock with no river. Repair raises it to the cave floor; the game then carves a proper river there from the connection when the map loads"
+            } else {
+                "Rivers saved by the game's editor keep their channel in the height data. On the surface the game still shows them, as a slightly sunken river with the province border drawn across it, so nothing is broken here. Redraw rivers raises the old channel so the game carves fresh rivers on load, which then cover the border like a newly generated map"
+            });
         });
     }
 
@@ -1827,7 +1848,7 @@ impl App {
                     theme::section(ui, "Looks");
                     ui.label("Water starts below height 0. Shallows reach down to -10, open water to -30, deep sea from -36. The presets move a province to those depths and set its Sea marks so the rules match the picture. Flatten gives every pixel the same height.");
                     theme::section(ui, "Rivers");
-                    ui.label("A river is a connection type and a channel in the height data. Removing a river here also lifts its channel. Maps saved by the game's editor keep old channels as scars that paint as bare rock; Repair raises them and the game redraws the rivers on load.");
+                    ui.label("A river is a connection type and a channel in the height data. Removing a river here also lifts its channel. Maps saved by the game's editor keep old channels in the height data: on the surface they still show as a sunken river with the border drawn across it, on the cave plane as plain rock. Repair on the cave plane raises them so the game carves real rivers there on load.");
                     theme::section(ui, "Paint area");
                     ui.label("Left button gives pixels to the selected province, right button takes them back from it, middle button or Ctrl+left drag pans.");
                     theme::section(ui, "Keys");
