@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 const TILE: usize = 1024;
 const PANEL_W: f32 = 340.0;
 const ICON_CELL: f32 = 48.0;
+pub const REPO_URL: &str = "https://github.com/PKozdra/dom6-simple-map-editor";
 
 struct TileGrid {
     w: usize,
@@ -587,15 +588,15 @@ pub struct App {
     relief_stale: Vec<bool>,
     thumbs: Vec<Option<egui::TextureHandle>>,
     thumb_stale: Vec<bool>,
-    thumb_at: std::time::Instant,
+    thumb_at: web_time::Instant,
     relief_in_height: bool,
     keep_rivers: bool,
     terrain_follows_height: bool,
     repair_rivers: bool,
     stroke_last: Option<(i32, i32)>,
     stroke_decor: Option<Rect>,
-    stroke_decor_at: std::time::Instant,
-    stroke_decor_cost: std::time::Duration,
+    stroke_decor_at: web_time::Instant,
+    stroke_decor_cost: web_time::Duration,
     tool: Tool,
     brush: i32,
     paint_empty: bool,
@@ -607,6 +608,7 @@ pub struct App {
     goto: u32,
     placing_new: bool,
     icons: Vec<(u16, egui::TextureHandle)>,
+    github: Option<egui::TextureHandle>,
     flatten: bool,
     show_names: bool,
     custom: f32,
@@ -627,6 +629,10 @@ pub struct App {
     confirm_generate: bool,
     settings: Settings,
     confirm_overwrite: bool,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    ctx: egui::Context,
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    folder_files: Vec<String>,
 }
 
 impl App {
@@ -669,15 +675,15 @@ impl App {
             relief_stale: Vec::new(),
             thumbs: Vec::new(),
             thumb_stale: Vec::new(),
-            thumb_at: std::time::Instant::now(),
+            thumb_at: web_time::Instant::now(),
             relief_in_height: true,
             keep_rivers: true,
             terrain_follows_height: true,
             repair_rivers: false,
             stroke_last: None,
             stroke_decor: None,
-            stroke_decor_at: std::time::Instant::now(),
-            stroke_decor_cost: std::time::Duration::ZERO,
+            stroke_decor_at: web_time::Instant::now(),
+            stroke_decor_cost: web_time::Duration::ZERO,
             brush: 10,
             paint_empty: false,
             painting: None,
@@ -688,6 +694,7 @@ impl App {
             goto: 1,
             placing_new: false,
             icons: load_icons(&cc.egui_ctx),
+            github: load_github_mark(&cc.egui_ctx),
             flatten: false,
             show_names: false,
             custom: -20.0,
@@ -712,6 +719,8 @@ impl App {
             confirm_generate: false,
             settings: Settings::load(),
             confirm_overwrite: false,
+            ctx: cc.egui_ctx.clone(),
+            folder_files: Vec::new(),
         };
         if let Some(p) = initial {
             app.open(&p);
@@ -1009,7 +1018,7 @@ impl App {
             .get(active)
             .map(|t| t.is_some())
             .unwrap_or(false);
-        if has && self.thumb_at.elapsed() < std::time::Duration::from_millis(400) {
+        if has && self.thumb_at.elapsed() < web_time::Duration::from_millis(400) {
             return;
         }
         let Some(project) = &self.project else {
@@ -1072,7 +1081,7 @@ impl App {
             None => {}
         }
         self.thumb_stale[active] = false;
-        self.thumb_at = std::time::Instant::now();
+        self.thumb_at = web_time::Instant::now();
     }
 
     fn relief_shown(&self) -> bool {
@@ -1217,6 +1226,12 @@ impl App {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn pick_save_target(&mut self) -> bool {
+        false
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_save_target(&mut self) -> bool {
         let (dir, base) = match &self.project {
             Some(p) if p.unsaved => (self.settings.maps_dir(), p.base.clone()),
@@ -1316,16 +1331,83 @@ impl App {
                 .iter()
                 .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .collect();
-            let dir = written
-                .first()
-                .and_then(|f| f.parent())
-                .map(crate::settings::shown)
-                .unwrap_or_default();
-            format!("Saved {} in {dir}", names.join(", "))
+            if crate::io::IS_WEB {
+                self.export(&written);
+                format!("Saving {}", names.join(", "))
+            } else {
+                let dir = written
+                    .first()
+                    .and_then(|f| f.parent())
+                    .map(crate::settings::shown)
+                    .unwrap_or_default();
+                format!("Saved {} in {dir}", names.join(", "))
+            }
         };
         true
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn export(&self, paths: &[PathBuf]) {
+        crate::web::export(paths.to_vec(), self.ctx.clone());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn export(&self, _paths: &[PathBuf]) {}
+
+    #[cfg(target_arch = "wasm32")]
+    fn pick_file(&mut self) {
+        crate::web::pick(
+            crate::web::Purpose::Open,
+            crate::web::MAP_FILES,
+            true,
+            self.ctx.clone(),
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn poll_web(&mut self) {
+        use crate::web::{Event, Purpose};
+        for event in crate::web::take_events() {
+            match event {
+                Event::Picked(Purpose::Open, files) => {
+                    let paths: Vec<PathBuf> =
+                        files.into_iter().map(crate::web::store_file).collect();
+                    if let Some(p) = primary_map_file(&paths) {
+                        self.open(&p);
+                    }
+                }
+                Event::Picked(Purpose::AddPlane, files) => {
+                    let paths: Vec<PathBuf> =
+                        files.into_iter().map(crate::web::store_file).collect();
+                    if let Some(p) = primary_map_file(&paths) {
+                        self.add_plane_from(&p);
+                    }
+                }
+                Event::Picked(Purpose::Blueprint { cave }, files) => {
+                    if let Some(f) = files.into_iter().next() {
+                        if let Err(e) = self.gen.set_own(cave, f.name, &f.bytes) {
+                            self.error = Some(e);
+                        }
+                    }
+                }
+                Event::Directory(Some(name)) => {
+                    self.error = None;
+                    self.status = format!("Maps are read from and saved into {name}");
+                }
+                Event::Directory(None) => {
+                    self.status = "No folder was chosen".to_owned();
+                }
+                Event::Listed(names) => self.folder_files = names,
+                Event::Status(text) => {
+                    self.error = None;
+                    self.status = text;
+                }
+                Event::Error(text) => self.error = Some(text),
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn pick_file(&mut self) {
         let mut dlg = rfd::FileDialog::new().add_filter("Dominions 6 map", &["d6m", "map"]);
         if let Some(p) = &self.project {
@@ -1460,14 +1542,33 @@ impl App {
                 Tool::Height => Tool::Select,
             };
         }
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if let Some(p) = dropped.into_iter().next() {
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            self.dropped(dropped);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dropped(&mut self, files: Vec<egui::DroppedFile>) {
+        if let Some(p) = files.into_iter().filter_map(|f| f.path).next() {
+            self.pending = Pending::Open(Some(p));
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn dropped(&mut self, files: Vec<egui::DroppedFile>) {
+        let paths: Vec<PathBuf> = files
+            .into_iter()
+            .filter_map(|f| {
+                let bytes = f.bytes?;
+                Some(crate::web::store_file(crate::web::PickedFile {
+                    name: f.name,
+                    bytes: bytes.to_vec(),
+                    handle: None,
+                }))
+            })
+            .collect();
+        if let Some(p) = primary_map_file(&paths) {
             self.pending = Pending::Open(Some(p));
         }
     }
@@ -1647,6 +1748,7 @@ impl App {
         self.after_edit(n > 0, None, &format!("No start cleared on {n} provinces"));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn add_plane(&mut self) {
         let mut dlg = rfd::FileDialog::new().add_filter("Dominions 6 map", &["d6m", "map"]);
         if let Some(p) = &self.project {
@@ -1655,12 +1757,26 @@ impl App {
         let Some(path) = dlg.pick_file() else {
             return;
         };
+        self.add_plane_from(&path);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn add_plane(&mut self) {
+        crate::web::pick(
+            crate::web::Purpose::AddPlane,
+            crate::web::MAP_FILES,
+            true,
+            self.ctx.clone(),
+        );
+    }
+
+    fn add_plane_from(&mut self, path: &Path) {
         let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
         let opts = self.opts;
         let res = self
             .project
             .as_mut()
-            .map(|p| p.add_plane(&path, &tex, &opts));
+            .map(|p| p.add_plane(path, &tex, &opts));
         self.tex = tex;
         match res {
             Some(Ok(n)) => {
@@ -1679,7 +1795,7 @@ impl App {
                     self.switch_plane(last);
                 }
                 self.apply_river_repair();
-                self.status = format!("Added plane {n} from {}", crate::settings::shown(&path));
+                self.status = format!("Added plane {n} from {}", crate::settings::shown(path));
                 self.error = None;
             }
             Some(Err(e)) => self.error = Some(e),
@@ -1711,10 +1827,14 @@ impl App {
                     .iter()
                     .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .collect();
-                self.status = format!(
-                    "Removed the last plane; its files were kept as {}",
-                    names.join(", ")
-                );
+                self.status = if crate::io::IS_WEB {
+                    "Removed the last plane; its files on disk were left alone".to_owned()
+                } else {
+                    format!(
+                        "Removed the last plane; its files were kept as {}",
+                        names.join(", ")
+                    )
+                };
                 self.error = None;
             }
             Some(Err(e)) => self.error = Some(e),
@@ -1820,13 +1940,13 @@ impl App {
             self.stroke_decor = None;
             return;
         }
-        let wait = (self.stroke_decor_cost * 4).max(std::time::Duration::from_millis(150));
+        let wait = (self.stroke_decor_cost * 4).max(web_time::Duration::from_millis(150));
         let since = self.stroke_decor_at.elapsed();
         if since < wait {
             ctx.request_repaint_after(wait - since);
             return;
         }
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let mut touched = None;
         if follow {
             let (r, became) = self
@@ -1845,7 +1965,7 @@ impl App {
             touched = union(touched, done);
         }
         self.stroke_decor_cost = started.elapsed();
-        self.stroke_decor_at = std::time::Instant::now();
+        self.stroke_decor_at = web_time::Instant::now();
         self.stroke_decor = None;
         if let Some(r) = touched {
             self.mark_tiles(Some(r));
@@ -2435,20 +2555,37 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_max_width(PANEL_W - 22.0);
-                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-                        self.map_section(ui);
-                        ui.add_space(8.0);
-                        if self.gen.action(ui, PANEL_W - 50.0) {
-                            self.pending_generate = true;
-                        }
-                        ui.add_space(8.0);
-                        self.settings_section(ui);
-                        ui.add_space(8.0);
-                        self.view_section(ui);
+                egui::TopBottomPanel::bottom("d6sme_right_foot")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                        left: 0,
+                        right: 2,
+                        top: 4,
+                        bottom: 0,
+                    }))
+                    .show_separator_line(false)
+                    .show_inside(ui, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            github_link(ui, self.github.as_ref());
+                        });
+                    });
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_max_width(PANEL_W - 22.0);
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                                self.map_section(ui);
+                                ui.add_space(8.0);
+                                if self.gen.action(ui, PANEL_W - 50.0) {
+                                    self.pending_generate = true;
+                                }
+                                ui.add_space(8.0);
+                                self.settings_section(ui);
+                                ui.add_space(8.0);
+                                self.view_section(ui);
+                            });
                     });
             });
     }
@@ -2492,6 +2629,71 @@ impl App {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn settings_section(&mut self, ui: &mut egui::Ui) {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(PANEL_W - 50.0);
+            theme::section_first(ui, "Folder");
+            let folder = crate::io::dir_name();
+            if crate::web::can_pick_directory() {
+                if let Some(name) = &folder {
+                    theme::dim(ui, name);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if theme::boxed_button_hint(
+                        ui,
+                        "Choose folder",
+                        true,
+                        "The game's maps folder: its maps are listed here and Save writes into it",
+                    ) {
+                        crate::web::pick_directory(self.ctx.clone());
+                    }
+                    if folder.is_some() && theme::boxed_button(ui, "Forget", true) {
+                        crate::web::forget_directory();
+                        self.folder_files.clear();
+                        self.status = "The folder is no longer used".to_owned();
+                    }
+                });
+            }
+            let maps: Vec<String> = self
+                .folder_files
+                .iter()
+                .filter(|n| n.to_ascii_lowercase().ends_with(".d6m"))
+                .filter(|n| {
+                    let stem = n[..n.len() - 4].to_owned();
+                    crate::mapfile::strip_plane_suffix(&stem).1 == 1
+                })
+                .cloned()
+                .collect();
+            if !maps.is_empty() {
+                theme::section(ui, "Maps in the folder");
+                let mut open = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("folder_maps")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for name in &maps {
+                            if theme::text_button(ui, &name[..name.len() - 4], true) {
+                                open = Some(name.clone());
+                            }
+                        }
+                    });
+                if let Some(name) = open {
+                    crate::web::open_from_directory(name, self.ctx.clone());
+                }
+            }
+            if theme::boxed_button_hint(
+                ui,
+                "Reset all settings",
+                true,
+                "Puts the generator form, the view toggles and the tool settings back to how the program starts; the open map and its seed and name stay",
+            ) {
+                self.reset_all_settings();
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn settings_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(PANEL_W - 50.0);
@@ -2640,6 +2842,10 @@ impl App {
                     }
                 }
                 match p.planes.get(self.active).filter(|_| !p.unsaved) {
+                    Some(d) if crate::io::IS_WEB => {
+                        let name = d.d6m_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        theme::dim(ui, &name);
+                    }
                     Some(d) => theme::path_label(ui, &d.d6m_path, 14.0, theme::INK_DIM),
                     None => {
                         theme::dim(ui, "not saved yet");
@@ -2694,7 +2900,7 @@ impl App {
                 if theme::boxed_button(ui, "Help", true) {
                     self.show_help = !self.show_help;
                 }
-                if theme::boxed_button(ui, "Exit", true) {
+                if !crate::io::IS_WEB && theme::boxed_button(ui, "Exit", true) {
                     self.pending = Pending::Close;
                 }
             });
@@ -3111,7 +3317,7 @@ impl App {
                 theme::dim(ui, "links, a river or pass counts");
                 ui.add(egui::DragValue::new(&mut self.nostart_crossing).range(0.0..=1.0).speed(0.05).fixed_decimals(2));
             });
-            if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start. The game's own map editor has no such tool; this repeats what the random map generator does when it places its No start marks. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
+            if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province with fewer connections than this as No start. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above; impassable borders count 0") {
                 self.set_no_starts();
             }
             if theme::boxed_button_hint(ui, "Clear no start", true, "Removes the No start mark from every province on this plane") {
@@ -3186,7 +3392,7 @@ impl App {
         if !self.show_help {
             return;
         }
-        theme::modal(ctx, "d6sme_help", egui::Order::Foreground, 520.0, |ui| {
+        theme::modal(ctx, "d6sme_help", egui::Order::Foreground, 700.0, |ui| {
             theme::title(ui, "Help");
             theme::section(ui, "Map");
             ui.label(
@@ -3203,7 +3409,11 @@ impl App {
                 keycap::help_row(ui, keys, what, keycap::DEFAULT);
             }
             theme::section(ui, "Files");
-            ui.label("Saving writes the .d6m and the .map beside it, in place.");
+            if crate::io::IS_WEB {
+                ui.label("Open picks the .d6m and .map files of a map together, or drop them on the window. Choose the game's maps folder once in the Folder box and Save writes back into it; without a folder, Save downloads a zip.");
+            } else {
+                ui.label("Saving writes the .d6m and the .map beside it, in place.");
+            }
             ui.add_space(6.0);
             if theme::boxed_button(ui, "Close", true) {
                 self.show_help = false;
@@ -3224,7 +3434,7 @@ impl App {
             ctx,
             "d6sme_generate_confirm",
             egui::Order::Tooltip,
-            360.0,
+            460.0,
             |ui| {
                 theme::title(ui, "Unsaved changes");
                 ui.label(format!("Discard the unsaved changes to {name}?"));
@@ -3263,7 +3473,7 @@ impl App {
         egui::Modal::new(egui::Id::new("d6sme_overwrite"))
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                theme::scroll_body(ui, 380.0, max_h, |ui| {
+                theme::scroll_body(ui, 480.0, max_h, |ui| {
                     theme::title(ui, "File already there");
                     ui.label(format!("Overwrite {base}?"));
                     theme::dim(ui, &crate::settings::shown(&dir));
@@ -3272,7 +3482,7 @@ impl App {
                         if theme::boxed_button(ui, "Overwrite", true) {
                             action = Some(0);
                         }
-                        if theme::boxed_button(ui, "Save as\u{2026}", true) {
+                        if !crate::io::IS_WEB && theme::boxed_button(ui, "Save as\u{2026}", true) {
                             action = Some(1);
                         }
                         if theme::boxed_button(ui, "Cancel", true) {
@@ -3303,7 +3513,7 @@ impl App {
         if !self.confirm_close {
             return;
         }
-        theme::modal(ctx, "d6sme_close", egui::Order::Tooltip, 320.0, |ui| {
+        theme::modal(ctx, "d6sme_close", egui::Order::Tooltip, 420.0, |ui| {
             theme::title(ui, "Unsaved changes");
             ui.label("The map has changes that are not saved.");
             ui.horizontal(|ui| {
@@ -3331,6 +3541,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_arch = "wasm32")]
+        self.poll_web();
         self.handle_keys(ctx);
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => {}
@@ -3428,6 +3640,56 @@ pub fn default_maps_dir() -> Option<PathBuf> {
     crate::settings::game_maps_dir()
 }
 
+fn load_github_mark(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = decode_png(include_bytes!("../assets/github.png")).ok()?;
+    let ci = egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba);
+    let opts = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    Some(ctx.load_texture("github_mark", ci, opts))
+}
+
+fn github_link(ui: &mut egui::Ui, mark: Option<&egui::TextureHandle>) {
+    let font = FontId::proportional(16.0);
+    let galley = ui
+        .painter()
+        .layout_no_wrap("GitHub".to_owned(), font, theme::INK);
+    let icon = 20.0;
+    let gap = 6.0;
+    let size = Vec2::new(icon + gap + galley.size().x, icon.max(galley.size().y));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(REPO_URL);
+    let col = if resp.hovered() {
+        theme::INK_HOT
+    } else {
+        theme::BRASS
+    };
+    let painter = ui.painter();
+    if let Some(tex) = mark {
+        let ir = egui::Rect::from_min_size(
+            Pos2::new(rect.min.x, rect.center().y - icon * 0.5),
+            Vec2::splat(icon),
+        );
+        painter.image(
+            tex.id(),
+            ir,
+            egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            col,
+        );
+    }
+    let text_pos = Pos2::new(
+        rect.min.x + icon + gap,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(text_pos, galley, col);
+    if resp.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
+    }
+}
+
 fn relief_legend(ui: &mut egui::Ui, lo: f32, hi: f32) {
     let width = ui.available_width().min(PANEL_W - 70.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 14.0), Sense::hover());
@@ -3490,6 +3752,33 @@ fn became_status(became: &[(u32, u64)]) -> String {
     format!("Now {}", parts.join(", "))
 }
 
+#[cfg(target_arch = "wasm32")]
+fn primary_map_file(paths: &[PathBuf]) -> Option<PathBuf> {
+    let ext_of = |p: &PathBuf| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let first_plane = |p: &PathBuf| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| crate::mapfile::strip_plane_suffix(s).1 == 1)
+            .unwrap_or(false)
+    };
+    paths
+        .iter()
+        .find(|p| ext_of(p) == "d6m" && first_plane(p))
+        .or_else(|| paths.iter().find(|p| ext_of(p) == "map" && first_plane(p)))
+        .or_else(|| {
+            paths
+                .iter()
+                .find(|p| ext_of(p) == "d6m" || ext_of(p) == "map")
+        })
+        .cloned()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub fn reveal(path: &Path) -> Result<(), String> {
     let cmd = if cfg!(target_os = "windows") {
         "explorer"

@@ -713,18 +713,21 @@ pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn write_canvas(canvas: &Canvas, path: &Path) -> Result<String, String> {
     let bytes = encode_png(canvas.w, canvas.h, &canvas.rgba())?;
-    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    crate::io::write_plain(path, &bytes)?;
     Ok(crate::settings::shown(path))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_canvas_into(canvas: &Canvas, blueprints: &Path, name: &str) -> Result<String, String> {
     let dir = crate::settings::ensure(blueprints.to_path_buf())?;
     let path = crate::settings::unique_path(&dir, name, "png");
     write_canvas(canvas, &path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_canvas_as(
     canvas: &Canvas,
     blueprints: &Path,
@@ -740,6 +743,23 @@ fn save_canvas_as(
         return Ok(None);
     };
     write_canvas(canvas, &path).map(Some)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_canvas_into(canvas: &Canvas, _blueprints: &Path, name: &str) -> Result<String, String> {
+    let bytes = encode_png(canvas.w, canvas.h, &canvas.rgba())?;
+    let file = format!("{name}.png");
+    crate::web::download(&file, &bytes);
+    Ok(format!("{file} as a download"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_canvas_as(
+    canvas: &Canvas,
+    blueprints: &Path,
+    name: &str,
+) -> Result<Option<String>, String> {
+    save_canvas_into(canvas, blueprints, name).map(Some)
 }
 
 pub fn blueprint_rgba(bp: &Blueprint) -> Vec<u8> {

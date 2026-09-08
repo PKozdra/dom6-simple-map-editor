@@ -3,21 +3,21 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use dom6_mapgen::cave::Gate;
-use dom6_mapgen::generate::{
-    generate_new_game, generate_new_game_per_player, generate_with_terrain, Generated,
-};
 use dom6_mapgen::layouts::{
     cave_layout_blueprint_variant, cave_layout_variant_for_seed, layout_blue_acc,
     layout_blueprint_variant, layout_variant_for_seed, CaveLayout, LAYOUT_SIZE,
 };
-use dom6_mapgen::{Blueprint, Control, Layout, Options as GenOptions, Sink, Stage};
+use dom6_mapgen::{Blueprint, Layout, Options as GenOptions, Stage};
+#[cfg(not(target_arch = "wasm32"))]
+use dom6_mapgen::{Control, Sink};
 
 use crate::blueprint_editor::{BlueprintEditor, Outcome, Subject};
 use crate::keycap;
 use crate::theme;
+use crate::wire::{self, Job, Mode};
 
 pub const PROVINCES: RangeInclusive<i32> = 10..=1980;
 pub const AXIS: RangeInclusive<i32> = 500..=7500;
@@ -74,8 +74,8 @@ pub fn cave_layout_index(kind: CaveLayout) -> usize {
 }
 
 pub fn random_seed() -> u32 {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let t = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0) as u64;
     let mut x = t ^ 0x9e37_79b9_7f4a_7c15;
@@ -141,8 +141,8 @@ impl Default for Form {
             own: None,
             cave_layout: CaveLayout::Random,
             cave_own: None,
-            new_game: false,
-            players: 4,
+            new_game: true,
+            players: 10,
             per_player_bucket: 15,
             custom_count: false,
             manual_seed: false,
@@ -263,18 +263,22 @@ impl Form {
 }
 
 pub fn load_blueprint(path: &Path) -> Result<Blueprint, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let ext = path
+    let bytes = crate::io::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    load_blueprint_bytes(&file_label(path), &bytes)
+}
+
+pub fn load_blueprint_bytes(name: &str, bytes: &[u8]) -> Result<Blueprint, String> {
+    let ext = Path::new(name)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     let img = if ext == "tga" {
-        let mut i = crate::tga::decode(&bytes)?;
+        let mut i = crate::tga::decode(bytes)?;
         i.flip_rows();
         i
     } else {
-        crate::textures::decode_png(&bytes)?
+        crate::textures::decode_png(bytes)?
     };
     if img.w == 0 || img.h == 0 {
         return Err("blueprint image is empty".to_string());
@@ -308,15 +312,19 @@ pub struct GeneratedMap {
 
 enum Msg {
     Progress(Stage, u32, u32),
-    Done(Box<Generated>),
+    Done(Vec<GeneratedPlane>, Vec<Gate>),
+    #[allow(dead_code)]
+    Failed(String),
     Cancelled,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct ChannelSink {
     tx: Sender<Msg>,
     cancel: Arc<AtomicBool>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ChannelSink {
     fn control(&self) -> Control {
         if self.cancel.load(Ordering::Relaxed) {
@@ -327,6 +335,7 @@ impl ChannelSink {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Sink for ChannelSink {
     fn wants_hash(&self) -> bool {
         false
@@ -347,9 +356,83 @@ impl Sink for ChannelSink {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_job(job: Job, tx: Sender<Msg>, cancel: Arc<AtomicBool>) -> Result<Handle, String> {
+    std::thread::spawn(move || {
+        let mut sink = ChannelSink {
+            tx: tx.clone(),
+            cancel,
+        };
+        let msg = match wire::run_job(&job, &mut sink) {
+            Ok(g) => {
+                let (planes, gates) = wire::planes_of(g);
+                Msg::Done(planes, gates)
+            }
+            Err(_) => Msg::Cancelled,
+        };
+        let _ = tx.send(msg);
+    });
+    Ok(Handle)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct Handle;
+
+#[cfg(target_arch = "wasm32")]
+struct Handle {
+    worker: web_sys::Worker,
+    _on_message: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.worker.terminate();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_job(job: Job, tx: Sender<Msg>, _cancel: Arc<AtomicBool>) -> Result<Handle, String> {
+    use js_sys::{Array, Uint8Array};
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+    let worker = web_sys::Worker::new(crate::worker::SCRIPT)
+        .map_err(|e| format!("the generator worker could not start: {e:?}"))?;
+    let job_bytes = wire::encode_job(&job);
+    let target = worker.clone();
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+            let data = Uint8Array::new(&e.data()).to_vec();
+            let msg = match data.first().copied() {
+                Some(wire::READY) => {
+                    let array = Uint8Array::from(&job_bytes[..]);
+                    let buffer = array.buffer();
+                    let _ = target.post_message_with_transfer(&array, &Array::of1(&buffer));
+                    return;
+                }
+                Some(wire::PROGRESS) => match wire::decode_progress(&data) {
+                    Ok((stage, done, total)) => Msg::Progress(stage, done, total),
+                    Err(e) => Msg::Failed(e),
+                },
+                Some(wire::DONE) => match wire::decode_done(&data) {
+                    Ok((planes, gates)) => Msg::Done(planes, gates),
+                    Err(e) => Msg::Failed(e),
+                },
+                _ => Msg::Cancelled,
+            };
+            let _ = tx.send(msg);
+        });
+    worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    Ok(Handle {
+        worker,
+        _on_message: on_message,
+    })
+}
+
 struct Run {
     cancel: Arc<AtomicBool>,
     rx: Receiver<Msg>,
+    _handle: Handle,
     stage: Stage,
     done: u32,
     total: u32,
@@ -441,6 +524,19 @@ impl GeneratorPanel {
         self.run.is_some()
     }
 
+    pub fn set_own(&mut self, cave: bool, label: String, bytes: &[u8]) -> Result<(), String> {
+        let image = load_blueprint_bytes(&label, bytes)?;
+        let own = OwnImage { label, image };
+        if cave {
+            self.form.cave_own = Some(own);
+            self.cave_own_tex = None;
+        } else {
+            self.form.own = Some(own);
+            self.own_tex = None;
+        }
+        Ok(())
+    }
+
     pub fn begin(&mut self) {
         if !self.form.manual_seed {
             let s = random_seed();
@@ -472,47 +568,40 @@ impl GeneratorPanel {
         let custom_count = self.form.custom_count;
         let seed = self.form.seed;
         let name = self.form.name.trim().to_string();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = channel();
-        let worker_cancel = Arc::clone(&cancel);
-        let worker_name = name.clone();
-        std::thread::spawn(move || {
-            let mut sink = ChannelSink {
-                tx: tx.clone(),
-                cancel: worker_cancel,
-            };
-            let made = if new_game {
-                if !custom_count && per_player_is_preset(per_player_bucket) {
-                    generate_new_game(
-                        &opts,
-                        seed,
-                        players,
-                        per_player_bucket,
-                        &worker_name,
-                        &mut sink,
-                    )
-                } else {
-                    generate_new_game_per_player(
-                        &opts,
-                        seed,
-                        players,
-                        per_player_bucket,
-                        &worker_name,
-                        &mut sink,
-                    )
+        let mode = if new_game {
+            if !custom_count && per_player_is_preset(per_player_bucket) {
+                Mode::NewGame {
+                    players,
+                    per_player_bucket,
                 }
             } else {
-                generate_with_terrain(&opts, seed, &worker_name, &mut sink)
-            };
-            let msg = match made {
-                Ok(g) => Msg::Done(Box::new(g)),
-                Err(_) => Msg::Cancelled,
-            };
-            let _ = tx.send(msg);
-        });
+                Mode::PerPlayer {
+                    players,
+                    per: per_player_bucket,
+                }
+            }
+        } else {
+            Mode::Terrain
+        };
+        let job = Job {
+            opts,
+            seed,
+            name: name.clone(),
+            mode,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = channel();
+        let handle = match spawn_job(job, tx, Arc::clone(&cancel)) {
+            Ok(h) => h,
+            Err(e) => {
+                self.errors = vec![e];
+                return;
+            }
+        };
         self.run = Some(Run {
             cancel,
             rx,
+            _handle: handle,
             stage: Stage::NoiseTable,
             done: 0,
             total: 0,
@@ -531,30 +620,23 @@ impl GeneratorPanel {
                     run.done = done;
                     run.total = total;
                 }
-                Ok(Msg::Done(g)) => {
+                Ok(Msg::Done(planes, gates)) => {
                     let elapsed = run.started.elapsed();
                     let name = run.name.clone();
                     let seed = run.seed;
                     self.run = None;
-                    let g = *g;
-                    let planes = g
-                        .planes
-                        .into_iter()
-                        .map(|p| GeneratedPlane {
-                            d6m: p.d6m,
-                            map_text: p.map_text,
-                            width: p.width,
-                            height: p.height,
-                            provinces: p.provinces.len().saturating_sub(1),
-                        })
-                        .collect();
                     return Some(GeneratedMap {
                         name,
                         seed,
                         planes,
-                        gates: g.gates,
+                        gates,
                         elapsed,
                     });
+                }
+                Ok(Msg::Failed(e)) => {
+                    self.run = None;
+                    self.note = Some(format!("Generation failed: {e}"));
+                    return None;
                 }
                 Ok(Msg::Cancelled) => {
                     self.run = None;
@@ -818,21 +900,13 @@ impl GeneratorPanel {
                     open_editor = true;
                 }
                 if theme::boxed_button(ui, "Pick", true) {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Blueprint image", &["png", "tga"])
-                        .set_directory(blueprints)
-                        .pick_file()
-                    {
-                        match load_blueprint(&p) {
-                            Ok(image) => {
-                                f.own = Some(OwnImage {
-                                    label: file_label(&p),
-                                    image,
-                                });
-                                *own_tex = None;
-                            }
-                            Err(e) => pick_error = Some(e),
+                    match pick_blueprint(ui.ctx(), blueprints, false) {
+                        Some(Ok(o)) => {
+                            f.own = Some(o);
+                            *own_tex = None;
                         }
+                        Some(Err(e)) => pick_error = Some(e),
+                        None => {}
                     }
                 }
                 if theme::boxed_button(ui, "Clear", picked) {
@@ -949,21 +1023,13 @@ impl GeneratorPanel {
                         open_cave_editor = true;
                     }
                     if theme::boxed_button(ui, "Pick", true) {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("Blueprint image", &["png", "tga"])
-                            .set_directory(blueprints)
-                            .pick_file()
-                        {
-                            match load_blueprint(&p) {
-                                Ok(image) => {
-                                    f.cave_own = Some(OwnImage {
-                                        label: file_label(&p),
-                                        image,
-                                    });
-                                    *cave_own_tex = None;
-                                }
-                                Err(e) => pick_error = Some(e),
+                        match pick_blueprint(ui.ctx(), blueprints, true) {
+                            Some(Ok(o)) => {
+                                f.cave_own = Some(o);
+                                *cave_own_tex = None;
                             }
+                            Some(Err(e)) => pick_error = Some(e),
+                            None => {}
                         }
                     }
                     if theme::boxed_button(ui, "Clear", f.cave_own.is_some()) {
@@ -1001,6 +1067,37 @@ fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_blueprint(
+    _ctx: &egui::Context,
+    blueprints: &Path,
+    _cave: bool,
+) -> Option<Result<OwnImage, String>> {
+    let p = rfd::FileDialog::new()
+        .add_filter("Blueprint image", &["png", "tga"])
+        .set_directory(blueprints)
+        .pick_file()?;
+    Some(load_blueprint(&p).map(|image| OwnImage {
+        label: file_label(&p),
+        image,
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn pick_blueprint(
+    ctx: &egui::Context,
+    _blueprints: &Path,
+    cave: bool,
+) -> Option<Result<OwnImage, String>> {
+    crate::web::pick(
+        crate::web::Purpose::Blueprint { cave },
+        crate::web::IMAGE_FILES,
+        false,
+        ctx.clone(),
+    );
+    None
 }
 
 pub fn preview_image(image: &Blueprint, max_side: usize) -> (usize, usize, Vec<u8>) {
@@ -1119,7 +1216,10 @@ mod tests {
 
     #[test]
     fn province_count_is_bounded() {
-        let mut f = Form::default();
+        let mut f = Form {
+            new_game: false,
+            ..Form::default()
+        };
         f.opts.provinces = 9;
         assert_eq!(f.validate().len(), 1);
         f.opts.provinces = 1981;
@@ -1462,6 +1562,7 @@ mod tests {
         let mut d = GeneratorPanel::default();
         assert!(!d.form.manual_seed);
         let before = d.form.seed;
+        d.form.new_game = false;
         d.form.opts.provinces = 5;
         d.begin();
         assert_ne!(d.form.seed, before);

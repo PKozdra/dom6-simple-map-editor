@@ -1491,8 +1491,8 @@ impl PlaneDoc {
 
     pub fn randomize_terrain(&mut self, tex: &TexSet, opts: &Options) -> usize {
         const KEEP: u64 = 0xffff_fffb_ffc0_1e0f;
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let seed = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
         let mut rng = Rng::new(seed);
@@ -2047,21 +2047,15 @@ pub fn backup_path(path: &Path) -> PathBuf {
 }
 
 pub fn write_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("tmp_write");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
-    Ok(())
+    crate::io::write(path, bytes)
 }
 
 pub fn write_with_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let bak = backup_path(path);
-    if path.exists() && !bak.exists() {
-        std::fs::copy(path, &bak).map_err(|e| format!("backup {}: {e}", bak.display()))?;
+    if crate::io::exists(path) && !crate::io::exists(&bak) {
+        crate::io::copy(path, &bak).map_err(|e| format!("backup {e}"))?;
     }
-    let tmp = path.with_extension("tmp_write");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
-    Ok(())
+    crate::io::write(path, bytes)
 }
 
 pub struct Project {
@@ -2118,12 +2112,12 @@ impl Project {
         let mut notes = Vec::new();
         for plane in 1..=9u32 {
             let d6m_path = dir.join(plane_file_name(&base, plane, "d6m"));
-            if !d6m_path.exists() {
+            if !crate::io::exists(&d6m_path) {
                 continue;
             }
             let d6m = D6m::load(&d6m_path).map_err(|e| format!("{}: {e}", d6m_path.display()))?;
             let map_path = dir.join(plane_file_name(&base, plane, "map"));
-            let map = if map_path.exists() {
+            let map = if crate::io::exists(&map_path) {
                 match MapFile::load(&map_path) {
                     Ok(m) => Some(m),
                     Err(e) => {
@@ -2295,7 +2289,7 @@ impl Project {
             let m = source.with_extension("map");
             (
                 source.to_path_buf(),
-                if m.exists() { Some(m) } else { None },
+                if crate::io::exists(&m) { Some(m) } else { None },
             )
         } else {
             return Err(format!("{} is not a .d6m or .map file", source.display()));
@@ -2305,7 +2299,7 @@ impl Project {
         let map_name = plane_file_name(&self.base, n, "map");
         let d6m_path = self.dir.join(&d6m_name);
         let map_path = self.dir.join(&map_name);
-        if d6m_path.exists() || map_path.exists() {
+        if crate::io::exists(&d6m_path) || crate::io::exists(&map_path) {
             return Err(format!("{d6m_name} or {map_name} already exists"));
         }
         let mut map = match src_map {
@@ -2315,10 +2309,8 @@ impl Project {
         map.path = map_path.clone();
         map.set_imagefile(&d6m_name);
         map.set_title(&format!("{} plane {n}", self.base));
-        std::fs::copy(&src_d6m, &d6m_path)
-            .map_err(|e| format!("copy {}: {e}", d6m_path.display()))?;
-        std::fs::write(&map_path, map.to_text())
-            .map_err(|e| format!("write {}: {e}", map_path.display()))?;
+        crate::io::copy(&src_d6m, &d6m_path)?;
+        crate::io::write(&map_path, map.to_text().as_bytes())?;
         map.modified = false;
         self.planes.push(PlaneDoc::build(
             n,
@@ -2340,7 +2332,7 @@ impl Project {
         let mut moved = Vec::new();
         for path in std::iter::once(&doc.d6m_path).chain(doc.map_path.iter()) {
             let parked = PathBuf::from(format!("{}.removed", path.display()));
-            std::fs::rename(path, &parked).map_err(|e| format!("move {}: {e}", path.display()))?;
+            crate::io::rename(path, &parked)?;
             moved.push(parked);
         }
         self.planes.pop();

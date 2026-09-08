@@ -4,8 +4,10 @@ pub mod d6m;
 pub mod decor;
 pub mod dirt;
 pub mod generator_panel;
+pub mod io;
 pub mod keycap;
 pub mod mapfile;
+pub mod par;
 pub mod project;
 pub mod render;
 pub mod settings;
@@ -13,3 +15,9 @@ pub mod terrain;
 pub mod textures;
 pub mod tga;
 pub mod theme;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
+pub mod wire;
+#[cfg(target_arch = "wasm32")]
+pub mod worker;
+pub mod zipfile;

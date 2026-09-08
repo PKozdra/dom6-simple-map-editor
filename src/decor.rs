@@ -1010,43 +1010,40 @@ pub fn draw_sprites(p: &Plane, tex: &TexSet, sprites: &[Sprite], rect: Rect, out
         return;
     }
     let rows = rect.y1 - rect.y0 + 1;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 32) as i32;
+    let threads = crate::par::threads() as i32;
     let chunk = ((rows + threads - 1) / threads).max(64);
     let first = rect.y0 as usize * stride;
     let last = (rect.y1 as usize + 1) * stride;
     let slice = &mut out[first..last];
     let visible = &visible;
-    std::thread::scope(|sc| {
-        let mut y = rect.y0;
-        let mut rest = slice;
-        while y <= rect.y1 {
-            let y1 = (y + chunk - 1).min(rect.y1);
-            let len = (y1 - y + 1) as usize * stride;
-            let (mine, tail) = rest.split_at_mut(len);
-            rest = tail;
-            let band = Rect {
-                x0: rect.x0,
-                y0: y,
-                x1: rect.x1,
-                y1,
-            };
-            sc.spawn(move || {
-                for s in visible {
-                    blit(tex, s, 0, 0, w, band, mine, y);
-                    if p.hwrap {
-                        blit(tex, s, -w, 0, w, band, mine, y);
-                        blit(tex, s, w, 0, w, band, mine, y);
-                    }
-                    if p.vwrap {
-                        blit(tex, s, 0, -p.h, w, band, mine, y);
-                        blit(tex, s, 0, p.h, w, band, mine, y);
-                    }
+    let mut jobs = Vec::new();
+    let mut y = rect.y0;
+    let mut rest = slice;
+    while y <= rect.y1 {
+        let y1 = (y + chunk - 1).min(rect.y1);
+        let len = (y1 - y + 1) as usize * stride;
+        let (mine, tail) = rest.split_at_mut(len);
+        rest = tail;
+        let band = Rect {
+            x0: rect.x0,
+            y0: y,
+            x1: rect.x1,
+            y1,
+        };
+        jobs.push(move || {
+            for s in visible {
+                blit(tex, s, 0, 0, w, band, mine, y);
+                if p.hwrap {
+                    blit(tex, s, -w, 0, w, band, mine, y);
+                    blit(tex, s, w, 0, w, band, mine, y);
                 }
-            });
-            y = y1 + 1;
-        }
-    });
+                if p.vwrap {
+                    blit(tex, s, 0, -p.h, w, band, mine, y);
+                    blit(tex, s, 0, p.h, w, band, mine, y);
+                }
+            }
+        });
+        y = y1 + 1;
+    }
+    crate::par::run_all(jobs);
 }

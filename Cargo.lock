@@ -645,13 +645,18 @@ dependencies = [
 
 [[package]]
 name = "dom6-simple-map-editor"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dom6-mapgen",
  "eframe",
  "egui",
+ "js-sys",
  "png 0.17.16",
  "rfd",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "winresource",
 ]
 

@@ -8,7 +8,9 @@ Also allows to generate vanilla random game maps.
 
 ## Run
 
-Grab the exe from releases. Open a `.d6m` or `.map`, or drop one on the window, or:
+In the browser: https://pkozdra.github.io/dom6-simple-map-editor/ (Chrome or Edge can open the game's maps folder and save straight back into it; other browsers open files one by one and download the saved ones).
+
+On the desktop, grab the exe from releases. Open a `.d6m` or `.map`, or drop one on the window, or:
 
 ```
 dom6-simple-map-editor.exe path\to\map.d6m
@@ -22,3 +24,11 @@ CTRL + S to save the map.
 ```
 cargo build --release
 ```
+
+The web version needs `trunk` and the `wasm32-unknown-unknown` target:
+
+```
+trunk build --release
+```
+
+It lands in `dist/web`; `trunk serve` runs it at http://127.0.0.1:8790/.

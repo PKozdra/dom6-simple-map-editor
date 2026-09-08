@@ -110,7 +110,7 @@ pub fn game_blueprints_dir() -> Option<PathBuf> {
 
 fn game_sub_dir(name: &str) -> Option<PathBuf> {
     let dir = game_user_dir()?;
-    if !dir.is_dir() {
+    if !crate::io::is_dir(&dir) {
         return None;
     }
     Some(dir.join(name))
@@ -190,7 +190,7 @@ impl Settings {
     }
 
     pub fn reload(mut self) -> Settings {
-        if let Ok(text) = std::fs::read_to_string(&self.config) {
+        if let Ok(text) = crate::io::read_to_string(&self.config) {
             if let Some(folder) = parse_config(&text) {
                 self.data_folder = folder;
             }
@@ -219,22 +219,17 @@ impl Settings {
 
     pub fn save(&self) -> Result<(), String> {
         if self.is_default() {
-            return match std::fs::remove_file(&self.config) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(format!("{}: {e}", self.config.display())),
-            };
+            return crate::io::remove_file(&self.config);
         }
         if let Some(dir) = self.config.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            crate::io::create_dir_all(dir)?;
         }
-        std::fs::write(&self.config, format_config(&self.data_folder))
-            .map_err(|e| format!("{}: {e}", self.config.display()))
+        crate::io::write_plain(&self.config, format_config(&self.data_folder).as_bytes())
     }
 
     pub fn root_dir(&self) -> PathBuf {
         if self.is_default() {
-            if let Some(d) = game_user_dir().filter(|d| d.is_dir()) {
+            if let Some(d) = game_user_dir().filter(|d| crate::io::is_dir(d)) {
                 return d;
             }
         }
@@ -259,19 +254,19 @@ impl Settings {
 }
 
 pub fn ensure(dir: PathBuf) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    crate::io::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let first = dir.join(format!("{stem}.{ext}"));
-    if !first.exists() {
+    if !crate::io::exists(&first) {
         return first;
     }
     let mut n = 2u32;
     loop {
         let candidate = dir.join(format!("{stem}-{n}.{ext}"));
-        if !candidate.exists() {
+        if !crate::io::exists(&candidate) {
             return candidate;
         }
         n += 1;

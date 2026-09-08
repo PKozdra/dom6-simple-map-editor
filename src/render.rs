@@ -443,34 +443,31 @@ fn par_bands(
         return;
     }
     let rows = rect.y1 - rect.y0 + 1;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 32) as i32;
+    let threads = crate::par::threads() as i32;
     let chunk = ((rows + threads - 1) / threads).max(32);
     let stride = w as usize * bytes_per_px;
     let first = rect.y0 as usize * stride;
     let last = (rect.y1 as usize + 1) * stride;
     let slice = &mut out[first..last];
     let f = &f;
-    std::thread::scope(|sc| {
-        let mut y = rect.y0;
-        let mut rest = slice;
-        while y <= rect.y1 {
-            let y1 = (y + chunk - 1).min(rect.y1);
-            let len = (y1 - y + 1) as usize * stride;
-            let (mine, tail) = rest.split_at_mut(len);
-            rest = tail;
-            let band = Rect {
-                x0: rect.x0,
-                y0: y,
-                x1: rect.x1,
-                y1,
-            };
-            sc.spawn(move || f(band, mine, y));
-            y = y1 + 1;
-        }
-    });
+    let mut jobs = Vec::new();
+    let mut y = rect.y0;
+    let mut rest = slice;
+    while y <= rect.y1 {
+        let y1 = (y + chunk - 1).min(rect.y1);
+        let len = (y1 - y + 1) as usize * stride;
+        let (mine, tail) = rest.split_at_mut(len);
+        rest = tail;
+        let band = Rect {
+            x0: rect.x0,
+            y0: y,
+            x1: rect.x1,
+            y1,
+        };
+        jobs.push(move || f(band, mine, y));
+        y = y1 + 1;
+    }
+    crate::par::run_all(jobs);
 }
 
 fn seam_rows(p: &Plane, work: &[f32], band: Rect, out: &mut [u8], row0: i32) {
@@ -1118,36 +1115,29 @@ impl Rendered {
         let carved = &self.carved;
         let bboxes = &self.bboxes;
         let lines = &lines;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 32);
+        let threads = crate::par::threads();
         let chunk = affected.len().div_ceil(threads).max(8);
-        let results: Vec<(usize, Vec<Sprite>, Vec<Sprite>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = affected
-                .chunks(chunk)
-                .map(|ids| {
-                    s.spawn(move || {
-                        let mut out = Vec::with_capacity(ids.len());
-                        for &i in ids {
-                            let mut trees = Vec::new();
-                            let mut rocks = Vec::new();
-                            decor::province_sprites(p, carved, lines, i, season, &mut trees);
-                            decor::mountain_sprites(
-                                p, carved, lines, i, bboxes[i], season, &mut rocks,
-                            );
-                            decor::bridge_sprites(p, i, &mut trees, &mut rocks);
-                            out.push((i, trees, rocks));
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        let jobs: Vec<_> = affected
+            .chunks(chunk)
+            .map(|ids| {
+                move || {
+                    let mut out = Vec::with_capacity(ids.len());
+                    for &i in ids {
+                        let mut trees = Vec::new();
+                        let mut rocks = Vec::new();
+                        decor::province_sprites(p, carved, lines, i, season, &mut trees);
+                        decor::mountain_sprites(p, carved, lines, i, bboxes[i], season, &mut rocks);
+                        decor::bridge_sprites(p, i, &mut trees, &mut rocks);
+                        out.push((i, trees, rocks));
+                    }
+                    out
+                }
+            })
+            .collect();
+        let results: Vec<(usize, Vec<Sprite>, Vec<Sprite>)> = crate::par::run_all_collect(jobs)
+            .into_iter()
+            .flatten()
+            .collect();
         for (i, trees, rocks) in results {
             if let Some(r) = decor::sprite_bounds(&trees) {
                 redraw = redraw.union(r);
@@ -1184,10 +1174,7 @@ impl Rendered {
     fn color(&mut self, p: &Plane, tex: &TexSet, rect: Rect, season: bool) {
         let looks = province_looks(p, season);
         let rows = rect.y1 - rect.y0 + 1;
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 32) as i32;
+        let threads = crate::par::threads() as i32;
         let chunk = ((rows + threads - 1) / threads).max(32);
         let w = p.w as usize;
         let stride = w * 4;
@@ -1196,33 +1183,33 @@ impl Rendered {
         let first = rect.y0 as usize * stride;
         let last = (rect.y1 as usize + 1) * stride;
         let slice = &mut self.rgba[first..last];
-        std::thread::scope(|s| {
-            let mut y = rect.y0;
-            let mut rest = slice;
-            while y <= rect.y1 {
-                let y1 = (y + chunk - 1).min(rect.y1);
-                let len = (y1 - y + 1) as usize * stride;
-                let (mine, tail) = rest.split_at_mut(len);
-                rest = tail;
-                s.spawn(move || {
-                    color_rows_into(
-                        p,
-                        carved,
-                        tex,
-                        looks,
-                        Rect {
-                            x0: rect.x0,
-                            y0: y,
-                            x1: rect.x1,
-                            y1,
-                        },
-                        mine,
-                        y,
-                    );
-                });
-                y = y1 + 1;
-            }
-        });
+        let mut jobs = Vec::new();
+        let mut y = rect.y0;
+        let mut rest = slice;
+        while y <= rect.y1 {
+            let y1 = (y + chunk - 1).min(rect.y1);
+            let len = (y1 - y + 1) as usize * stride;
+            let (mine, tail) = rest.split_at_mut(len);
+            rest = tail;
+            jobs.push(move || {
+                color_rows_into(
+                    p,
+                    carved,
+                    tex,
+                    looks,
+                    Rect {
+                        x0: rect.x0,
+                        y0: y,
+                        x1: rect.x1,
+                        y1,
+                    },
+                    mine,
+                    y,
+                );
+            });
+            y = y1 + 1;
+        }
+        crate::par::run_all(jobs);
     }
 }
 

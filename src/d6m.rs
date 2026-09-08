@@ -149,7 +149,7 @@ impl D6m {
     }
 
     pub fn load(path: &Path) -> Result<D6m, Error> {
-        let b = std::fs::read(path)?;
+        let b = crate::io::read(path)?;
         D6m::parse(&b)
     }
 

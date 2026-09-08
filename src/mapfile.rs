@@ -135,7 +135,7 @@ impl MapFile {
     }
 
     pub fn load(path: &Path) -> std::io::Result<MapFile> {
-        let bytes = std::fs::read(path)?;
+        let bytes = crate::io::read(path)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         Ok(MapFile::parse(&text, path))
     }

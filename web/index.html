@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dominions 6 Simple Map Editor</title>
+<link data-trunk rel="icon" href="../assets/icon.png">
+<link data-trunk rel="rust" href="../Cargo.toml" data-bin="dom6-simple-map-editor" data-type="main" data-wasm-opt="0">
+<link data-trunk rel="rust" href="../Cargo.toml" data-bin="mapgen-worker" data-type="worker" data-loader-shim data-wasm-opt="0">
+<style>
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #171a21; color: #c8ccd4; font-family: system-ui, sans-serif; }
+canvas { display: block; width: 100%; height: 100%; outline: none; }
+#loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; letter-spacing: 0.02em; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="editor"></canvas>
+<div id="loading">Loading the editor…</div>
+</body>
+</html>

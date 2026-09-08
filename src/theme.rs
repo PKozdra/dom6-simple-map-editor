@@ -376,14 +376,19 @@ pub fn scroll_body<R>(
     panel_frame()
         .show(ui, |ui| {
             ui.set_width(width);
-            egui::ScrollArea::vertical()
-                .max_height(max_h - 24.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.set_width(width);
-                    add(ui)
-                })
-                .inner
+            let r = ui.max_rect();
+            let tall = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), max_h));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(tall), |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(max_h - 24.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        add(ui)
+                    })
+                    .inner
+            })
+            .inner
         })
         .inner
 }

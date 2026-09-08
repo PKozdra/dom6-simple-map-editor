@@ -1,0 +1,8 @@
+[build]
+target = "web/index.html"
+dist = "dist/web"
+filehash = false
+release = true
+
+[serve]
+port = 8790
