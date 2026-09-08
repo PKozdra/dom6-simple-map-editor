@@ -30,6 +30,9 @@ jobs:
         run: |
           curl -sSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf - -C /usr/local/bin
           trunk --version
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - name: Build
         shell: bash
         run: trunk build --release --locked --public-url "./"
