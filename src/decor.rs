@@ -110,9 +110,16 @@ impl Ctx<'_> {
     }
 
     fn dry(&self, x: i32, y: i32) -> bool {
-        self.height_clamped(x - 2, y) >= SEA_LEVEL
-            && self.height_clamped(x, y) >= SEA_LEVEL
-            && self.height_clamped(x + 2, y) >= SEA_LEVEL
+        [x - 2, x, x + 2]
+            .into_iter()
+            .all(|px| self.height_clamped(px, y) >= SEA_LEVEL && !self.wall(px, y))
+    }
+
+    fn wall(&self, x: i32, y: i32) -> bool {
+        let cx = x.clamp(0, self.p.w - 1);
+        let cy = y.clamp(0, self.p.h - 1);
+        let o = self.owner(cx, cy);
+        o > 0 && (o as usize) < self.p.flags.len() && self.p.flags[o as usize] & CAVE_WALL != 0
     }
 
     fn rejected(&self, x: i32, y: i32, prov: i32, margin: i32, rng: &mut Rng) -> bool {
@@ -431,6 +438,7 @@ pub fn province_sprites(
     heights: &[f32],
     lines: &HashSet<(u32, u32)>,
     prov: usize,
+    season: bool,
     out: &mut Vec<Sprite>,
 ) {
     out.clear();
@@ -449,7 +457,7 @@ pub fn province_sprites(
     let (cx, cy) = (cx as i32, cy as i32);
     let sc = p.scale;
     let s = sc.max(4.0);
-    let winter = province_winter(flags);
+    let winter = province_winter(flags, season);
     if flags & CAVE != 0 {
         if flags & FOREST != 0 {
             let n = rng.below(150) + 300;
@@ -760,6 +768,7 @@ pub fn mountain_sprites(
     lines: &HashSet<(u32, u32)>,
     prov: usize,
     bbox: [i32; 4],
+    season: bool,
     out: &mut Vec<Sprite>,
 ) {
     if prov == 0 || prov >= p.flags.len() || lines.is_empty() {
@@ -773,7 +782,7 @@ pub fn mountain_sprites(
     let mut rng = Rng::new((prov as u64) << 40 ^ 0xA5A5 ^ (p.w as u64) << 20 ^ p.h as u64);
     let s = p.scale.max(4.0);
     let chance = (220000.0 / (s * s)).max(1.0);
-    let winter = province_winter(flags);
+    let winter = province_winter(flags, season);
     let base_size = (s * 0.9) as i32;
     for y in bbox[2]..=bbox[3] {
         let mut x = bbox[0] + ((bbox[0] & 1) ^ (y & 1));

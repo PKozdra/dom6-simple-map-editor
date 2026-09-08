@@ -1,9 +1,14 @@
 pub mod app;
+pub mod blueprint_editor;
 pub mod d6m;
 pub mod decor;
+pub mod dirt;
+pub mod generator_panel;
+pub mod keycap;
 pub mod mapfile;
 pub mod project;
 pub mod render;
+pub mod settings;
 pub mod terrain;
 pub mod textures;
 pub mod tga;

@@ -1,4 +1,6 @@
-use dom6_simple_map_editor::render::{land_texture, province_winter, Options, Plane, Rendered};
+use dom6_simple_map_editor::render::{
+    cold_scale, land_texture, province_winter, Options, Plane, Rendered,
+};
 use dom6_simple_map_editor::terrain::*;
 use dom6_simple_map_editor::textures::{Image, Tex, TexSet};
 
@@ -62,9 +64,9 @@ fn land_texture_table() {
     assert_eq!(land_texture(FOREST, true), Tex::Winterwood);
     assert_eq!(land_texture(FARM, true), Tex::Winterfarm);
     assert_eq!(land_texture(CAVE | SWAMP, true), Tex::Frozendrip);
-    assert!(province_winter(COLDER));
-    assert!(!province_winter(COLDER | WARMER | CAVE_WALL));
-    assert!(!province_winter(WARMER));
+    assert!(province_winter(COLDER, false));
+    assert!(!province_winter(COLDER | WARMER | CAVE_WALL, false));
+    assert!(!province_winter(WARMER, false));
 }
 
 #[test]
@@ -83,6 +85,9 @@ fn water_bands_follow_depth() {
         edge_fade: false,
         border_percent: 100,
         decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
     };
     let r = Rendered::new(&p, &tex, &opts);
     let px = |x: usize| [r.rgba[x * 4], r.rgba[x * 4 + 1], r.rgba[x * 4 + 2]];
@@ -117,6 +122,9 @@ fn unowned_pixels_stay_transparent_and_gorge_darkens() {
         edge_fade: false,
         border_percent: 100,
         decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
     };
     let r = Rendered::new(&p, &tex, &opts);
     assert_eq!(&r.rgba[0..4], &[0, 0, 0, 0]);
@@ -148,6 +156,9 @@ fn rivers_carve_only_land_between_the_pair() {
         edge_fade: false,
         border_percent: 100,
         decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
     };
     let r = Rendered::new(&p, &tex, &opts);
     assert_eq!(r.carved[2], dom6_simple_map_editor::d6m::RIVER_SENTINEL);
@@ -180,6 +191,9 @@ fn borders_brighten_the_seam() {
         edge_fade: false,
         border_percent: 100,
         decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
     };
     let with = Options {
         borders: true,
@@ -234,4 +248,147 @@ fn partial_rerender_matches_full() {
     );
     let full = Rendered::new(&p2, &tex, &opts);
     assert_eq!(r.rgba, full.rgba);
+}
+
+#[test]
+fn winter_season_cold_scale() {
+    assert!(province_winter(0, true));
+    assert!(province_winter(FOREST, true));
+    assert!(province_winter(COLDER, true));
+    assert!(!province_winter(WARMER, true));
+    assert!(!province_winter(CAVE, true));
+    assert!(province_winter(CAVE | COLDER, true));
+    assert!(!province_winter(CAVE_WALL, true));
+    assert!(!province_winter(OUTER_PLANE, true));
+    assert!(!province_winter(VOID_LAND, true));
+    assert!(province_winter(SEA, true));
+    assert!(!province_winter(SEA | DEEP_SEA, true));
+    assert!(!province_winter(SEA | DEEP_SEA | COLDER, true));
+    assert_eq!(cold_scale(COLDER, true), 2);
+    assert_eq!(cold_scale(WARMER, true), 0);
+    assert_eq!(cold_scale(SEA | COLDER, true), 1);
+    assert_eq!(cold_scale(0, false), 0);
+}
+
+#[test]
+fn winter_repaints_land_and_shallow_water() {
+    let tex = flat_textures();
+    let w = 6;
+    let h = 1;
+    let heights: Vec<f32> = vec![5.0, 5.0, 5.0, -1.0, -50.0, -50.0];
+    let owners: Vec<i16> = vec![1, 2, 3, 4, 4, 5];
+    let flags = vec![0u64, 0, FARM, WARMER, FRESH_WATER, SEA | DEEP_SEA];
+    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let opts = Options {
+        rivers: false,
+        borders: false,
+        capitals: false,
+        edge_fade: false,
+        border_percent: 100,
+        decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
+    };
+    let summer = Rendered::new(&p, &tex, &opts);
+    let winter = Rendered::new(
+        &p,
+        &tex,
+        &Options {
+            winter: true,
+            ..opts
+        },
+    );
+    let px = |r: &Rendered, x: usize| [r.rgba[x * 4], r.rgba[x * 4 + 1], r.rgba[x * 4 + 2]];
+    let want = |t: Tex| {
+        let s = tex.sample(t, 0, 0);
+        [s[0], s[1], s[2]]
+    };
+    assert_eq!(px(&summer, 0), want(Tex::Plain));
+    assert_eq!(px(&winter, 0), want(Tex::Winter));
+    assert_eq!(px(&summer, 1), want(Tex::Farm));
+    assert_eq!(px(&winter, 1), want(Tex::Winterfarm));
+    assert_eq!(px(&summer, 2), want(Tex::Plain));
+    assert_eq!(px(&winter, 2), want(Tex::Plain));
+    assert_eq!(px(&summer, 3), want(Tex::Shallowsea));
+    assert_eq!(px(&winter, 3), want(Tex::Frozen));
+    assert_eq!(px(&summer, 4), px(&winter, 4));
+    assert_eq!(px(&summer, 5), px(&winter, 5));
+}
+
+#[test]
+fn dirt_darkens_land_and_leaves_unowned_alone() {
+    let tex = flat_textures();
+    let w = 96;
+    let h = 96;
+    let heights: Vec<f32> = (0..w * h)
+        .map(|i| if i % w < 8 { -50.0 } else { 20.0 })
+        .collect();
+    let owners: Vec<i16> = (0..w * h).map(|i| if i % w < 4 { 0 } else { 1 }).collect();
+    let flags = vec![0u64, 0];
+    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let base = Options {
+        rivers: false,
+        borders: false,
+        capitals: false,
+        edge_fade: false,
+        border_percent: 100,
+        decor: false,
+        dirt: false,
+        winter: false,
+        grey_no_start: false,
+    };
+    let clean = Rendered::new(&p, &tex, &base);
+    let dirty = Rendered::new(&p, &tex, &Options { dirt: true, ..base });
+    let mut changed = 0;
+    for (i, own) in owners.iter().enumerate() {
+        if *own == 0 {
+            assert_eq!(dirty.rgba[i * 4..i * 4 + 4], clean.rgba[i * 4..i * 4 + 4]);
+        } else if dirty.rgba[i * 4..i * 4 + 3] != clean.rgba[i * 4..i * 4 + 3] {
+            changed += 1;
+        }
+        assert!(dirty.rgba[i * 4] <= clean.rgba[i * 4] || dirty.rgba[i * 4 + 3] == 255);
+    }
+    assert!(
+        changed > (w * h) as usize / 4,
+        "dirt touched {changed} pixels"
+    );
+    let again = Rendered::new(&p, &tex, &Options { dirt: true, ..base });
+    assert_eq!(dirty.rgba, again.rgba);
+}
+
+#[test]
+fn dirt_partial_rerender_matches_full() {
+    let tex = flat_textures();
+    let w = 80;
+    let h = 80;
+    let heights: Vec<f32> = vec![20.0; (w * h) as usize];
+    let owners: Vec<i16> = vec![1; (w * h) as usize];
+    let flags = vec![0u64, 0];
+    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let opts = Options {
+        rivers: false,
+        borders: false,
+        capitals: false,
+        edge_fade: false,
+        border_percent: 100,
+        decor: false,
+        dirt: true,
+        winter: false,
+        grey_no_start: false,
+    };
+    let full = Rendered::new(&p, &tex, &opts);
+    let mut partial = Rendered::new(&p, &tex, &opts);
+    partial.render(
+        &p,
+        &tex,
+        &opts,
+        dom6_simple_map_editor::render::Rect {
+            x0: 20,
+            y0: 20,
+            x1: 50,
+            y1: 50,
+        },
+    );
+    assert_eq!(full.rgba, partial.rgba);
 }

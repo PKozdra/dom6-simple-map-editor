@@ -1,5 +1,6 @@
 use crate::d6m::RIVER_SENTINEL;
 use crate::decor::{self, Sprite};
+use crate::dirt;
 use crate::terrain::*;
 use crate::textures::{Tex, TexSet};
 
@@ -30,6 +31,9 @@ pub struct Options {
     pub capitals: bool,
     pub edge_fade: bool,
     pub decor: bool,
+    pub dirt: bool,
+    pub winter: bool,
+    pub grey_no_start: bool,
     pub border_percent: i32,
 }
 
@@ -41,6 +45,9 @@ impl Default for Options {
             capitals: true,
             edge_fade: true,
             decor: true,
+            dirt: true,
+            winter: false,
+            grey_no_start: false,
             border_percent: 100,
         }
     }
@@ -95,14 +102,31 @@ impl Rect {
     }
 }
 
-pub fn province_winter(flags: u64) -> bool {
+pub fn cold_scale(flags: u64, season: bool) -> i32 {
     let mut v = 0i32;
+    if season && flags & (CAVE | OUTER_PLANE) == 0 {
+        v += 1;
+    }
     if flags & COLDER != 0 {
         v += 1;
     } else if flags & WARMER != 0 {
         v -= 1;
     }
-    v > 0 && flags & CAVE_WALL == 0
+    if flags & SEA != 0 {
+        v = if flags & DEEP_SEA != 0 {
+            0
+        } else {
+            v.clamp(-1, 1)
+        };
+    }
+    if flags & VOID_LAND != 0 {
+        v = 0;
+    }
+    v.clamp(-5, 5)
+}
+
+pub fn province_winter(flags: u64, season: bool) -> bool {
+    cold_scale(flags, season) >= 1 && flags & CAVE_WALL == 0
 }
 
 pub fn land_texture(u: u64, winter: bool) -> Tex {
@@ -173,7 +197,7 @@ pub fn land_texture(u: u64, winter: bool) -> Tex {
 }
 
 #[inline]
-fn wrap_clamp(v: i32, n: i32, wrap: bool) -> i32 {
+pub(crate) fn wrap_clamp(v: i32, n: i32, wrap: bool) -> i32 {
     let mut r = v;
     if wrap {
         if r < 0 {
@@ -280,11 +304,11 @@ struct ProvLook {
     skip: bool,
 }
 
-fn province_looks(p: &Plane) -> Vec<ProvLook> {
+fn province_looks(p: &Plane, season: bool) -> Vec<ProvLook> {
     p.flags
         .iter()
         .map(|&f| {
-            let winter = province_winter(f);
+            let winter = province_winter(f, season);
             ProvLook {
                 land: land_texture(f, winter),
                 winter,
@@ -304,8 +328,8 @@ fn blend_channels(deep: [u8; 4], water: [u8; 4], t: f32) -> [i32; 4] {
     o
 }
 
-pub fn color_rows(p: &Plane, work: &[f32], tex: &TexSet, rect: Rect, out: &mut [u8]) {
-    let looks = province_looks(p);
+pub fn color_rows(p: &Plane, work: &[f32], tex: &TexSet, rect: Rect, out: &mut [u8], season: bool) {
+    let looks = province_looks(p, season);
     color_rows_into(p, work, tex, &looks, rect, out, 0);
 }
 
@@ -712,6 +736,151 @@ pub fn edge_fade_rows(p: &Plane, rect: Rect, out: &mut [u8]) {
     }
 }
 
+pub fn luminance(r: u8, g: u8, b: u8) -> u8 {
+    ((299 * u32::from(r) + 587 * u32::from(g) + 114 * u32::from(b) + 500) / 1000) as u8
+}
+
+pub fn grey_no_start_rows(p: &Plane, rect: Rect, out: &mut [u8]) {
+    let (y0, y1, x0, x1) = (rect.y0, rect.y1, rect.x0, rect.x1);
+    let w = p.w;
+    for y in y0.max(0)..=y1.min(p.h - 1) {
+        for x in x0.max(0)..=x1.min(w - 1) {
+            let i = (y * w + x) as usize;
+            let id = p.owners[i];
+            if id <= 0 || id as usize >= p.flags.len() || p.flags[id as usize] & NO_START == 0 {
+                continue;
+            }
+            let o = i * 4;
+            let l = luminance(out[o], out[o + 1], out[o + 2]);
+            out[o] = l;
+            out[o + 1] = l;
+            out[o + 2] = l;
+        }
+    }
+}
+
+pub const RELIEF_SEA: [u8; 3] = [78, 132, 178];
+pub const RELIEF_DEEP: [u8; 3] = [12, 28, 72];
+pub const RELIEF_LAND: [([u8; 3], f32); 6] = [
+    ([194, 182, 138], 0.0),
+    ([106, 152, 74], 0.12),
+    ([70, 118, 56], 0.35),
+    ([142, 112, 72], 0.6),
+    ([158, 154, 148], 0.85),
+    ([245, 245, 245], 1.0),
+];
+
+pub const HEIGHT_FLOOR: f32 = -2000.0;
+
+pub fn is_channel(h: f32) -> bool {
+    h == RIVER_SENTINEL || h <= HEIGHT_FLOOR
+}
+
+pub fn height_range(heights: &[f32], owners: &[i16]) -> (f32, f32) {
+    let mut lo = f32::MAX;
+    let mut hi = f32::MIN;
+    for (i, &h) in heights.iter().enumerate() {
+        if is_channel(h) || owners.get(i).copied().unwrap_or(0) <= 0 {
+            continue;
+        }
+        lo = lo.min(h);
+        hi = hi.max(h);
+    }
+    if lo == f32::MAX {
+        return (-1.0, 1.0);
+    }
+    (lo.min(-1.0), hi.max(1.0))
+}
+
+fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        a[0] as f32 + (b[0] as f32 - a[0] as f32) * t,
+        a[1] as f32 + (b[1] as f32 - a[1] as f32) * t,
+        a[2] as f32 + (b[2] as f32 - a[2] as f32) * t,
+    ]
+}
+
+pub fn channel_depth(lo: f32, hi: f32) -> f32 {
+    SEA_LEVEL - (hi - lo) * 0.05
+}
+
+pub fn relief_tint(h: f32, lo: f32, hi: f32) -> [f32; 3] {
+    if is_channel(h) {
+        return lerp3(RELIEF_SEA, RELIEF_DEEP, 0.25);
+    }
+    if h < SEA_LEVEL {
+        let t = ((SEA_LEVEL - h) / (SEA_LEVEL - lo)).sqrt();
+        return lerp3(RELIEF_SEA, RELIEF_DEEP, t);
+    }
+    let t = ((h - SEA_LEVEL) / (hi - SEA_LEVEL)).clamp(0.0, 1.0);
+    for k in 1..RELIEF_LAND.len() {
+        let (c0, t0) = RELIEF_LAND[k - 1];
+        let (c1, t1) = RELIEF_LAND[k];
+        if t <= t1 {
+            return lerp3(c0, c1, (t - t0) / (t1 - t0));
+        }
+    }
+    let (c, _) = RELIEF_LAND[RELIEF_LAND.len() - 1];
+    [c[0] as f32, c[1] as f32, c[2] as f32]
+}
+
+pub fn relief_rows(p: &Plane, heights: &[f32], rect: Rect, lo: f32, hi: f32, out: &mut [u8]) {
+    let rect = rect.clamp_to(p.w, p.h);
+    if rect.is_empty() {
+        return;
+    }
+    let (w, h) = (p.w, p.h);
+    let slope = 140.0 / (hi - lo).max(1.0);
+    let light = {
+        let (lx, ly, lz) = match (p.hwrap, p.vwrap) {
+            (false, false) => (-0.55f32, -0.55f32, 0.63f32),
+            (true, false) => (0.0, -0.7, 0.7),
+            (false, true) => (-0.7, 0.0, 0.7),
+            (true, true) => (0.0, 0.0, 1.0),
+        };
+        let n = (lx * lx + ly * ly + lz * lz).sqrt();
+        (lx / n, ly / n, lz / n)
+    };
+    let at = |x: i32, y: i32, own: f32| -> f32 {
+        let v = heights[(wrap_clamp(y, h, p.vwrap) * w + wrap_clamp(x, w, p.hwrap)) as usize];
+        if is_channel(v) {
+            channel_depth(lo, hi).min(own)
+        } else {
+            v.max(lo)
+        }
+    };
+    par_bands(rect, w, out, 4, |band, slice, row0| {
+        for y in band.y0..=band.y1 {
+            for x in band.x0..=band.x1 {
+                let i = (((y - row0) * w + x) * 4) as usize;
+                if p.owners[(y * w + x) as usize] <= 0 {
+                    slice[i..i + 4].fill(0);
+                    continue;
+                }
+                let hv = heights[(y * w + x) as usize];
+                let tint = relief_tint(hv, lo, hi);
+                let shade = {
+                    let own = if is_channel(hv) {
+                        channel_depth(lo, hi)
+                    } else {
+                        hv.max(lo)
+                    };
+                    let gx = (at(x + 1, y, own) - at(x - 1, y, own)) * slope;
+                    let gy = (at(x, y + 1, own) - at(x, y - 1, own)) * slope;
+                    let n = (gx * gx + gy * gy + 1.0).sqrt();
+                    let dot = (-gx * light.0 - gy * light.1 + light.2) / n;
+                    (0.45 + dot * 0.75).clamp(0.35, 1.3)
+                };
+                slice[i] = (tint[0] * shade).clamp(0.0, 255.0) as u8;
+                slice[i + 1] = (tint[1] * shade).clamp(0.0, 255.0) as u8;
+                slice[i + 2] = (tint[2] * shade).clamp(0.0, 255.0) as u8;
+                slice[i + 3] = 255;
+            }
+        }
+    });
+}
+
 pub struct Rendered {
     pub w: i32,
     pub h: i32,
@@ -780,7 +949,10 @@ impl Rendered {
         }
         let inner = rect.expand(self.margin(), p.w, p.h);
         self.touched = inner;
-        self.decorate(p, tex, inner, false);
+        self.decorate(p, tex, inner, false, opts.winter);
+        if opts.grey_no_start {
+            grey_no_start_rows(p, self.touched, &mut self.decor);
+        }
     }
 
     fn render_with(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect, scatter: bool) {
@@ -802,7 +974,10 @@ impl Rendered {
             let within = if full { None } else { Some(reach) };
             carve_rivers(p, &mut self.carved, &self.bboxes, within);
         }
-        self.color(p, tex, inner);
+        self.color(p, tex, inner, opts.winter);
+        if opts.dirt {
+            self.dirtify(p, inner, opts.winter);
+        }
         for y in inner.y0..=inner.y1 {
             let row = (y * p.w) as usize;
             self.mask[row + inner.x0 as usize..=row + inner.x1 as usize].fill(0);
@@ -823,13 +998,19 @@ impl Rendered {
         if opts.edge_fade {
             edge_fade_rows(p, inner, &mut self.rgba);
         }
+        if opts.grey_no_start {
+            grey_no_start_rows(p, inner, &mut self.rgba);
+        }
         self.touched = inner;
         if opts.decor {
             let full = rect.x0 <= 0 && rect.y0 <= 0 && rect.x1 >= p.w - 1 && rect.y1 >= p.h - 1;
             if scatter || full || self.decor.len() != (p.w * p.h * 4) as usize {
-                self.decorate(p, tex, inner, full);
+                self.decorate(p, tex, inner, full, opts.winter);
             } else {
                 self.redraw_decor(p, tex, inner);
+            }
+            if opts.grey_no_start {
+                grey_no_start_rows(p, self.touched, &mut self.decor);
             }
         }
     }
@@ -895,7 +1076,7 @@ impl Rendered {
             + self.mountains.iter().map(Vec::len).sum::<usize>()
     }
 
-    fn decorate(&mut self, p: &Plane, tex: &TexSet, rect: Rect, full: bool) {
+    fn decorate(&mut self, p: &Plane, tex: &TexSet, rect: Rect, full: bool, season: bool) {
         let n = p.flags.len();
         if self.sprites.len() != n {
             self.sprites = vec![Vec::new(); n];
@@ -951,8 +1132,10 @@ impl Rendered {
                         for &i in ids {
                             let mut trees = Vec::new();
                             let mut rocks = Vec::new();
-                            decor::province_sprites(p, carved, lines, i, &mut trees);
-                            decor::mountain_sprites(p, carved, lines, i, bboxes[i], &mut rocks);
+                            decor::province_sprites(p, carved, lines, i, season, &mut trees);
+                            decor::mountain_sprites(
+                                p, carved, lines, i, bboxes[i], season, &mut rocks,
+                            );
                             decor::bridge_sprites(p, i, &mut trees, &mut rocks);
                             out.push((i, trees, rocks));
                         }
@@ -985,8 +1168,21 @@ impl Rendered {
         self.touched = self.touched.union(redraw).clamp_to(p.w, p.h);
     }
 
-    fn color(&mut self, p: &Plane, tex: &TexSet, rect: Rect) {
-        let looks = province_looks(p);
+    fn dirtify(&mut self, p: &Plane, rect: Rect, season: bool) {
+        let rect = rect.clamp_to(p.w, p.h);
+        if rect.is_empty() {
+            return;
+        }
+        let disks = dirt::disks(p, season);
+        let carved = &self.carved;
+        let disks = &disks;
+        par_bands(rect, p.w, &mut self.rgba, 4, |band, slice, row0| {
+            dirt::dirt_band(p, carved, disks, band, slice, row0)
+        });
+    }
+
+    fn color(&mut self, p: &Plane, tex: &TexSet, rect: Rect, season: bool) {
+        let looks = province_looks(p, season);
         let rows = rect.y1 - rect.y0 + 1;
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())

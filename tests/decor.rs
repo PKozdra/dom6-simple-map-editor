@@ -103,7 +103,7 @@ fn forests_get_trees_plains_get_grass_and_water_stays_bare() {
     let p = world.plane();
     let lines = HashSet::new();
     let mut forest = Vec::new();
-    province_sprites(&p, &world.heights, &lines, 1, &mut forest);
+    province_sprites(&p, &world.heights, &lines, 1, false, &mut forest);
     assert!(forest.len() > 100, "forest has {} sprites", forest.len());
     assert!(forest.iter().any(|s| (0x16..0x1c).contains(&s.idx)));
     assert!(forest
@@ -111,24 +111,24 @@ fn forests_get_trees_plains_get_grass_and_water_stays_bare() {
         .all(|s| (0x16..0x1c).contains(&s.idx) || (0x46..=0x4a).contains(&s.idx)));
     assert!(forest.iter().all(|s| s.x < 80 + 5));
     let mut again = Vec::new();
-    province_sprites(&p, &world.heights, &lines, 1, &mut again);
+    province_sprites(&p, &world.heights, &lines, 1, false, &mut again);
     assert_eq!(forest, again);
     let mut wet = world.heights.clone();
     for v in wet.iter_mut() {
         *v = -20.0;
     }
     let mut none = Vec::new();
-    province_sprites(&p, &wet, &lines, 1, &mut none);
+    province_sprites(&p, &wet, &lines, 1, false, &mut none);
     assert!(none.is_empty());
     let plains = World::new(0, 0, Vec::new());
     let pp = plains.plane();
     let mut grass = Vec::new();
-    province_sprites(&pp, &plains.heights, &lines, 1, &mut grass);
+    province_sprites(&pp, &plains.heights, &lines, 1, false, &mut grass);
     assert!(grass.iter().all(|s| s.idx <= 0x4a));
     let winter = World::new(FOREST | COLDER, 0, Vec::new());
     let wp = winter.plane();
     let mut snow = Vec::new();
-    province_sprites(&wp, &winter.heights, &lines, 1, &mut snow);
+    province_sprites(&wp, &winter.heights, &lines, 1, false, &mut snow);
     assert!(snow.iter().any(|s| (0x22..0x28).contains(&s.idx)));
     assert!(snow.iter().all(|s| !(0x16..0x1c).contains(&s.idx)));
 }
@@ -139,10 +139,10 @@ fn site_and_throne_flags_pick_their_sprites() {
     let p = world.plane();
     let lines = HashSet::new();
     let mut sites = Vec::new();
-    province_sprites(&p, &world.heights, &lines, 1, &mut sites);
+    province_sprites(&p, &world.heights, &lines, 1, false, &mut sites);
     assert!(sites.iter().any(|s| (0x34..=0x3c).contains(&s.idx)));
     let mut one = Vec::new();
-    province_sprites(&p, &world.heights, &lines, 2, &mut one);
+    province_sprites(&p, &world.heights, &lines, 2, false, &mut one);
     assert_eq!(one.iter().filter(|s| s.idx == 0x37).count(), 1);
 }
 
@@ -153,14 +153,30 @@ fn mountains_only_grow_along_mountain_lines() {
     let set = mountain_line_set(&p);
     assert!(set.is_empty());
     let mut none = Vec::new();
-    mountain_sprites(&p, &bare.heights, &set, 1, [0, 79, 0, 119], &mut none);
+    mountain_sprites(
+        &p,
+        &bare.heights,
+        &set,
+        1,
+        [0, 79, 0, 119],
+        false,
+        &mut none,
+    );
     assert!(none.is_empty());
     let ridge = World::new(MOUNTAIN, MOUNTAIN, vec![(1, 2)]);
     let p = ridge.plane();
     let set = mountain_line_set(&p);
     assert_eq!(set.len(), 1);
     let mut rocks = Vec::new();
-    mountain_sprites(&p, &ridge.heights, &set, 1, [0, 79, 0, 119], &mut rocks);
+    mountain_sprites(
+        &p,
+        &ridge.heights,
+        &set,
+        1,
+        [0, 79, 0, 119],
+        false,
+        &mut rocks,
+    );
     assert!(!rocks.is_empty());
     assert!(rocks.iter().all(|s| s.x >= 79 - 8));
     assert!(rocks.iter().all(|s| (0..=10).contains(&s.idx)));
@@ -249,4 +265,26 @@ fn rendered_map_carries_a_decor_layer() {
     };
     let r2 = Rendered::new(&p, &tex, &plain);
     assert_eq!(r2.sprite_count(), 0);
+}
+
+#[test]
+fn cave_walls_never_get_sprites_even_above_the_waterline() {
+    let world = World::new(
+        FOREST | CAVE | CAVE_LOOK,
+        FOREST | CAVE_WALL | CAVE_LOOK,
+        Vec::new(),
+    );
+    let p = world.plane();
+    let lines = mountain_line_set(&p);
+    let mut floor = Vec::new();
+    province_sprites(&p, &world.heights, &lines, 1, false, &mut floor);
+    assert!(!floor.is_empty());
+    let mut wall = Vec::new();
+    province_sprites(&p, &world.heights, &lines, 2, false, &mut wall);
+    assert!(
+        wall.iter().all(|s| s.x < 80),
+        "wall province placed {} sprites on its own rock",
+        wall.iter().filter(|s| s.x >= 80).count()
+    );
+    assert!(floor.iter().all(|s| s.x < 80));
 }

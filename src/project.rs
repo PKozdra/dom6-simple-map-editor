@@ -1,4 +1,6 @@
 use crate::d6m::{stored_from_units, units_from_stored, D6m, STORED_LIMIT};
+
+pub const DEEP_SEA_FROM: f32 = -36.0;
 use crate::decor::Rng;
 use crate::mapfile::{plane_file_name, strip_plane_suffix, MapFile};
 use crate::render::{province_bboxes, Options, Plane, Rect, Rendered};
@@ -118,9 +120,11 @@ pub struct PlaneDoc {
     pub pixel_counts: Vec<u32>,
     pub rendered: Rendered,
     pub dirty: bool,
+    pub edited: bool,
     pub owners_changed: bool,
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
+    river_repair: Vec<(u32, i16, i16)>,
     stroke: Option<Edit>,
 }
 
@@ -132,6 +136,20 @@ fn count_pixels(owners: &[i16], n: usize) -> Vec<u32> {
         }
     }
     counts
+}
+
+pub fn wrap_point(x: i32, y: i32, w: i32, h: i32, hwrap: bool, vwrap: bool) -> (i32, i32) {
+    let wx = if hwrap && w > 0 { x.rem_euclid(w) } else { x };
+    let wy = if vwrap && h > 0 { y.rem_euclid(h) } else { y };
+    (wx, wy)
+}
+
+pub fn wrap_delta(d: f32, n: f32, wrap: bool) -> f32 {
+    if wrap && n > 0.0 {
+        d - (d / n).round() * n
+    } else {
+        d
+    }
 }
 
 pub fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
@@ -197,7 +215,9 @@ impl PlaneDoc {
             baseline: Vec::new(),
             pixel_counts,
             rendered: Rendered::empty(),
+            river_repair: Vec::new(),
             dirty: false,
+            edited: false,
             owners_changed: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -255,6 +275,14 @@ impl PlaneDoc {
             bridges: &self.bridges,
             cave_plane: self.index == 2,
         }
+    }
+
+    pub fn hwrap(&self) -> bool {
+        self.map.as_ref().map(|m| m.hwrap).unwrap_or(false)
+    }
+
+    pub fn vwrap(&self) -> bool {
+        self.map.as_ref().map(|m| m.vwrap).unwrap_or(false)
     }
 
     pub fn width(&self) -> i32 {
@@ -426,11 +454,9 @@ impl PlaneDoc {
                 if dx * dx + dy * dy > r * r {
                     continue;
                 }
-                let (x, y) = (cx + dx, cy + dy);
-                if x < 0 || y < 0 || x >= w || y >= h {
+                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
                     continue;
-                }
-                let i = (y * w + x) as usize;
+                };
                 owners.push((i as u32, self.d6m.owners[i], p as i16));
             }
         }
@@ -466,51 +492,7 @@ impl PlaneDoc {
         }
         let w = self.d6m.width;
         let h = self.d6m.height;
-        let owners = &self.d6m.owners;
-        let mut fill: Vec<i16> = Vec::new();
-        let mut idx: Vec<usize> = Vec::new();
-        let mut pos: Vec<usize> = vec![usize::MAX; owners.len()];
-        for (i, &o) in owners.iter().enumerate() {
-            if o as u32 == p {
-                pos[i] = idx.len();
-                idx.push(i);
-                fill.push(0);
-            }
-        }
-        let mut queue = std::collections::VecDeque::new();
-        let near = |i: usize| -> [Option<usize>; 4] {
-            let x = (i as i32) % w;
-            let y = (i as i32) / w;
-            [
-                (x > 0).then(|| i - 1),
-                (x + 1 < w).then(|| i + 1),
-                (y > 0).then(|| i - w as usize),
-                (y + 1 < h).then(|| i + w as usize),
-            ]
-        };
-        for (k, &i) in idx.iter().enumerate() {
-            let mut best: Option<i16> = None;
-            for j in near(i).into_iter().flatten() {
-                let o = owners[j];
-                if o as u32 != p && o > 0 {
-                    best = Some(best.map_or(o, |b: i16| b.min(o)));
-                }
-            }
-            if let Some(o) = best {
-                fill[k] = o;
-                queue.push_back(i);
-            }
-        }
-        while let Some(i) = queue.pop_front() {
-            let o = fill[pos[i]];
-            for j in near(i).into_iter().flatten() {
-                let k = pos[j];
-                if k != usize::MAX && fill[k] == 0 {
-                    fill[k] = o;
-                    queue.push_back(j);
-                }
-            }
-        }
+        let (idx, fill) = fill_removed(w, h, &self.d6m.owners, &self.d6m.heights, p);
         let rec = self.d6m.provinces[p as usize - 1].clone();
         let links: Vec<(u32, i64)> = self
             .neighbours(p)
@@ -552,13 +534,13 @@ impl PlaneDoc {
         for &(i, f) in pixels {
             self.d6m.owners[i as usize] = f;
         }
+        for &i in baseline {
+            self.baseline[i as usize] = self.d6m.owners[i as usize];
+        }
         for o in self.d6m.owners.iter_mut() {
             if *o as u32 > p {
                 *o -= 1;
             }
-        }
-        for &i in baseline {
-            self.baseline[i as usize] = self.d6m.owners[i as usize];
         }
         for b in self.baseline.iter_mut() {
             if *b as u32 > p {
@@ -1125,6 +1107,39 @@ impl PlaneDoc {
             .collect()
     }
 
+    pub fn set_river_repair(&mut self, on: bool, tex: &TexSet, opts: &Options) -> usize {
+        let full = Rect::full(self.d6m.width, self.d6m.height);
+        let changed = if on {
+            if !self.river_repair.is_empty() {
+                return 0;
+            }
+            let changes = self.repair_in(full, |_| true);
+            for &(i, _, new) in &changes {
+                self.d6m.heights[i as usize] = new;
+                self.heights[i as usize] = units_from_stored(new);
+            }
+            self.river_repair = changes;
+            self.river_repair.len()
+        } else {
+            let changes = std::mem::take(&mut self.river_repair);
+            let mut n = 0;
+            for &(i, old, new) in &changes {
+                if self.d6m.heights[i as usize] == new {
+                    self.d6m.heights[i as usize] = old;
+                    self.heights[i as usize] = units_from_stored(old);
+                    n += 1;
+                }
+            }
+            n
+        };
+        if changed > 0 {
+            let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+            r.render(&self.plane(), tex, opts, full);
+            self.rendered = r;
+        }
+        changed
+    }
+
     pub fn repair_scars(&mut self, tex: &TexSet, opts: &Options) -> usize {
         let full = Rect::full(self.d6m.width, self.d6m.height);
         let changes = self.repair_in(full, |_| true);
@@ -1140,6 +1155,33 @@ impl PlaneDoc {
         } else {
             0
         }
+    }
+
+    fn brush_pixel(&self, x: i32, y: i32) -> Option<usize> {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let x = if self.hwrap() { x.rem_euclid(w) } else { x };
+        let y = if self.vwrap() { y.rem_euclid(h) } else { y };
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return None;
+        }
+        Some((y * w + x) as usize)
+    }
+
+    fn brush_rect(&self, cx: i32, cy: i32, radius: i32) -> Rect {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let (x0, x1) = if self.hwrap() && (cx - radius < 0 || cx + radius >= w) {
+            (0, w - 1)
+        } else {
+            ((cx - radius).max(0), (cx + radius).min(w - 1))
+        };
+        let (y0, y1) = if self.vwrap() && (cy - radius < 0 || cy + radius >= h) {
+            (0, h - 1)
+        } else {
+            ((cy - radius).max(0), (cy + radius).min(h - 1))
+        };
+        Rect { x0, y0, x1, y1 }
     }
 
     pub fn paint_begin(&mut self, label: &str) {
@@ -1158,8 +1200,6 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<Rect> {
-        let w = self.d6m.width;
-        let h = self.d6m.height;
         let n = self.d6m.provinces.len();
         if prov as usize > n {
             return None;
@@ -1170,12 +1210,9 @@ impl PlaneDoc {
                 if dx * dx + dy * dy > radius * radius {
                     continue;
                 }
-                let x = cx + dx;
-                let y = cy + dy;
-                if x < 0 || y < 0 || x >= w || y >= h {
+                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
                     continue;
-                }
-                let i = (y * w + x) as usize;
+                };
                 let old = self.d6m.owners[i];
                 if old as i32 == prov as i32 {
                     continue;
@@ -1186,12 +1223,7 @@ impl PlaneDoc {
         if changes.is_empty() {
             return None;
         }
-        let r = Rect {
-            x0: (cx - radius).max(0),
-            y0: (cy - radius).max(0),
-            x1: (cx + radius).min(w - 1),
-            y1: (cy + radius).min(h - 1),
-        };
+        let r = self.brush_rect(cx, cy, radius);
         let step = Edit {
             owners: changes,
             rect: Some(r),
@@ -1219,20 +1251,15 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<Rect> {
-        let w = self.d6m.width;
-        let h = self.d6m.height;
         let mut changes = Vec::new();
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 if dx * dx + dy * dy > radius * radius {
                     continue;
                 }
-                let x = cx + dx;
-                let y = cy + dy;
-                if x < 0 || y < 0 || x >= w || y >= h {
+                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
                     continue;
-                }
-                let i = (y * w + x) as usize;
+                };
                 let old = self.d6m.owners[i];
                 let back = self.baseline[i];
                 if old == back {
@@ -1244,12 +1271,7 @@ impl PlaneDoc {
         if changes.is_empty() {
             return None;
         }
-        let r = Rect {
-            x0: (cx - radius).max(0),
-            y0: (cy - radius).max(0),
-            x1: (cx + radius).min(w - 1),
-            y1: (cy + radius).min(h - 1),
-        };
+        let r = self.brush_rect(cx, cy, radius);
         let step = Edit {
             owners: changes,
             rect: Some(r),
@@ -1269,6 +1291,192 @@ impl PlaneDoc {
         Some(r)
     }
 
+    pub fn paint_height_stamps(
+        &mut self,
+        stamps: &[(i32, i32, f32)],
+        radius: i32,
+        keep_rivers: bool,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<Rect> {
+        let r2 = (radius * radius) as f32;
+        let mut all = Vec::new();
+        let mut rect: Option<Rect> = None;
+        for &(cx, cy, delta) in stamps {
+            let mut changes = Vec::new();
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let d2 = (dx * dx + dy * dy) as f32;
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
+                        continue;
+                    };
+                    if self.d6m.owners[i] <= 0 {
+                        continue;
+                    }
+                    let old = self.d6m.heights[i];
+                    if keep_rivers && old <= -STORED_LIMIT {
+                        continue;
+                    }
+                    let t = 1.0 - d2 / r2.max(1.0);
+                    let falloff = t * t;
+                    let new = stored_from_units(units_from_stored(old) + delta * falloff);
+                    if new != old {
+                        changes.push((i as u32, old, new));
+                    }
+                }
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            let r = self.brush_rect(cx, cy, radius);
+            let step = Edit {
+                heights: changes,
+                rect: Some(r),
+                ..Default::default()
+            };
+            self.perform(&step, false);
+            all.extend(step.heights);
+            rect = union(rect, Some(r));
+        }
+        let r = self.seam_rect(rect?);
+        let mut rd = std::mem::replace(&mut self.rendered, Rendered::empty());
+        if self.stroke.is_some() {
+            rd.render_quick(&self.plane(), tex, opts, r);
+        } else {
+            rd.render(&self.plane(), tex, opts, r);
+        }
+        self.rendered = rd;
+        if let Some(s) = &mut self.stroke {
+            s.heights.extend(all);
+            s.rect = union(s.rect, Some(r));
+        } else {
+            self.redo.clear();
+            self.undo.push(Edit {
+                label: "Height brush".to_string(),
+                heights: all,
+                rect: Some(r),
+                ..Default::default()
+            });
+        }
+        Some(r)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_height_path(
+        &mut self,
+        from: (i32, i32),
+        to: (i32, i32),
+        radius: i32,
+        step: f32,
+        keep_rivers: bool,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<Rect> {
+        let r = radius.max(1) as f32;
+        let (ax, ay) = (from.0 as f32, from.1 as f32);
+        let (bx, by) = (to.0 as f32, to.1 as f32);
+        let (vx, vy) = (bx - ax, by - ay);
+        let len = (vx * vx + vy * vy).sqrt();
+        if len < 0.5 {
+            return None;
+        }
+        let (ux, uy) = (vx / len, vy / len);
+        let k = step / (2.0 * r);
+        let r2 = r * r;
+        let r4 = r2 * r2;
+        let x0 = ax.min(bx).floor() as i32 - radius;
+        let x1 = ax.max(bx).ceil() as i32 + radius;
+        let y0 = ay.min(by).floor() as i32 - radius;
+        let y1 = ay.max(by).ceil() as i32 + radius;
+        let f =
+            |s: f32, c: f32| c * c * s - 2.0 * c * s * s * s / (3.0 * r2) + s.powi(5) / (5.0 * r4);
+        let mut changes = Vec::new();
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let Some(i) = self.brush_pixel(px, py) else {
+                    continue;
+                };
+                if self.d6m.owners[i] <= 0 {
+                    continue;
+                }
+                let (dx, dy) = (px as f32 - ax, py as f32 - ay);
+                let t = dx * ux + dy * uy;
+                let d2 = (dx * dx + dy * dy - t * t).max(0.0);
+                if d2 >= r2 {
+                    continue;
+                }
+                let half = (r2 - d2).sqrt();
+                let lo = (-t).max(-half);
+                let hi = (len - t).min(half);
+                if hi <= lo {
+                    continue;
+                }
+                let c = 1.0 - d2 / r2;
+                let delta = k * (f(hi, c) - f(lo, c));
+                let old = self.d6m.heights[i];
+                if keep_rivers && old <= -STORED_LIMIT {
+                    continue;
+                }
+                let new = stored_from_units(units_from_stored(old) + delta);
+                if new != old {
+                    changes.push((i as u32, old, new));
+                }
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
+        let rect = self.path_rect(from, to, radius);
+        let step_edit = Edit {
+            heights: changes,
+            rect: Some(rect),
+            ..Default::default()
+        };
+        self.perform(&step_edit, false);
+        let r = self.seam_rect(rect);
+        let mut rd = std::mem::replace(&mut self.rendered, Rendered::empty());
+        if self.stroke.is_some() {
+            rd.render_quick(&self.plane(), tex, opts, r);
+        } else {
+            rd.render(&self.plane(), tex, opts, r);
+        }
+        self.rendered = rd;
+        if let Some(s) = &mut self.stroke {
+            s.heights.extend(step_edit.heights);
+            s.rect = union(s.rect, Some(r));
+        } else {
+            self.redo.clear();
+            self.undo.push(Edit {
+                label: "Height brush".to_string(),
+                heights: step_edit.heights,
+                rect: Some(r),
+                ..Default::default()
+            });
+        }
+        Some(r)
+    }
+
+    fn path_rect(&self, from: (i32, i32), to: (i32, i32), radius: i32) -> Rect {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let (lx, hx) = (from.0.min(to.0) - radius, from.0.max(to.0) + radius);
+        let (ly, hy) = (from.1.min(to.1) - radius, from.1.max(to.1) + radius);
+        let (x0, x1) = if self.hwrap() && (lx < 0 || hx >= w) {
+            (0, w - 1)
+        } else {
+            (lx.max(0), hx.min(w - 1))
+        };
+        let (y0, y1) = if self.vwrap() && (ly < 0 || hy >= h) {
+            (0, h - 1)
+        } else {
+            (ly.max(0), hy.min(h - 1))
+        };
+        Rect { x0, y0, x1, y1 }
+    }
+
     pub fn paint_height(
         &mut self,
         cx: i32,
@@ -1278,59 +1486,7 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<Rect> {
-        let w = self.d6m.width;
-        let h = self.d6m.height;
-        let mut changes = Vec::new();
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let d2 = (dx * dx + dy * dy) as f32;
-                let r2 = (radius * radius) as f32;
-                if d2 > r2 {
-                    continue;
-                }
-                let x = cx + dx;
-                let y = cy + dy;
-                if x < 0 || y < 0 || x >= w || y >= h {
-                    continue;
-                }
-                let i = (y * w + x) as usize;
-                if self.d6m.owners[i] <= 0 {
-                    continue;
-                }
-                let falloff = 1.0 - (d2 / r2.max(1.0)) * 0.5;
-                let old = self.d6m.heights[i];
-                let new = stored_from_units(units_from_stored(old) + delta * falloff);
-                if new != old {
-                    changes.push((i as u32, old, new));
-                }
-            }
-        }
-        if changes.is_empty() {
-            return None;
-        }
-        let r = Rect {
-            x0: (cx - radius).max(0),
-            y0: (cy - radius).max(0),
-            x1: (cx + radius).min(w - 1),
-            y1: (cy + radius).min(h - 1),
-        };
-        let step = Edit {
-            heights: changes,
-            rect: Some(r),
-            ..Default::default()
-        };
-        self.commit(&step, false, tex, opts);
-        if let Some(s) = &mut self.stroke {
-            s.heights.extend(step.heights);
-            s.rect = union(s.rect, Some(r));
-        } else {
-            self.redo.clear();
-            self.undo.push(Edit {
-                label: "Height brush".to_string(),
-                ..step
-            });
-        }
-        Some(r)
+        self.paint_height_stamps(&[(cx, cy, delta)], radius, true, tex, opts)
     }
 
     pub fn randomize_terrain(&mut self, tex: &TexSet, opts: &Options) -> usize {
@@ -1473,18 +1629,159 @@ impl PlaneDoc {
         }
     }
 
-    pub fn paint_end(&mut self, tex: &TexSet, opts: &Options) -> Option<Rect> {
-        let s = self.stroke.take()?;
-        if s.is_empty() {
+    pub fn clear_no_starts(&mut self, tex: &TexSet, opts: &Options) -> usize {
+        let n = self.d6m.provinces.len();
+        let mut edit = Edit {
+            label: "Clear no start".to_string(),
+            rect: Some(Rect::full(self.d6m.width, self.d6m.height)),
+            ..Default::default()
+        };
+        for p in 1..=n as u32 {
+            let old = self.flags[p as usize];
+            if old & terrain::NO_START == 0 {
+                continue;
+            }
+            edit.map.push(MapChange::Terrain {
+                p,
+                old,
+                new: old & !terrain::NO_START,
+            });
+        }
+        let count = edit.map.len();
+        if self.push(edit, tex, opts) {
+            count
+        } else {
+            0
+        }
+    }
+
+    pub fn refresh_decor(&mut self, rect: Rect, tex: &TexSet, opts: &Options) -> Option<Rect> {
+        if !opts.decor || rect.is_empty() {
             return None;
         }
-        let rect = s.rect?;
+        let rect = self.seam_rect(rect);
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.refresh_decor(&self.plane(), tex, opts, rect);
+        self.rendered = r;
+        Some(self.rendered.touched)
+    }
+
+    pub fn terrain_for_heights(&self, p: u32) -> Option<u64> {
+        let b = self.bbox(p)?;
+        let w = self.d6m.width;
+        let mut hs: Vec<i16> = Vec::new();
+        for y in b.y0..=b.y1 {
+            let row = (y * w) as usize;
+            for x in b.x0..=b.x1 {
+                let i = row + x as usize;
+                let h = self.d6m.heights[i];
+                if self.d6m.owners[i] as u32 == p && h > -STORED_LIMIT {
+                    hs.push(h);
+                }
+            }
+        }
+        if hs.is_empty() {
+            return None;
+        }
+        let mid = hs.len() / 2;
+        let (_, median, _) = hs.select_nth_unstable(mid);
+        let units = units_from_stored(*median);
+        let old = *self.flags.get(p as usize)?;
+        Some(if units < 0.0 {
+            terrain::make_sea(old, units <= DEEP_SEA_FROM)
+        } else {
+            terrain::make_land(old)
+        })
+    }
+
+    fn terrain_changes(
+        &mut self,
+        provs: &[u32],
+        tex: &TexSet,
+        opts: &Options,
+        became: &mut Vec<(u32, u64)>,
+    ) -> (Vec<MapChange>, Option<Rect>) {
+        let mut extra = Edit::default();
+        let mut rect = None;
+        for &p in provs {
+            let Some(new) = self.terrain_for_heights(p) else {
+                continue;
+            };
+            let old = self.flags[p as usize];
+            if new != old {
+                extra.map.push(MapChange::Terrain { p, old, new });
+                rect = union(rect, self.bbox(p));
+                became.push((p, new));
+            }
+        }
+        if extra.map.is_empty() {
+            return (Vec::new(), None);
+        }
+        self.commit(&extra, false, tex, opts);
+        (extra.map, rect)
+    }
+
+    pub fn follow_terrain_in(
+        &mut self,
+        rect: Rect,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> (Option<Rect>, Vec<(u32, u64)>) {
+        if self.stroke.is_none() {
+            return (None, Vec::new());
+        }
+        let provs: Vec<u32> = (1..=self.d6m.provinces.len() as u32)
+            .filter(|&p| self.bbox(p).is_some_and(|b| b.intersects(rect)))
+            .collect();
+        let mut became = Vec::new();
+        let (extra, r) = self.terrain_changes(&provs, tex, opts, &mut became);
+        if let Some(s) = &mut self.stroke {
+            s.map.extend(extra);
+            s.rect = union(s.rect, r);
+        }
+        (r, became)
+    }
+
+    pub fn paint_end(&mut self, tex: &TexSet, opts: &Options) -> Option<Rect> {
+        self.paint_end_follow(false, tex, opts).0
+    }
+
+    pub fn paint_end_follow(
+        &mut self,
+        follow: bool,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> (Option<Rect>, Vec<(u32, u64)>) {
+        let Some(mut s) = self.stroke.take() else {
+            return (None, Vec::new());
+        };
+        if s.is_empty() {
+            return (None, Vec::new());
+        }
+        let mut became = Vec::new();
+        if follow && !s.heights.is_empty() {
+            let mut provs: Vec<u32> = s
+                .heights
+                .iter()
+                .map(|&(i, _, _)| self.d6m.owners[i as usize] as u32)
+                .filter(|&p| p > 0)
+                .collect();
+            provs.sort_unstable();
+            provs.dedup();
+            let (extra, r) = self.terrain_changes(&provs, tex, opts, &mut became);
+            s.map.extend(extra);
+            s.rect = union(s.rect, r);
+        }
+        let Some(rect) = s.rect else {
+            return (None, became);
+        };
+        let rect = self.seam_rect(rect);
         self.redo.clear();
         self.undo.push(s);
         let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
         r.refresh_decor(&self.plane(), tex, opts, rect);
         self.rendered = r;
-        Some(self.rendered.touched)
+        (Some(self.rendered.touched), became)
     }
 
     pub fn undo_all(&mut self, tex: &TexSet, opts: &Options) -> usize {
@@ -1510,6 +1807,23 @@ impl PlaneDoc {
         true
     }
 
+    fn seam_rect(&self, r: Rect) -> Rect {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let pad = self.rendered.margin() * 2 + 16;
+        let (x0, x1) = if self.hwrap() && (r.x0 < pad || r.x1 >= w - pad) {
+            (0, w - 1)
+        } else {
+            (r.x0, r.x1)
+        };
+        let (y0, y1) = if self.vwrap() && (r.y0 < pad || r.y1 >= h - pad) {
+            (0, h - 1)
+        } else {
+            (r.y0, r.y1)
+        };
+        Rect { x0, y0, x1, y1 }
+    }
+
     fn commit(&mut self, e: &Edit, reverse: bool, tex: &TexSet, opts: &Options) {
         let Some(rect) = self.perform(e, reverse) else {
             return;
@@ -1517,6 +1831,7 @@ impl PlaneDoc {
         if rect.is_empty() {
             return;
         }
+        let rect = self.seam_rect(rect);
         let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
         if self.stroke.is_some() {
             r.render_quick(&self.plane(), tex, opts, rect);
@@ -1667,6 +1982,7 @@ impl PlaneDoc {
             self.rebuild_links();
         }
         self.dirty = true;
+        self.edited = true;
         let pixels = !e.heights.is_empty() || !e.owners.is_empty();
         if full || (pixels && rect.is_none()) {
             Some(Rect::full(self.d6m.width, self.d6m.height))
@@ -1707,26 +2023,34 @@ impl PlaneDoc {
         }
         let mut written = Vec::new();
         let bytes = self.d6m.to_bytes();
-        write_with_backup(&self.d6m_path, &bytes)?;
+        write_replace(&self.d6m_path, &bytes)?;
         written.push(self.d6m_path.clone());
         if let (Some(m), Some(p)) = (&mut self.map, &self.map_path) {
             if self.owners_changed && m.has_pb() {
                 m.replace_pb(self.d6m.width, self.d6m.height, &self.d6m.owners);
             }
             if m.modified {
-                write_with_backup(p, m.to_text().as_bytes())?;
+                write_replace(p, m.to_text().as_bytes())?;
                 m.modified = false;
                 written.push(p.clone());
             }
         }
         self.owners_changed = false;
         self.dirty = false;
+        self.edited = false;
         Ok(written)
     }
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.bak", path.display()))
+}
+
+pub fn write_replace(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp_write");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    Ok(())
 }
 
 pub fn write_with_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1745,6 +2069,7 @@ pub struct Project {
     pub base: String,
     pub planes: Vec<PlaneDoc>,
     pub notes: Vec<String>,
+    pub unsaved: bool,
 }
 
 impl Project {
@@ -1826,7 +2151,109 @@ impl Project {
             base,
             planes,
             notes,
+            unsaved: false,
         })
+    }
+
+    pub fn from_generated(
+        dir: PathBuf,
+        name: &str,
+        planes: &[(&[u8], &str)],
+        gates: &[(u16, u16)],
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Result<Project, String> {
+        let base = strip_plane_suffix(name).0;
+        if base.is_empty() {
+            return Err("a generated map needs a name".to_string());
+        }
+        if planes.is_empty() {
+            return Err("a generated map needs at least one plane".to_string());
+        }
+        if planes.len() > 9 {
+            return Err("a map can hold at most 9 planes".to_string());
+        }
+        let mut parsed = Vec::new();
+        for (i, (bytes, text)) in planes.iter().enumerate() {
+            let index = i as u32 + 1;
+            let d6m_name = plane_file_name(&base, index, "d6m");
+            let d6m_path = dir.join(&d6m_name);
+            let map_path = dir.join(plane_file_name(&base, index, "map"));
+            let d6m = D6m::parse(bytes).map_err(|e| format!("{d6m_name}: {e}"))?;
+            let mut map = MapFile::parse(text, &map_path);
+            map.set_imagefile(&d6m_name);
+            if index > 1 {
+                map.set_title(&format!("{base} plane {index}"));
+            }
+            parsed.push((index, d6m_path, map_path, d6m, map));
+        }
+        if parsed.len() > 1 {
+            for (n, (surface, cave)) in gates.iter().enumerate() {
+                let n = n as i32 + 1;
+                parsed[0].4.set_gate(*surface as u32, n);
+                parsed[1].4.set_gate(*cave as u32, n);
+            }
+        }
+        let mut docs = Vec::new();
+        for (index, d6m_path, map_path, d6m, mut map) in parsed {
+            map.modified = true;
+            let mut doc =
+                PlaneDoc::build(index, d6m_path, Some(map_path), d6m, Some(map), tex, opts);
+            doc.dirty = true;
+            docs.push(doc);
+        }
+        Ok(Project {
+            dir,
+            base,
+            planes: docs,
+            notes: Vec::new(),
+            unsaved: true,
+        })
+    }
+
+    pub fn retarget(&mut self, dir: PathBuf, base: &str) {
+        let base = strip_plane_suffix(base).0;
+        for d in &mut self.planes {
+            let d6m_name = plane_file_name(&base, d.index, "d6m");
+            let map_name = plane_file_name(&base, d.index, "map");
+            d.d6m_path = dir.join(&d6m_name);
+            let map_path = dir.join(&map_name);
+            if let Some(m) = &mut d.map {
+                m.path = map_path.clone();
+                m.set_imagefile(&d6m_name);
+                if d.index == 1 {
+                    m.set_title(&base);
+                }
+                m.modified = true;
+            }
+            d.map_path = Some(map_path);
+            d.dirty = true;
+        }
+        self.dir = dir;
+        self.base = base;
+        self.unsaved = false;
+    }
+
+    pub fn rename(&mut self, base: &str) {
+        let base = strip_plane_suffix(base).0;
+        if base.is_empty() || base == self.base {
+            return;
+        }
+        if self.unsaved {
+            for d in &mut self.planes {
+                if let Some(m) = &mut d.map {
+                    if d.index == 1 {
+                        m.set_title(&base);
+                    }
+                    m.modified = true;
+                }
+                d.dirty = true;
+            }
+            self.base = base;
+        } else {
+            let dir = self.dir.clone();
+            self.retarget(dir, &base);
+        }
     }
 
     pub fn any_dirty(&self) -> bool {
@@ -1919,6 +2346,29 @@ impl Project {
         self.planes.pop();
         Ok(moved)
     }
+
+    pub fn gateway_ring(&self, gate: i32) -> Vec<(usize, u32)> {
+        if gate == 0 {
+            return Vec::new();
+        }
+        let mut ring = Vec::new();
+        for (i, doc) in self.planes.iter().enumerate() {
+            for prov in 1..=doc.province_count() as u32 {
+                if doc.gate(prov) == gate {
+                    ring.push((i, prov));
+                }
+            }
+        }
+        ring
+    }
+
+    pub fn next_gateway(&self, plane: usize, prov: u32) -> Option<(usize, u32)> {
+        let gate = self.planes.get(plane)?.gate(prov);
+        let ring = self.gateway_ring(gate);
+        let here = ring.iter().position(|&e| e == (plane, prov))?;
+        let next = ring[(here + 1) % ring.len()];
+        (next != (plane, prov)).then_some(next)
+    }
 }
 
 pub fn generated_map_text(base: &str, d6m: &D6m) -> String {
@@ -1957,4 +2407,120 @@ pub fn generated_map_text(base: &str, d6m: &D6m) -> String {
         text.push_str(&format!("#neighbour {a} {b}\n"));
     }
     text
+}
+
+pub fn fill_removed(
+    w: i32,
+    h: i32,
+    owners: &[i16],
+    heights: &[i16],
+    p: u32,
+) -> (Vec<usize>, Vec<i16>) {
+    let mut idx: Vec<usize> = Vec::new();
+    let mut pos: Vec<usize> = vec![usize::MAX; owners.len()];
+    for (i, &o) in owners.iter().enumerate() {
+        if o as u32 == p {
+            pos[i] = idx.len();
+            idx.push(i);
+        }
+    }
+    let mut fill: Vec<i16> = vec![0; idx.len()];
+    let water = |i: usize| heights.get(i).is_some_and(|&z| z < 0);
+    let near = |i: usize| -> [Option<usize>; 8] {
+        let x = (i as i32) % w;
+        let y = (i as i32) / w;
+        let at = |dx: i32, dy: i32| {
+            let nx = x + dx;
+            let ny = y + dy;
+            (nx >= 0 && nx < w && ny >= 0 && ny < h).then(|| (ny * w + nx) as usize)
+        };
+        [
+            at(-1, 0),
+            at(1, 0),
+            at(0, -1),
+            at(0, 1),
+            at(-1, -1),
+            at(1, -1),
+            at(-1, 1),
+            at(1, 1),
+        ]
+    };
+    let pick = |v: &[i16]| -> Option<i16> {
+        let mut best: Option<(usize, i16)> = None;
+        for &o in v {
+            let c = v.iter().filter(|&&q| q == o).count();
+            let better = match best {
+                None => true,
+                Some((bc, bo)) => c > bc || (c == bc && o < bo),
+            };
+            if better {
+                best = Some((c, o));
+            }
+        }
+        best.map(|b| b.1)
+    };
+    let mut queue = std::collections::VecDeque::new();
+    let mut cross: Vec<(usize, i16)> = Vec::new();
+    for (k, &i) in idx.iter().enumerate() {
+        let mut same: Vec<i16> = Vec::new();
+        let mut other: Vec<i16> = Vec::new();
+        for (n, j) in near(i).into_iter().enumerate() {
+            let Some(j) = j else { continue };
+            let o = owners[j];
+            if o as u32 == p || o <= 0 {
+                continue;
+            }
+            let weight = if n < 4 { 2 } else { 1 };
+            let bucket = if water(j) == water(i) {
+                &mut same
+            } else {
+                &mut other
+            };
+            for _ in 0..weight {
+                bucket.push(o);
+            }
+        }
+        if let Some(o) = pick(&same) {
+            fill[k] = o;
+            queue.push_back(i);
+        } else if let Some(o) = pick(&other) {
+            cross.push((i, o));
+        }
+    }
+    let mut edge: Vec<usize> = Vec::new();
+    while let Some(i) = queue.pop_front() {
+        let o = fill[pos[i]];
+        for j in near(i).into_iter().take(4).flatten() {
+            let k = pos[j];
+            if k == usize::MAX || fill[k] != 0 {
+                continue;
+            }
+            if water(j) != water(i) {
+                edge.push(i);
+                continue;
+            }
+            fill[k] = o;
+            queue.push_back(j);
+        }
+    }
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for (i, o) in cross {
+        let k = pos[i];
+        if fill[k] == 0 {
+            fill[k] = o;
+            queue.push_back(i);
+        }
+    }
+    queue.extend(edge);
+    while let Some(i) = queue.pop_front() {
+        let o = fill[pos[i]];
+        for j in near(i).into_iter().take(4).flatten() {
+            let k = pos[j];
+            if k != usize::MAX && fill[k] == 0 {
+                fill[k] = o;
+                queue.push_back(j);
+            }
+        }
+    }
+    (idx, fill)
 }

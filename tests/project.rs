@@ -1,7 +1,7 @@
 use dom6_simple_map_editor::d6m::{D6m, Province, STORED_LIMIT};
-use dom6_simple_map_editor::project::{FlagOp, HeightOp, Project};
+use dom6_simple_map_editor::project::{wrap_delta, wrap_point, FlagOp, HeightOp, Project};
 use dom6_simple_map_editor::render::Options;
-use dom6_simple_map_editor::terrain::{BORDER_BRIDGE, BORDER_RIVER, DEEP_SEA, SEA};
+use dom6_simple_map_editor::terrain::{BORDER_BRIDGE, BORDER_RIVER, DEEP_SEA, NO_START, SEA};
 use dom6_simple_map_editor::textures::{Image, TexSet};
 use std::path::{Path, PathBuf};
 
@@ -125,8 +125,8 @@ fn sea_preset_sinks_province_updates_map_and_keeps_backups() {
     let written = doc.save().unwrap();
     assert_eq!(written.len(), 2);
     assert!(!doc.dirty);
-    let bak = PathBuf::from(format!("{}.bak", p1.display()));
-    assert_eq!(std::fs::read(&bak).unwrap(), original);
+    assert!(!PathBuf::from(format!("{}.bak", p1.display())).exists());
+    assert_ne!(std::fs::read(&p1).unwrap(), original);
     let reloaded = D6m::load(&p1).unwrap();
     for (i, &o) in reloaded.owners.iter().enumerate() {
         if o == 1 {
@@ -150,8 +150,7 @@ fn sea_preset_sinks_province_updates_map_and_keeps_backups() {
     assert!(doc2.redo_last(&t, &opts).is_some());
     assert!(doc2.stats(1).min >= 30.0 - 0.07);
     doc2.save().unwrap();
-    assert!(!PathBuf::from(format!("{}.bak.1", p1.display())).exists());
-    assert_eq!(std::fs::read(&bak).unwrap(), original);
+    assert!(!PathBuf::from(format!("{}.bak", p1.display())).exists());
 }
 
 #[test]
@@ -504,4 +503,349 @@ fn removing_a_province_fills_and_renumbers() {
     assert_eq!(doc.name(2), "Second");
     assert_eq!(doc.owner_at(2, 2), 1);
     assert!(!doc.remove_province(9, &t, &opts));
+}
+
+#[test]
+fn generated_bytes_open_as_an_unsaved_project_and_save_where_retargeted() {
+    let mut opts = dom6_mapgen::Options {
+        width: 512,
+        height: 512,
+        provinces: 12,
+        ..dom6_mapgen::Options::default()
+    };
+    opts.cave_world = false;
+    let g = dom6_mapgen::generate::generate_with_terrain(
+        &opts,
+        3,
+        "random_3",
+        &mut dom6_mapgen::stage::NoSink,
+    )
+    .unwrap();
+    let plane = &g.planes[0];
+    let t = tex();
+    let ropts = Options::default();
+    let mut proj = Project::from_generated(
+        PathBuf::from("."),
+        "random_3",
+        &[(plane.d6m.as_slice(), plane.map_text.as_str())],
+        &[],
+        &t,
+        &ropts,
+    )
+    .unwrap();
+    assert!(proj.unsaved);
+    assert_eq!(proj.base, "random_3");
+    assert_eq!(proj.planes.len(), 1);
+    assert_eq!(proj.planes[0].width(), plane.width);
+    assert_eq!(proj.planes[0].height(), plane.height);
+    assert_eq!(proj.planes[0].province_count(), plane.provinces.len() - 1);
+    assert!(proj.any_dirty());
+
+    let dir = temp_dir("generated");
+    proj.retarget(dir.clone(), "isle");
+    assert!(!proj.unsaved);
+    let written = proj.planes[0].save().unwrap();
+    assert_eq!(written.len(), 2);
+    assert!(dir.join("isle.d6m").exists());
+    assert!(dir.join("isle.map").exists());
+    let text = std::fs::read_to_string(dir.join("isle.map")).unwrap();
+    assert!(text.contains("#imagefile isle.d6m"));
+    assert!(text.contains("#dom2title isle"));
+
+    let reopened = Project::open(&dir.join("isle.d6m"), &t, &ropts).unwrap();
+    assert!(!reopened.unsaved);
+    assert_eq!(
+        reopened.planes[0].province_count(),
+        proj.planes[0].province_count()
+    );
+    assert_eq!(
+        std::fs::read(dir.join("isle.d6m")).unwrap().len(),
+        plane.d6m.len()
+    );
+}
+
+#[test]
+fn a_new_game_map_opens_with_its_caves_plane_and_gateways_and_survives_a_save() {
+    let opts = dom6_mapgen::Options {
+        width: 512,
+        height: 512,
+        caves_plane: true,
+        ..dom6_mapgen::Options::default()
+    };
+    let g = dom6_mapgen::generate::generate_new_game(
+        &opts,
+        11,
+        2,
+        10,
+        "random_11",
+        &mut dom6_mapgen::stage::NoSink,
+    )
+    .unwrap();
+    assert_eq!(g.planes.len(), 2);
+    assert!(!g.gates.is_empty());
+    let planes: Vec<(&[u8], &str)> = g
+        .planes
+        .iter()
+        .map(|p| (p.d6m.as_slice(), p.map_text.as_str()))
+        .collect();
+    let gates: Vec<(u16, u16)> = g.gates.iter().map(|g| (g.surface, g.cave)).collect();
+    let t = tex();
+    let ropts = Options::default();
+    let dir = temp_dir("newgame");
+    let mut proj =
+        Project::from_generated(dir.clone(), "random_11", &planes, &gates, &t, &ropts).unwrap();
+    assert_eq!(proj.planes.len(), 2);
+    assert_eq!(proj.planes[1].index, 2);
+    assert_eq!(proj.planes[0].height(), g.planes[0].height);
+    assert_eq!(proj.planes[1].height(), g.planes[1].height);
+    for (n, (surface, cave)) in gates.iter().enumerate() {
+        let n = n as i32 + 1;
+        assert_eq!(proj.planes[0].gate(*surface as u32), n);
+        assert_eq!(proj.planes[1].gate(*cave as u32), n);
+    }
+
+    proj.retarget(dir.clone(), "under");
+    for d in &mut proj.planes {
+        d.save().unwrap();
+    }
+    assert!(dir.join("under.d6m").exists());
+    assert!(dir.join("under_plane2.d6m").exists());
+    assert!(dir.join("under_plane2.map").exists());
+
+    let reopened = Project::open(&dir.join("under.d6m"), &t, &ropts).unwrap();
+    assert_eq!(reopened.planes.len(), 2);
+    assert_eq!(
+        reopened.planes[1].province_count(),
+        proj.planes[1].province_count()
+    );
+    let (s0, c0) = gates[0];
+    assert_eq!(reopened.planes[0].gate(s0 as u32), 1);
+    assert_eq!(reopened.planes[1].gate(c0 as u32), 1);
+}
+
+#[test]
+fn a_generated_document_is_dirty_but_not_edited_until_a_real_change() {
+    let opts = dom6_mapgen::Options {
+        width: 512,
+        height: 512,
+        provinces: 12,
+        ..dom6_mapgen::Options::default()
+    };
+    let g = dom6_mapgen::generate::generate_with_terrain(
+        &opts,
+        4,
+        "random_4",
+        &mut dom6_mapgen::stage::NoSink,
+    )
+    .unwrap();
+    let plane = &g.planes[0];
+    let t = tex();
+    let ropts = Options::default();
+    let dir = temp_dir("edited");
+    let mut proj = Project::from_generated(
+        dir.clone(),
+        "random_4",
+        &[(plane.d6m.as_slice(), plane.map_text.as_str())],
+        &[],
+        &t,
+        &ropts,
+    )
+    .unwrap();
+    assert!(proj.any_dirty());
+    assert!(!proj.planes.iter().any(|d| d.edited));
+    assert!(proj.planes[0].apply(
+        1,
+        HeightOp::Flat(-5.0),
+        FlagOp::Keep,
+        "Shallows",
+        &t,
+        &ropts
+    ));
+    assert!(proj.planes.iter().any(|d| d.edited));
+    proj.planes[0].save().unwrap();
+    assert!(!proj.planes.iter().any(|d| d.edited));
+}
+
+#[test]
+fn gateway_jump_cycles_across_planes() {
+    let dir = temp_dir("gatejump");
+    let (p1, _) = make_map(&dir, "gates", 1, false);
+    make_map(&dir, "gates", 2, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    assert!(proj.planes[0].set_gate(1, 3, &t, &opts));
+    assert!(proj.planes[0].set_gate(2, 3, &t, &opts));
+    assert!(proj.planes[1].set_gate(1, 3, &t, &opts));
+    assert!(proj.planes[1].set_gate(2, 7, &t, &opts));
+    assert_eq!(proj.gateway_ring(3), vec![(0, 1), (0, 2), (1, 1)]);
+    assert_eq!(proj.next_gateway(0, 1), Some((0, 2)));
+    assert_eq!(proj.next_gateway(0, 2), Some((1, 1)));
+    assert_eq!(proj.next_gateway(1, 1), Some((0, 1)));
+    assert_eq!(proj.next_gateway(1, 2), None);
+    assert!(proj.gateway_ring(0).is_empty());
+    assert_eq!(proj.next_gateway(0, 1), proj.next_gateway(0, 1));
+    assert!(proj.planes[0].set_gate(2, 0, &t, &opts));
+    assert_eq!(proj.next_gateway(0, 1), Some((1, 1)));
+    assert!(proj.planes[1].set_gate(1, 0, &t, &opts));
+    assert_eq!(proj.next_gateway(0, 1), None);
+    assert_eq!(proj.next_gateway(5, 1), None);
+}
+
+#[test]
+fn wrapped_pointer_coordinates_fold_back_onto_the_map() {
+    assert_eq!(wrap_point(-1, -1, 100, 50, true, true), (99, 49));
+    assert_eq!(wrap_point(250, 130, 100, 50, true, true), (50, 30));
+    assert_eq!(wrap_point(-1, -1, 100, 50, false, false), (-1, -1));
+    assert_eq!(wrap_point(-1, 60, 100, 50, true, false), (99, 60));
+    assert_eq!(wrap_point(120, -3, 100, 50, false, true), (120, 47));
+    assert_eq!(wrap_point(7, 9, 0, 0, true, true), (7, 9));
+    assert_eq!(wrap_delta(-98.0, 100.0, true), 2.0);
+    assert_eq!(wrap_delta(60.0, 100.0, true), -40.0);
+    assert_eq!(wrap_delta(-98.0, 100.0, false), -98.0);
+}
+
+#[test]
+fn renaming_a_saved_map_moves_its_files_and_title() {
+    let dir = temp_dir("rename");
+    let (p1, _) = make_map(&dir, "oldname", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    proj.rename("newname");
+    assert_eq!(proj.base, "newname");
+    assert_eq!(proj.planes[0].d6m_path, dir.join("newname.d6m"));
+    assert_eq!(proj.planes[0].map_path, Some(dir.join("newname.map")));
+    proj.planes[0].save().unwrap();
+    let text = std::fs::read_to_string(dir.join("newname.map")).unwrap();
+    assert!(text.contains("#dom2title newname"));
+    assert!(text.contains("#imagefile newname.d6m"));
+    proj.rename("");
+    assert_eq!(proj.base, "newname");
+}
+
+#[test]
+fn removing_a_coastal_province_keeps_sea_pixels_in_the_sea_and_baseline_in_step() {
+    let dir = temp_dir("rmcoast");
+    let w = 20;
+    let h = 12;
+    let mut heights = Vec::new();
+    let mut owners = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let id: i16 = if x < 7 {
+                1
+            } else if x < 13 {
+                2
+            } else {
+                3
+            };
+            owners.push(id);
+            let wet = id == 3 || (id == 2 && y >= 6);
+            heights.push(if wet { -300 } else { 200 });
+        }
+    }
+    let d = D6m {
+        version: 3,
+        width: w,
+        height: h,
+        passthrough: 0,
+        scale_frac: 0,
+        scale_int: 30,
+        provinces: vec![
+            Province {
+                x: 3,
+                y: 5,
+                terrain: 0,
+            },
+            Province {
+                x: 10,
+                y: 3,
+                terrain: 0,
+            },
+            Province {
+                x: 16,
+                y: 5,
+                terrain: 4,
+            },
+        ],
+        heights,
+        owners,
+        trailing: Vec::new(),
+    };
+    let d6m_path = dir.join("rmcoast.d6m");
+    std::fs::write(&d6m_path, d.to_bytes()).unwrap();
+    std::fs::write(
+        dir.join("rmcoast.map"),
+        "#dom2title rmcoast\n#imagefile rmcoast.d6m\n#mapsize 20 12\n#terrain 1 0\n#terrain 2 0\n#terrain 3 4\n#neighbour 1 2\n#neighbour 2 3\n",
+    )
+    .unwrap();
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&d6m_path, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    assert!(doc.remove_province(2, &t, &opts));
+    for y in 0..h {
+        for x in 7..13 {
+            let want = if y >= 6 { 2 } else { 1 };
+            assert_eq!(doc.owner_at(x, y), want, "pixel {x},{y}");
+            assert_eq!(
+                doc.baseline[(y * w + x) as usize],
+                want as i16,
+                "baseline {x},{y}"
+            );
+        }
+    }
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert_eq!(doc.owner_at(10, 8), 2);
+    assert_eq!(doc.baseline[(8 * w + 10) as usize], 2);
+}
+
+#[test]
+fn a_height_stroke_can_carry_the_sea_marks_with_it() {
+    let dir = temp_dir("follow");
+    let (p1, _) = make_map(&dir, "follow", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    assert_eq!(doc.flags[1] & SEA, 0);
+    doc.paint_begin("Height brush");
+    doc.paint_height_stamps(&[(5, 6, -900.0)], 40, true, &t, &opts);
+    let (_, became) = doc.paint_end_follow(true, &t, &opts);
+    assert!(became
+        .iter()
+        .any(|&(p, f)| p == 1 && f & (SEA | DEEP_SEA) == SEA | DEEP_SEA));
+    assert!(became
+        .iter()
+        .any(|&(p, f)| p == 2 && f & DEEP_SEA == DEEP_SEA));
+    assert_eq!(doc.flags[1] & SEA, SEA);
+    assert_eq!(doc.flags[1] & DEEP_SEA, DEEP_SEA);
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert_eq!(doc.flags[1] & SEA, 0);
+    assert_eq!(doc.flags[2] & DEEP_SEA, 0);
+    assert!(doc.redo_last(&t, &opts).is_some());
+    assert_eq!(doc.flags[1] & DEEP_SEA, DEEP_SEA);
+    doc.paint_begin("Height brush");
+    doc.paint_height_stamps(&[(15, 6, 900.0)], 40, true, &t, &opts);
+    let (_, became) = doc.paint_end_follow(true, &t, &opts);
+    assert!(became.iter().any(|&(p, f)| p == 2 && f & SEA == 0));
+    assert_eq!(doc.flags[2] & SEA, 0);
+}
+
+#[test]
+fn no_start_marks_can_be_cleared_for_the_whole_plane() {
+    let dir = temp_dir("clearns");
+    let (p1, _) = make_map(&dir, "clearns", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    let f = doc.flags[1];
+    assert!(doc.set_flags(1, f | NO_START, "ns", &t, &opts));
+    assert_eq!(doc.clear_no_starts(&t, &opts), 1);
+    assert_eq!(doc.flags[1] & NO_START, 0);
+    assert_eq!(doc.clear_no_starts(&t, &opts), 0);
+    assert!(doc.undo_last(&t, &opts).is_some());
+    assert_eq!(doc.flags[1] & NO_START, NO_START);
 }

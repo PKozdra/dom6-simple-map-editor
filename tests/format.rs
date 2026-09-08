@@ -95,7 +95,7 @@ fn rejects_bad_magic_and_truncation() {
 }
 
 #[test]
-fn height_quantisation_matches_engine() {
+fn height_quantisation_is_sixteenths() {
     assert_eq!(stored_from_units(-20.0), -320);
     assert_eq!(units_from_stored(-320), -20.0);
     assert_eq!(stored_from_units(5000.0), 32000);

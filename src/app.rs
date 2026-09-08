@@ -1,5 +1,29 @@
-use crate::project::{union, FlagOp, HeightOp, PlaneDoc, Project};
+use crate::generator_panel::{GeneratedMap, GeneratorPanel};
+use crate::keycap;
+
+const KEY_HELP: &[(&[&str], &str)] = &[
+    (&["Ctrl", "Z"], "Undo"),
+    (&["Ctrl", "Y"], "Redo"),
+    (&["Ctrl", "S"], "Save"),
+    (&["Ctrl", "O"], "Open"),
+    (&["Ctrl", "N"], "Random map generator"),
+    (&["G"], "Generate a random map"),
+    (&["F4"], "Random terrain"),
+    (&["S"], "Select"),
+    (&["L"], "Link"),
+    (&["P"], "Paint area"),
+    (&["H"], "Heights"),
+    (&["Tab"], "Next tool"),
+    (&["PgUp"], "Previous plane"),
+    (&["PgDn"], "Next plane"),
+    (&["Home"], "Fit the map"),
+    (&["Esc"], "Back"),
+    (&["F1"], "Help"),
+];
+use crate::mapfile::plane_file_name;
+use crate::project::{union, wrap_delta, wrap_point, FlagOp, HeightOp, PlaneDoc, Project};
 use crate::render::{Options, Rect};
+use crate::settings::Settings;
 use crate::terrain::{self, *};
 use crate::textures::{decode_png, TexSet};
 use crate::theme;
@@ -16,8 +40,10 @@ struct TileGrid {
     cols: usize,
     rows: usize,
     handles: Vec<Option<egui::TextureHandle>>,
-    dirty: Vec<bool>,
+    dirty: Vec<Option<[usize; 4]>>,
 }
+
+const FULL_TILE: [usize; 4] = [0, 0, usize::MAX, usize::MAX];
 
 impl TileGrid {
     fn new(w: i32, h: i32) -> TileGrid {
@@ -29,25 +55,43 @@ impl TileGrid {
             cols,
             rows,
             handles: (0..cols * rows).map(|_| None).collect(),
-            dirty: vec![true; cols * rows],
+            dirty: vec![Some(FULL_TILE); cols * rows],
         }
     }
 
     fn mark(&mut self, r: Rect) {
         let h = self.h as i32;
-        let top = (h - 1 - r.y1).max(0) as usize / TILE;
-        let bot = (h - 1 - r.y0).max(0) as usize / TILE;
-        let left = r.x0.max(0) as usize / TILE;
-        let right = r.x1.max(0) as usize / TILE;
-        for ty in top..=bot.min(self.rows.saturating_sub(1)) {
-            for tx in left..=right.min(self.cols.saturating_sub(1)) {
-                self.dirty[ty * self.cols + tx] = true;
+        let sy0 = (h - 1 - r.y1).max(0) as usize;
+        let sy1 = ((h - 1 - r.y0).max(0) as usize).min(self.h.saturating_sub(1));
+        let sx0 = r.x0.max(0) as usize;
+        let sx1 = (r.x1.max(0) as usize).min(self.w.saturating_sub(1));
+        if sx0 > sx1 || sy0 > sy1 {
+            return;
+        }
+        for ty in sy0 / TILE..=(sy1 / TILE).min(self.rows.saturating_sub(1)) {
+            for tx in sx0 / TILE..=(sx1 / TILE).min(self.cols.saturating_sub(1)) {
+                let i = ty * self.cols + tx;
+                let local = [
+                    sx0.saturating_sub(tx * TILE),
+                    sy0.saturating_sub(ty * TILE),
+                    (sx1 - tx * TILE).min(TILE - 1),
+                    (sy1 - ty * TILE).min(TILE - 1),
+                ];
+                self.dirty[i] = Some(match self.dirty[i] {
+                    None => local,
+                    Some(d) => [
+                        d[0].min(local[0]),
+                        d[1].min(local[1]),
+                        d[2].max(local[2]),
+                        d[3].max(local[3]),
+                    ],
+                });
             }
         }
     }
 
     fn mark_all(&mut self) {
-        self.dirty.iter_mut().for_each(|d| *d = true);
+        self.dirty.iter_mut().for_each(|d| *d = Some(FULL_TILE));
     }
 
     fn upload(&mut self, ctx: &egui::Context, rgba: &[u8], name: &str, premultiplied: bool) {
@@ -56,27 +100,35 @@ impl TileGrid {
         for ty in 0..self.rows {
             for tx in 0..self.cols {
                 let i = ty * self.cols + tx;
-                if !self.dirty[i] {
+                let Some(d) = self.dirty[i].take() else {
                     continue;
-                }
-                self.dirty[i] = false;
+                };
                 let x0 = tx * TILE;
                 let y0 = ty * TILE;
                 let tw = (w - x0).min(TILE);
                 let th = (h - y0).min(TILE);
-                let mut buf = vec![0u8; tw * th * 4];
-                for row in 0..th {
-                    let eng_y = h - 1 - (y0 + row);
-                    let src = (eng_y * w + x0) * 4;
-                    buf[row * tw * 4..(row + 1) * tw * 4].copy_from_slice(&rgba[src..src + tw * 4]);
+                let partial = self.handles[i].is_some() && d != FULL_TILE;
+                let (px, py, pw, ph) = if partial {
+                    let px = d[0].min(tw - 1);
+                    let py = d[1].min(th - 1);
+                    (px, py, d[2].min(tw - 1) - px + 1, d[3].min(th - 1) - py + 1)
+                } else {
+                    (0, 0, tw, th)
+                };
+                let mut buf = vec![0u8; pw * ph * 4];
+                for row in 0..ph {
+                    let eng_y = h - 1 - (y0 + py + row);
+                    let src = (eng_y * w + x0 + px) * 4;
+                    buf[row * pw * 4..(row + 1) * pw * 4].copy_from_slice(&rgba[src..src + pw * 4]);
                 }
                 let image = if premultiplied {
-                    egui::ColorImage::from_rgba_premultiplied([tw, th], &buf)
+                    egui::ColorImage::from_rgba_premultiplied([pw, ph], &buf)
                 } else {
-                    egui::ColorImage::from_rgba_unmultiplied([tw, th], &buf)
+                    egui::ColorImage::from_rgba_unmultiplied([pw, ph], &buf)
                 };
                 let opts = egui::TextureOptions::LINEAR;
                 match &mut self.handles[i] {
+                    Some(hnd) if partial => hnd.set_partial([px, py], image, opts),
                     Some(hnd) => hnd.set(image, opts),
                     None => {
                         self.handles[i] = Some(ctx.load_texture(format!("{name}_{i}"), image, opts))
@@ -121,7 +173,10 @@ impl Overlay {
         let w = doc.width();
         let h = doc.height();
         let owners = &doc.d6m.owners;
+        let (hw, vw) = (doc.hwrap(), doc.vwrap());
         let inside = |x: i32, y: i32| {
+            let x = if hw { x.rem_euclid(w) } else { x };
+            let y = if vw { y.rem_euclid(h) } else { y };
             x >= 0 && y >= 0 && x < w && y < h && owners[(y * w + x) as usize] as u32 == prov
         };
         for y in r.y0..=r.y1 {
@@ -216,6 +271,12 @@ enum Tool {
     Link,
     Paint,
     Height,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Editor,
+    Generator,
 }
 
 #[derive(Clone, PartialEq)]
@@ -335,6 +396,68 @@ fn terrain_icons(f: u64) -> Vec<u16> {
     out
 }
 
+const MIN_ZOOM: f32 = 0.02;
+const THUMB_W: usize = 320;
+const LABEL_MIN_ZOOM: f32 = 0.25;
+const DOT_MIN_ZOOM: f32 = 0.12;
+const MAX_WRAP_COPIES: i32 = 96;
+
+fn wrap_fits(span: f32, extent: f32) -> bool {
+    span > 1.0 && ((extent / span).ceil() as i32) < MAX_WRAP_COPIES
+}
+
+fn wrap_axis_shifts(base: f32, span: f32, lo: f32, hi: f32, wrap: bool) -> Vec<i32> {
+    if !wrap || span <= 1.0 {
+        return vec![0];
+    }
+    let first = ((lo - base) / span).floor() as i32;
+    let last = ((hi - base) / span).floor() as i32;
+    let last = last.max(first).min(first + MAX_WRAP_COPIES);
+    (first..=last).collect()
+}
+
+fn wrap_shifts(
+    canvas: egui::Rect,
+    offset: Vec2,
+    zoom: f32,
+    w: i32,
+    h: i32,
+    hwrap: bool,
+    vwrap: bool,
+) -> Vec<Vec2> {
+    let span_x = w as f32 * zoom;
+    let span_y = h as f32 * zoom;
+    let xs = wrap_axis_shifts(
+        canvas.min.x + offset.x,
+        span_x,
+        canvas.min.x,
+        canvas.max.x,
+        hwrap,
+    );
+    let ys = wrap_axis_shifts(
+        canvas.min.y + offset.y,
+        span_y,
+        canvas.min.y,
+        canvas.max.y,
+        vwrap,
+    );
+    let mut out = Vec::new();
+    for ky in &ys {
+        for kx in &xs {
+            out.push(Vec2::new(*kx as f32 * span_x, *ky as f32 * span_y));
+        }
+    }
+    out
+}
+
+fn plane_label(index: u32) -> String {
+    match index {
+        1 => "Surface".to_owned(),
+        2 => "Caves".to_owned(),
+        n => format!("Plane {n}"),
+    }
+}
+
 fn terrain_label(f: u64) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if f & UNKNOWN != 0 {
@@ -447,9 +570,32 @@ pub struct App {
     zoom: f32,
     offset: Vec2,
     fit_pending: bool,
+    center_pending: Option<u32>,
+    wrap_view: bool,
+    gen_wrap: (bool, bool),
+    last_canvas: Option<Vec2>,
+    last_wrap_axes: (bool, bool),
+    renaming: bool,
+    name_draft: String,
+    last_click_prov: Option<(usize, u32)>,
     selected: Option<u32>,
     hover: Option<u32>,
     decor_tiles: Vec<TileGrid>,
+    relief_tiles: Vec<TileGrid>,
+    relief: Vec<Vec<u8>>,
+    relief_range: Vec<(f32, f32)>,
+    relief_stale: Vec<bool>,
+    thumbs: Vec<Option<egui::TextureHandle>>,
+    thumb_stale: Vec<bool>,
+    thumb_at: std::time::Instant,
+    relief_in_height: bool,
+    keep_rivers: bool,
+    terrain_follows_height: bool,
+    repair_rivers: bool,
+    stroke_last: Option<(i32, i32)>,
+    stroke_decor: Option<Rect>,
+    stroke_decor_at: std::time::Instant,
+    stroke_decor_cost: std::time::Duration,
     tool: Tool,
     brush: i32,
     paint_empty: bool,
@@ -475,6 +621,12 @@ pub struct App {
     pending: Pending,
     confirm_close: bool,
     show_help: bool,
+    gen: GeneratorPanel,
+    mode: Mode,
+    pending_generate: bool,
+    confirm_generate: bool,
+    settings: Settings,
+    confirm_overwrite: bool,
 }
 
 impl App {
@@ -482,8 +634,13 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         initial: Option<PathBuf>,
         preselect: Option<u32>,
+        random: bool,
     ) -> App {
         theme::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|o| {
+            o.input_options.max_double_click_delay = 0.5;
+            o.input_options.max_click_dist = 8.0;
+        });
         let mut app = App {
             tex: TexSet::embedded(),
             opts: Options::default(),
@@ -494,10 +651,33 @@ impl App {
             zoom: 1.0,
             offset: Vec2::ZERO,
             fit_pending: true,
+            center_pending: None,
+            wrap_view: false,
+            gen_wrap: (false, false),
+            last_canvas: None,
+            last_wrap_axes: (false, false),
+            renaming: false,
+            name_draft: String::new(),
+            last_click_prov: None,
             selected: None,
             hover: None,
             tool: Tool::Select,
             decor_tiles: Vec::new(),
+            relief_tiles: Vec::new(),
+            relief: Vec::new(),
+            relief_range: Vec::new(),
+            relief_stale: Vec::new(),
+            thumbs: Vec::new(),
+            thumb_stale: Vec::new(),
+            thumb_at: std::time::Instant::now(),
+            relief_in_height: true,
+            keep_rivers: true,
+            terrain_follows_height: true,
+            repair_rivers: false,
+            stroke_last: None,
+            stroke_decor: None,
+            stroke_decor_at: std::time::Instant::now(),
+            stroke_decor_cost: std::time::Duration::ZERO,
             brush: 10,
             paint_empty: false,
             painting: None,
@@ -522,6 +702,16 @@ impl App {
             pending: Pending::None,
             confirm_close: false,
             show_help: false,
+            gen: GeneratorPanel::default(),
+            mode: if random {
+                Mode::Generator
+            } else {
+                Mode::Editor
+            },
+            pending_generate: false,
+            confirm_generate: false,
+            settings: Settings::load(),
+            confirm_overwrite: false,
         };
         if let Some(p) = initial {
             app.open(&p);
@@ -538,53 +728,126 @@ impl App {
         app
     }
 
+    fn adopt_project(&mut self, p: Project) {
+        self.tiles = p
+            .planes
+            .iter()
+            .map(|d| TileGrid::new(d.width(), d.height()))
+            .collect();
+        self.overlays = p
+            .planes
+            .iter()
+            .map(|d| Overlay::new(d.width(), d.height()))
+            .collect();
+        self.decor_tiles = p
+            .planes
+            .iter()
+            .map(|d| TileGrid::new(d.width(), d.height()))
+            .collect();
+        self.relief_tiles = p
+            .planes
+            .iter()
+            .map(|d| TileGrid::new(d.width(), d.height()))
+            .collect();
+        self.relief = p.planes.iter().map(|_| Vec::new()).collect();
+        self.relief_range = p.planes.iter().map(|_| (-1.0, 1.0)).collect();
+        self.relief_stale = p.planes.iter().map(|_| true).collect();
+        self.thumbs = p.planes.iter().map(|_| None).collect();
+        self.thumb_stale = p.planes.iter().map(|_| true).collect();
+        self.project = Some(p);
+        self.active = 0;
+        self.selected = None;
+        self.name_for = None;
+        self.error = None;
+        self.fit_pending = true;
+        self.tool = Tool::Select;
+        let (hwrap, vwrap) = self.plane_wraps();
+        if hwrap || vwrap {
+            self.wrap_view = true;
+        }
+        self.apply_river_repair();
+    }
+
+    fn apply_river_repair(&mut self) {
+        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
+        let opts = self.opts;
+        let on = self.repair_rivers;
+        let mut total = 0;
+        if let Some(p) = &mut self.project {
+            for d in &mut p.planes {
+                total += d.set_river_repair(on, &tex, &opts);
+            }
+        }
+        self.tex = tex;
+        if total > 0 {
+            for t in self.tiles.iter_mut().chain(self.decor_tiles.iter_mut()) {
+                t.mark_all();
+            }
+            for st in &mut self.relief_stale {
+                *st = true;
+            }
+            self.refresh_selection();
+        }
+    }
+
+    fn open_generated(&mut self, g: GeneratedMap) {
+        let dir = self.settings.maps_dir();
+        let planes: Vec<(&[u8], &str)> = g
+            .planes
+            .iter()
+            .map(|p| (p.d6m.as_slice(), p.map_text.as_str()))
+            .collect();
+        let gates: Vec<(u16, u16)> = g.gates.iter().map(|g| (g.surface, g.cave)).collect();
+        match Project::from_generated(dir, &g.name, &planes, &gates, &self.tex, &self.opts) {
+            Ok(p) => {
+                self.adopt_project(p);
+                let counts = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.planes.first())
+                    .map(terrain_tally)
+                    .unwrap_or_default();
+                let first = &g.planes[0];
+                let caves = if g.planes.len() > 1 {
+                    format!(
+                        ", {} cave provinces behind {} gateways",
+                        g.planes[1].provinces,
+                        gates.len()
+                    )
+                } else {
+                    String::new()
+                };
+                self.status = format!(
+                    "Generated {} px x {} px with {} provinces{} from seed {} in {:.1} s. {}",
+                    first.width,
+                    first.height,
+                    first.provinces,
+                    caves,
+                    g.seed,
+                    g.elapsed.as_secs_f32(),
+                    counts
+                );
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
     fn open(&mut self, path: &Path) {
         match Project::open(path, &self.tex, &self.opts) {
             Ok(p) => {
                 let planes = p.planes.len();
-                self.tiles = p
-                    .planes
-                    .iter()
-                    .map(|d| TileGrid::new(d.width(), d.height()))
-                    .collect();
-                self.overlays = p
-                    .planes
-                    .iter()
-                    .map(|d| Overlay::new(d.width(), d.height()))
-                    .collect();
-                self.decor_tiles = p
-                    .planes
-                    .iter()
-                    .map(|d| TileGrid::new(d.width(), d.height()))
-                    .collect();
                 let notes = p.notes.clone();
-                let scars: usize = p
-                    .planes
-                    .iter()
-                    .filter(|d| d.index == 2)
-                    .map(|d| d.scar_count())
-                    .sum();
                 self.status = if planes > 1 {
                     format!("Loaded {} with {} planes", p.base, planes)
                 } else {
                     format!("Loaded {}", p.base)
                 };
-                if scars > 0 {
-                    self.status = format!(
-                        "{}. {} grey river pixels on the cave plane, see Repair there",
-                        self.status, scars
-                    );
-                }
                 if !notes.is_empty() {
                     self.status = format!("{} ({})", self.status, notes.join("; "));
                 }
-                self.project = Some(p);
-                self.active = 0;
-                self.selected = None;
-                self.name_for = None;
-                self.error = None;
-                self.fit_pending = true;
-                self.tool = Tool::Select;
+                let status = std::mem::take(&mut self.status);
+                self.adopt_project(p);
+                self.status = status;
             }
             Err(e) => self.error = Some(e),
         }
@@ -609,14 +872,34 @@ impl App {
         out
     }
 
-    fn map_to_screen(&self, canvas: egui::Rect, x: f32, y_img: f32) -> Pos2 {
-        canvas.min + self.offset + Vec2::new(x, y_img) * self.zoom
+    fn map_to_screen_shift(&self, canvas: egui::Rect, x: f32, y_img: f32, shift: Vec2) -> Pos2 {
+        canvas.min + self.offset + shift + Vec2::new(x, y_img) * self.zoom
+    }
+
+    fn wrap_axes(&self) -> (bool, bool) {
+        if !self.wrap_view {
+            return (false, false);
+        }
+        self.doc()
+            .map(|d| (d.hwrap(), d.vwrap()))
+            .unwrap_or((false, false))
+    }
+
+    fn plane_wraps(&self) -> (bool, bool) {
+        self.doc()
+            .map(|d| (d.hwrap(), d.vwrap()))
+            .unwrap_or((false, false))
     }
 
     fn screen_to_map(&self, canvas: egui::Rect, p: Pos2) -> (i32, i32) {
         let v = (p - canvas.min - self.offset) / self.zoom;
-        let h = self.doc().map(|d| d.height()).unwrap_or(0);
-        (v.x.floor() as i32, h - 1 - v.y.floor() as i32)
+        let (w, h) = self
+            .doc()
+            .map(|d| (d.width(), d.height()))
+            .unwrap_or((0, 0));
+        let (hw, vw) = self.wrap_axes();
+        let (x, y_img) = wrap_point(v.x.floor() as i32, v.y.floor() as i32, w, h, hw, vw);
+        (x, h - 1 - y_img)
     }
 
     fn fit(&mut self, canvas: egui::Rect) {
@@ -626,11 +909,51 @@ impl App {
         let w = doc.width() as f32;
         let h = doc.height() as f32;
         let z = (canvas.width() / w).min(canvas.height() / h) * 0.985;
-        self.zoom = z.max(0.02);
+        self.zoom = z.max(MIN_ZOOM);
         self.offset = Vec2::new(
             (canvas.width() - w * self.zoom) * 0.5,
             (canvas.height() - h * self.zoom) * 0.5,
         );
+    }
+
+    fn center_on(&mut self, canvas: egui::Rect, prov: u32) {
+        let Some(doc) = self.doc() else {
+            return;
+        };
+        let Some(&(cx, cy)) = doc.capitals.get(prov as usize - 1) else {
+            return;
+        };
+        let h = doc.height();
+        let target = Vec2::new(cx as f32 + 0.5, (h - 1 - cy as i32) as f32 + 0.5) * self.zoom;
+        self.offset = canvas.size() * 0.5 - target;
+    }
+
+    fn jump_to_gateway(&mut self, prov: u32) {
+        let gate = self.doc().map(|d| d.gate(prov)).unwrap_or(0);
+        if gate == 0 {
+            return;
+        }
+        let next = self
+            .project
+            .as_ref()
+            .and_then(|p| p.next_gateway(self.active, prov));
+        let Some((plane, target)) = next else {
+            self.status =
+                format!("Gate {gate}: province {prov} is the only gateway with that number");
+            return;
+        };
+        if plane != self.active {
+            self.switch_plane(plane);
+            self.fit_pending = false;
+        }
+        self.select(Some(target));
+        self.goto = target;
+        self.center_pending = Some(target);
+        let where_to = self
+            .doc()
+            .map(|d| plane_label(d.index))
+            .unwrap_or_else(|| format!("plane {}", plane + 1));
+        self.status = format!("Gate {gate}: jumped to province {target} on {where_to}");
     }
 
     fn select(&mut self, prov: Option<u32>) {
@@ -664,6 +987,138 @@ impl App {
             match touched {
                 Some(r) => grid.mark(r.expand(4, i32::MAX, i32::MAX)),
                 None => grid.mark_all(),
+            }
+        }
+        if self.relief_shown() && !self.relief_stale.get(active).copied().unwrap_or(true) {
+            self.refresh_relief(touched);
+        } else if let Some(st) = self.relief_stale.get_mut(active) {
+            *st = true;
+        }
+        if let Some(st) = self.thumb_stale.get_mut(active) {
+            *st = true;
+        }
+    }
+
+    fn refresh_thumb(&mut self, ctx: &egui::Context) {
+        let active = self.active;
+        if !self.thumb_stale.get(active).copied().unwrap_or(false) {
+            return;
+        }
+        let has = self
+            .thumbs
+            .get(active)
+            .map(|t| t.is_some())
+            .unwrap_or(false);
+        if has && self.thumb_at.elapsed() < std::time::Duration::from_millis(400) {
+            return;
+        }
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(doc) = project.planes.get(active) else {
+            return;
+        };
+        let (w, h) = (doc.width() as usize, doc.height() as usize);
+        if w == 0 || h == 0 || doc.rendered.rgba.len() != w * h * 4 {
+            return;
+        }
+        let k = w.div_ceil(THUMB_W).max(1);
+        let (ow, oh) = ((w / k).max(1), (h / k).max(1));
+        let decor = if self.opts.decor && doc.rendered.decor.len() == w * h * 4 {
+            Some(&doc.rendered.decor)
+        } else {
+            None
+        };
+        let map = &doc.rendered.rgba;
+        let mut out = vec![0u8; ow * oh * 4];
+        let n = (k * k) as u32;
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut acc = [0u32; 3];
+                for yy in 0..k {
+                    let row = ((oy * k + yy) * w + ox * k) * 4;
+                    for xx in 0..k {
+                        let i = row + xx * 4;
+                        let ma = map[i + 3] as u32;
+                        let (mut r, mut g, mut b) = (
+                            map[i] as u32 * ma / 255,
+                            map[i + 1] as u32 * ma / 255,
+                            map[i + 2] as u32 * ma / 255,
+                        );
+                        if let Some(d) = decor {
+                            let da = d[i + 3] as u32;
+                            r = r * (255 - da) / 255 + d[i] as u32;
+                            g = g * (255 - da) / 255 + d[i + 1] as u32;
+                            b = b * (255 - da) / 255 + d[i + 2] as u32;
+                        }
+                        acc[0] += r;
+                        acc[1] += g;
+                        acc[2] += b;
+                    }
+                }
+                let o = (oy * ow + ox) * 4;
+                out[o] = (acc[0] / n).min(255) as u8;
+                out[o + 1] = (acc[1] / n).min(255) as u8;
+                out[o + 2] = (acc[2] / n).min(255) as u8;
+                out[o + 3] = 255;
+            }
+        }
+        let top = crate::render::flip_to_top_down(ow as i32, oh as i32, &out);
+        let image = egui::ColorImage::from_rgba_unmultiplied([ow, oh], &top);
+        let name = format!("thumb{}", doc.index);
+        match self.thumbs.get_mut(active) {
+            Some(Some(t)) => t.set(image, egui::TextureOptions::LINEAR),
+            Some(slot) => *slot = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR)),
+            None => {}
+        }
+        self.thumb_stale[active] = false;
+        self.thumb_at = std::time::Instant::now();
+    }
+
+    fn relief_shown(&self) -> bool {
+        self.tool == Tool::Height && self.relief_in_height
+    }
+
+    fn refresh_relief(&mut self, rect: Option<Rect>) {
+        let active = self.active;
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(doc) = project.planes.get(active) else {
+            return;
+        };
+        if self.relief.len() <= active {
+            return;
+        }
+        let n = doc.rendered.rgba.len();
+        let full = rect.is_none() || self.relief[active].len() != n || self.relief_stale[active];
+        if full {
+            self.relief[active] = vec![0u8; n];
+            self.relief_range[active] =
+                crate::render::height_range(&doc.rendered.carved, &doc.d6m.owners);
+        }
+        let (lo, hi) = self.relief_range[active];
+        let area = match rect {
+            Some(r) if !full => r.expand(2, i32::MAX, i32::MAX),
+            _ => Rect::full(doc.width(), doc.height()),
+        };
+        let plane = doc.plane();
+        let buf = &mut self.relief[active];
+        crate::render::relief_rows(&plane, &doc.rendered.carved, area, lo, hi, buf);
+        if self.opts.borders {
+            let bw = doc.rendered.width;
+            crate::render::draw_border_rows(&plane, &doc.rendered.mask, bw, 15, area, buf);
+            crate::render::draw_border_rows(&plane, &doc.rendered.mask, bw, 30, area, buf);
+        }
+        if self.opts.capitals {
+            crate::render::mark_capitals(&plane, buf);
+        }
+        self.relief_stale[active] = false;
+        if let Some(t) = self.relief_tiles.get_mut(active) {
+            if full {
+                t.mark_all();
+            } else {
+                t.mark(area.expand(4, i32::MAX, i32::MAX));
             }
         }
     }
@@ -754,32 +1209,90 @@ impl App {
         for t in self.tiles.iter_mut().chain(self.decor_tiles.iter_mut()) {
             t.mark_all();
         }
+        for st in &mut self.relief_stale {
+            *st = true;
+        }
+        for st in &mut self.thumb_stale {
+            *st = true;
+        }
     }
 
-    fn repair_scars(&mut self) {
-        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
-        let opts = self.opts;
-        let mut total = 0;
-        let mut cave = false;
+    fn pick_save_target(&mut self) -> bool {
+        let (dir, base) = match &self.project {
+            Some(p) if p.unsaved => (self.settings.maps_dir(), p.base.clone()),
+            Some(p) => (p.dir.clone(), p.base.clone()),
+            None => return false,
+        };
+        let _ = crate::settings::ensure(dir.clone());
+        let dlg = rfd::FileDialog::new()
+            .add_filter("Dominions 6 recipe", &["d6m"])
+            .set_directory(&dir)
+            .set_file_name(format!("{base}.d6m"));
+        let Some(path) = dlg.save_file() else {
+            return false;
+        };
+        let dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            self.error = Some("that file name cannot be used".to_owned());
+            return false;
+        };
+        let stem = stem.to_owned();
         if let Some(p) = &mut self.project {
-            if let Some(d) = p.planes.get_mut(self.active) {
-                cave = d.index == 2;
-                total = d.repair_scars(&tex, &opts);
+            p.retarget(dir, &stem);
+        }
+        true
+    }
+
+    fn default_target(&self) -> Option<(PathBuf, String)> {
+        let p = self.project.as_ref()?;
+        Some((self.settings.maps_dir(), p.base.clone()))
+    }
+
+    fn target_taken(&self, dir: &Path, base: &str) -> bool {
+        let Some(p) = &self.project else {
+            return false;
+        };
+        p.planes.iter().any(|d| {
+            dir.join(plane_file_name(base, d.index, "d6m")).exists()
+                || dir.join(plane_file_name(base, d.index, "map")).exists()
+        })
+    }
+
+    fn retarget_to(&mut self, dir: PathBuf, base: &str) -> bool {
+        match crate::settings::ensure(dir) {
+            Ok(dir) => {
+                if let Some(p) = &mut self.project {
+                    p.retarget(dir, base);
+                }
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
             }
         }
-        self.tex = tex;
-        for t in self.tiles.iter_mut().chain(self.decor_tiles.iter_mut()) {
-            t.mark_all();
-        }
-        self.refresh_selection();
-        self.status = if total > 0 && cave {
-            format!("Raised {total} grey river pixels to the cave floor; the game carves the rivers there on load")
-        } else {
-            "No grey river pixels on this plane".to_owned()
-        };
     }
 
     fn save(&mut self) -> bool {
+        if self.project.as_ref().map(|p| p.unsaved).unwrap_or(false) {
+            let Some((dir, base)) = self.default_target() else {
+                return false;
+            };
+            if self.target_taken(&dir, &base) {
+                self.confirm_overwrite = true;
+                return false;
+            }
+            if !self.retarget_to(dir, &base) {
+                return false;
+            }
+        }
+        self.write_planes()
+    }
+
+    fn write_planes(&mut self) -> bool {
         let Some(p) = &mut self.project else {
             return false;
         };
@@ -803,10 +1316,12 @@ impl App {
                 .iter()
                 .filter_map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .collect();
-            format!(
-                "Saved {} (the untouched originals stay beside them as .bak)",
-                names.join(", ")
-            )
+            let dir = written
+                .first()
+                .and_then(|f| f.parent())
+                .map(crate::settings::shown)
+                .unwrap_or_default();
+            format!("Saved {} in {dir}", names.join(", "))
         };
         true
     }
@@ -815,8 +1330,13 @@ impl App {
         let mut dlg = rfd::FileDialog::new().add_filter("Dominions 6 map", &["d6m", "map"]);
         if let Some(p) = &self.project {
             dlg = dlg.set_directory(&p.dir);
-        } else if let Some(d) = default_maps_dir() {
-            dlg = dlg.set_directory(d);
+        } else {
+            let maps = self.settings.maps_dir();
+            if maps.is_dir() {
+                dlg = dlg.set_directory(maps);
+            } else if let Some(d) = default_maps_dir() {
+                dlg = dlg.set_directory(d);
+            }
         }
         if let Some(path) = dlg.pick_file() {
             self.open(&path);
@@ -824,10 +1344,22 @@ impl App {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        let typing = ctx
+            .memory(|m| m.focused())
+            .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
+        if typing {
             return;
         }
-        let (undo, redo, save, open, fit, rerender, esc, help, tab) = ctx.input(|i| {
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(Key::N)) && !self.gen.is_running() {
+            self.mode = Mode::Generator;
+        }
+        let generate =
+            ctx.input(|i| !i.modifiers.command && !i.modifiers.alt && i.key_pressed(Key::G));
+        if generate && !self.gen.is_running() {
+            self.mode = Mode::Generator;
+            self.pending_generate = true;
+        }
+        let (undo, redo, save, open, fit, esc, help, tab) = ctx.input(|i| {
             let c = i.modifiers.command;
             (
                 c && i.key_pressed(Key::Z) && !i.modifiers.shift,
@@ -835,7 +1367,6 @@ impl App {
                 c && i.key_pressed(Key::S),
                 c && i.key_pressed(Key::O),
                 i.key_pressed(Key::Home),
-                i.key_pressed(Key::F5),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::F1),
                 i.key_pressed(Key::Tab),
@@ -903,11 +1434,9 @@ impl App {
         if fit {
             self.fit_pending = true;
         }
-        if rerender {
-            self.rerender_all();
-            self.status = "Rerendered".to_owned();
-        }
-        if esc {
+        if esc && self.renaming {
+            self.renaming = false;
+        } else if esc {
             if self.show_help {
                 self.show_help = false;
             } else if self.placing_capital || self.placing_new {
@@ -963,13 +1492,18 @@ impl App {
     }
 
     fn capital_near(&self, canvas: egui::Rect, pos: Pos2) -> Option<u32> {
+        let (hw, vw) = self.wrap_axes();
         let doc = self.doc()?;
         let h = doc.height();
+        let wf = doc.width() as f32;
+        let hf = h as f32;
+        let v = (pos - canvas.min - self.offset) / self.zoom;
         let mut best = None;
         let mut best_d = 8.0_f32 * 8.0;
         for (i, &(cx, cy)) in doc.capitals.iter().enumerate() {
-            let c = self.map_to_screen(canvas, cx as f32 + 0.5, (h - 1 - cy as i32) as f32 + 0.5);
-            let d = c.distance_sq(pos);
+            let dx = wrap_delta(v.x - (cx as f32 + 0.5), wf, hw) * self.zoom;
+            let dy = wrap_delta(v.y - ((h - 1 - cy as i32) as f32 + 0.5), hf, vw) * self.zoom;
+            let d = dx * dx + dy * dy;
             if d < best_d {
                 best_d = d;
                 best = Some(i as u32 + 1);
@@ -1107,6 +1641,12 @@ impl App {
         );
     }
 
+    fn clear_no_starts(&mut self) {
+        let res = self.with_doc(|d, tex, opts| d.clear_no_starts(tex, opts));
+        let n = res.unwrap_or(0);
+        self.after_edit(n > 0, None, &format!("No start cleared on {n} provinces"));
+    }
+
     fn add_plane(&mut self) {
         let mut dlg = rfd::FileDialog::new().add_filter("Dominions 6 map", &["d6m", "map"]);
         if let Some(p) = &self.project {
@@ -1129,10 +1669,17 @@ impl App {
                     self.tiles.push(TileGrid::new(d.width(), d.height()));
                     self.overlays.push(Overlay::new(d.width(), d.height()));
                     self.decor_tiles.push(TileGrid::new(d.width(), d.height()));
+                    self.relief_tiles.push(TileGrid::new(d.width(), d.height()));
+                    self.relief.push(Vec::new());
+                    self.relief_range.push((-1.0, 1.0));
+                    self.relief_stale.push(true);
+                    self.thumbs.push(None);
+                    self.thumb_stale.push(true);
                     let last = p.planes.len() - 1;
                     self.switch_plane(last);
                 }
-                self.status = format!("Added plane {n} from {}", path.display());
+                self.apply_river_repair();
+                self.status = format!("Added plane {n} from {}", crate::settings::shown(&path));
                 self.error = None;
             }
             Some(Err(e)) => self.error = Some(e),
@@ -1147,6 +1694,12 @@ impl App {
                 self.tiles.pop();
                 self.overlays.pop();
                 self.decor_tiles.pop();
+                self.relief_tiles.pop();
+                self.relief.pop();
+                self.relief_range.pop();
+                self.relief_stale.pop();
+                self.thumbs.pop();
+                self.thumb_stale.pop();
                 let n = self.project.as_ref().map(|p| p.planes.len()).unwrap_or(0);
                 if self.active >= n {
                     self.active = n.saturating_sub(1);
@@ -1169,29 +1722,133 @@ impl App {
         }
     }
 
+    fn stroke_points(&mut self, x: i32, y: i32, spacing: f32) -> Vec<(i32, i32, f32)> {
+        let Some(doc) = self.doc() else {
+            return Vec::new();
+        };
+        let (w, h) = (doc.width(), doc.height());
+        let (hw, vw) = (doc.hwrap(), doc.vwrap());
+        let out = match self.stroke_last {
+            None => vec![(x, y, 1.0)],
+            Some((lx, ly)) => {
+                let dx = wrap_delta((x - lx) as f32, w as f32, hw);
+                let dy = wrap_delta((y - ly) as f32, h as f32, vw);
+                let dist = (dx * dx + dy * dy).sqrt();
+                let n = (dist / spacing).floor() as i32;
+                (1..=n)
+                    .map(|k| {
+                        let t = k as f32 * spacing / dist;
+                        let (px, py) = wrap_point(
+                            (lx as f32 + dx * t).round() as i32,
+                            (ly as f32 + dy * t).round() as i32,
+                            w,
+                            h,
+                            hw,
+                            vw,
+                        );
+                        (px, py, 0.0)
+                    })
+                    .collect()
+            }
+        };
+        if let Some(&(sx, sy, _)) = out.last() {
+            self.stroke_last = Some((sx, sy));
+        }
+        out
+    }
+
     fn paint_at(&mut self, x: i32, y: i32, remove: bool) {
         let r = self.brush;
         let res = if self.tool == Tool::Height {
-            let delta = if remove { -self.step } else { self.step };
-            self.with_doc(|d, tex, opts| d.paint_height(x, y, r, delta, tex, opts))
-                .flatten()
-        } else if remove {
-            self.with_doc(|d, tex, opts| d.paint_restore(x, y, r, tex, opts))
-                .flatten()
+            let sign = if remove { -1.0 } else { 1.0 };
+            let keep = self.keep_rivers;
+            let step = self.step * sign;
+            let from = self.stroke_last;
+            self.stroke_last = Some((x, y));
+            match from {
+                None => self
+                    .with_doc(|d, tex, opts| {
+                        d.paint_height_stamps(&[(x, y, step)], r, keep, tex, opts)
+                    })
+                    .flatten(),
+                Some((fx, fy)) if (fx, fy) == (x, y) => None,
+                Some((fx, fy)) => self
+                    .with_doc(|d, tex, opts| {
+                        d.paint_height_path((fx, fy), (x, y), r, step, keep, tex, opts)
+                    })
+                    .flatten(),
+            }
         } else {
             let prov = if self.paint_empty {
                 0
             } else {
                 self.selected.unwrap_or(0)
             };
-            if !self.paint_empty && prov == 0 {
+            if !remove && !self.paint_empty && prov == 0 {
                 return;
             }
-            self.with_doc(|d, tex, opts| d.paint(prov, x, y, r, tex, opts))
-                .flatten()
+            let spacing = (r as f32 / 2.0).max(1.0);
+            let points = self.stroke_points(x, y, spacing);
+            let mut acc: Option<Rect> = None;
+            for (sx, sy, _) in points {
+                let got = if remove {
+                    self.with_doc(|d, tex, opts| d.paint_restore(sx, sy, r, tex, opts))
+                        .flatten()
+                } else {
+                    self.with_doc(|d, tex, opts| d.paint(prov, sx, sy, r, tex, opts))
+                        .flatten()
+                };
+                acc = union(acc, got);
+            }
+            acc
         };
         if let Some(rect) = res {
             self.mark_tiles(Some(rect));
+            self.stroke_decor = union(self.stroke_decor, Some(rect));
+            if self.tool == Tool::Paint {
+                self.refresh_selection();
+            }
+        }
+    }
+
+    fn stroke_decor_tick(&mut self, ctx: &egui::Context) {
+        let Some(rect) = self.stroke_decor else {
+            return;
+        };
+        let follow = self.tool == Tool::Height && self.terrain_follows_height;
+        if !self.opts.decor && !follow {
+            self.stroke_decor = None;
+            return;
+        }
+        let wait = (self.stroke_decor_cost * 4).max(std::time::Duration::from_millis(150));
+        let since = self.stroke_decor_at.elapsed();
+        if since < wait {
+            ctx.request_repaint_after(wait - since);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut touched = None;
+        if follow {
+            let (r, became) = self
+                .with_doc(|d, tex, opts| d.follow_terrain_in(rect, tex, opts))
+                .unwrap_or((None, Vec::new()));
+            touched = union(touched, r);
+            if !became.is_empty() {
+                self.status = became_status(&became);
+            }
+        }
+        if self.opts.decor {
+            let area = union(Some(rect), touched).unwrap_or(rect);
+            let done = self
+                .with_doc(|d, tex, opts| d.refresh_decor(area, tex, opts))
+                .flatten();
+            touched = union(touched, done);
+        }
+        self.stroke_decor_cost = started.elapsed();
+        self.stroke_decor_at = std::time::Instant::now();
+        self.stroke_decor = None;
+        if let Some(r) = touched {
+            self.mark_tiles(Some(r));
         }
     }
 
@@ -1212,15 +1869,58 @@ impl App {
                     );
                     return;
                 }
+                let size = canvas.size();
+                if self.last_canvas.map(|s| s != size).unwrap_or(false) {
+                    self.fit_pending = true;
+                }
+                self.last_canvas = Some(size);
+                let axes_now = self.wrap_axes();
+                if axes_now != self.last_wrap_axes {
+                    self.fit_pending = true;
+                }
+                self.last_wrap_axes = axes_now;
                 if self.fit_pending {
                     self.fit(canvas);
                     self.fit_pending = false;
                 }
+                if let Some(p) = self.center_pending.take() {
+                    self.center_on(canvas, p);
+                }
+                let (want_hwrap, want_vwrap) = self.wrap_axes();
+                let (map_w, map_h) = self
+                    .doc()
+                    .map(|d| (d.width(), d.height()))
+                    .unwrap_or((0, 0));
+                let hwrap = want_hwrap && wrap_fits(map_w as f32 * self.zoom, canvas.width());
+                let vwrap = want_vwrap && wrap_fits(map_h as f32 * self.zoom, canvas.height());
+                if map_w > 0 {
+                    let span = map_w as f32 * self.zoom;
+                    if hwrap {
+                        self.offset.x = self.offset.x.rem_euclid(span) - span;
+                    } else if span <= canvas.width() {
+                        self.offset.x = (canvas.width() - span) * 0.5;
+                    }
+                }
+                if map_h > 0 {
+                    let span = map_h as f32 * self.zoom;
+                    if vwrap {
+                        self.offset.y = self.offset.y.rem_euclid(span) - span;
+                    } else if span <= canvas.height() {
+                        self.offset.y = (canvas.height() - span) * 0.5;
+                    }
+                }
                 let paint_tool = matches!(self.tool, Tool::Paint | Tool::Height);
                 let ctrl = ctx.input(|i| i.modifiers.command);
+                let placing = self.placing_capital || self.placing_new;
+                let jump_click = self.tool == Tool::Select
+                    && !placing
+                    && (resp.double_clicked_by(PointerButton::Primary)
+                        || resp.triple_clicked_by(PointerButton::Primary));
                 let pan = resp.dragged_by(PointerButton::Middle)
                     || (!paint_tool && resp.dragged_by(PointerButton::Secondary))
-                    || ((!paint_tool || ctrl) && resp.dragged_by(PointerButton::Primary));
+                    || ((!paint_tool || ctrl)
+                        && !jump_click
+                        && resp.dragged_by(PointerButton::Primary));
                 if pan {
                     self.offset += resp.drag_delta();
                 }
@@ -1233,7 +1933,7 @@ impl App {
                         zd
                     };
                     if factor != 1.0 {
-                        let new_zoom = (self.zoom * factor).clamp(0.02, 16.0);
+                        let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, 16.0);
                         let k = new_zoom / self.zoom;
                         let rel = pos - canvas.min;
                         self.offset = rel - (rel - self.offset) * k;
@@ -1241,12 +1941,28 @@ impl App {
                     }
                     let (x, y) = self.screen_to_map(canvas, pos);
                     self.hover = self.doc().map(|d| d.owner_at(x, y)).filter(|&p| p > 0);
-                    let placing = self.placing_capital || self.placing_new;
                     if placing && resp.clicked_by(PointerButton::Primary) {
                         if self.placing_new {
                             self.place_new_province(x, y);
                         } else {
                             self.place_capital(x, y);
+                        }
+                    } else if jump_click {
+                        let under = self.capital_near(canvas, pos).or_else(|| {
+                            self.doc().and_then(|d| {
+                                let p = d.owner_at(x, y);
+                                (p > 0).then_some(p)
+                            })
+                        });
+                        let same_spot = under.is_some()
+                            && self.last_click_prov == under.map(|p| (self.active, p));
+                        self.last_click_prov = under.map(|p| (self.active, p));
+                        if let Some(p) = under {
+                            self.select(Some(p));
+                            if same_spot {
+                                self.jump_to_gateway(p);
+                                self.last_click_prov = None;
+                            }
                         }
                     } else if !paint_tool && resp.clicked_by(PointerButton::Primary) {
                         let dot = if self.tool == Tool::Select {
@@ -1254,6 +1970,7 @@ impl App {
                         } else {
                             None
                         };
+                        self.last_click_prov = dot.or(self.hover).map(|p| (self.active, p));
                         if let Some(p) = dot {
                             self.select(Some(p));
                         } else if let Some(p) = self.hover {
@@ -1277,6 +1994,7 @@ impl App {
                             if started {
                                 if self.painting != Some(b) {
                                     self.painting = Some(b);
+                                    self.stroke_last = None;
                                     let label = match (self.tool, b) {
                                         (Tool::Height, _) => "Height brush",
                                         (_, PointerButton::Primary) => "Paint area",
@@ -1285,6 +2003,7 @@ impl App {
                                     self.with_doc(|d, _, _| d.paint_begin(label));
                                 }
                                 self.paint_at(x, y, b == PointerButton::Secondary);
+                                self.stroke_decor_tick(ctx);
                             }
                         }
                     }
@@ -1295,20 +2014,41 @@ impl App {
                     let still = ctx.input(|i| i.pointer.button_down(b));
                     if !still {
                         self.painting = None;
-                        let done = self
-                            .with_doc(|d, tex, opts| d.paint_end(tex, opts))
-                            .flatten();
-                        if let Some(rect) = done {
-                            self.mark_tiles(Some(rect));
+                        self.stroke_last = None;
+                        self.stroke_decor = None;
+                        let follow = self.tool == Tool::Height && self.terrain_follows_height;
+                        let done =
+                            self.with_doc(|d, tex, opts| d.paint_end_follow(follow, tex, opts));
+                        if let Some((rect, became)) = done {
+                            if let Some(rect) = rect {
+                                self.mark_tiles(Some(rect));
+                            }
+                            if !became.is_empty() {
+                                self.status = became_status(&became);
+                            }
                         }
                         self.refresh_selection();
                     }
                 }
                 let active = self.active;
+                let relief_shown = self.relief_shown();
+                if relief_shown && self.relief_stale.get(active).copied().unwrap_or(false) {
+                    self.refresh_relief(None);
+                }
+                self.refresh_thumb(ctx);
                 if let Some(project) = &self.project {
                     let doc = &project.planes[active];
                     if let Some(t) = self.tiles.get_mut(active) {
                         t.upload(ctx, &doc.rendered.rgba, &format!("map{}", doc.index), false);
+                    }
+                    if relief_shown {
+                        if let (Some(t), Some(buf)) =
+                            (self.relief_tiles.get_mut(active), self.relief.get(active))
+                        {
+                            if buf.len() == doc.rendered.rgba.len() {
+                                t.upload(ctx, buf, &format!("relief{}", doc.index), false);
+                            }
+                        }
                     }
                     if self.opts.decor && doc.rendered.decor.len() == doc.rendered.rgba.len() {
                         if let Some(t) = self.decor_tiles.get_mut(active) {
@@ -1332,220 +2072,265 @@ impl App {
                 let w = doc.width();
                 let h = doc.height();
                 let uv = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                let mut layers = vec![&self.tiles[self.active]];
-                if self.opts.decor {
-                    layers.push(&self.decor_tiles[self.active]);
-                }
-                layers.push(&self.overlays[self.active].tiles);
-                for grid in layers {
-                    for ty in 0..grid.rows {
-                        for tx in 0..grid.cols {
-                            let Some(hnd) = &grid.handles[ty * grid.cols + tx] else {
-                                continue;
-                            };
-                            let x0 = (tx * TILE) as f32;
-                            let y0 = (ty * TILE) as f32;
-                            let tw = ((w as usize - tx * TILE).min(TILE)) as f32;
-                            let th = ((h as usize - ty * TILE).min(TILE)) as f32;
-                            let r = egui::Rect::from_min_max(
-                                self.map_to_screen(canvas, x0, y0),
-                                self.map_to_screen(canvas, x0 + tw, y0 + th),
-                            );
-                            if r.intersects(canvas) {
-                                painter.image(hnd.id(), r, uv, Color32::WHITE);
-                            }
-                        }
+                let shifts = wrap_shifts(canvas, self.offset, self.zoom, w, h, hwrap, vwrap);
+                {
+                    let mut layers = if relief_shown {
+                        vec![&self.relief_tiles[self.active]]
+                    } else {
+                        vec![&self.tiles[self.active]]
+                    };
+                    if self.opts.decor && !relief_shown {
+                        layers.push(&self.decor_tiles[self.active]);
                     }
-                }
-                if self.show_links {
-                    let thin = 2.0_f32 * self.zoom.sqrt().clamp(0.6, 1.5);
-                    for p in 1..=doc.province_count() as u32 {
-                        let (ax, ay) = doc.capitals[p as usize - 1];
-                        for nb in doc.neighbours(p) {
-                            if nb <= p {
-                                continue;
-                            }
-                            let Some(&(bx, by)) = doc.capitals.get(nb as usize - 1) else {
-                                continue;
-                            };
-                            let a = self.map_to_screen(
-                                canvas,
-                                ax as f32 + 0.5,
-                                (h - 1 - ay as i32) as f32 + 0.5,
-                            );
-                            let b = self.map_to_screen(
-                                canvas,
-                                bx as f32 + 0.5,
-                                (h - 1 - by as i32) as f32 + 0.5,
-                            );
-                            if !canvas.intersects(egui::Rect::from_two_pos(a, b)) {
-                                continue;
-                            }
-                            painter.line_segment(
-                                [a, b],
-                                egui::Stroke::new(thin, link_colour(doc.spec(p, nb))),
-                            );
-                        }
-                    }
-                }
-                if self.tool == Tool::Link {
-                    if let Some(sel) = self.selected {
-                        for nb in doc.neighbours(sel) {
-                            let (ax, ay) = doc.capitals[sel as usize - 1];
-                            let Some(&(bx, by)) = doc.capitals.get(nb as usize - 1) else {
-                                continue;
-                            };
-                            let a = self.map_to_screen(
-                                canvas,
-                                ax as f32 + 0.5,
-                                (h - 1 - ay as i32) as f32 + 0.5,
-                            );
-                            let b = self.map_to_screen(
-                                canvas,
-                                bx as f32 + 0.5,
-                                (h - 1 - by as i32) as f32 + 0.5,
-                            );
-                            let col = link_colour(doc.spec(sel, nb));
-                            painter.line_segment([a, b], egui::Stroke::new(3.0_f32, col));
-                            painter.circle_filled(b, 6.0, col);
-                        }
-                    }
-                }
-                if self.show_names || self.show_markers || self.show_terrain {
-                    let size = (14.0 * self.zoom.sqrt()).clamp(11.0, 26.0);
-                    let badge = (12.0 * self.zoom.sqrt()).clamp(10.0, 18.0);
-                    let halo = Color32::from_rgba_unmultiplied(255, 244, 214, 150);
-                    for (i, &(cx, cy)) in doc.capitals.iter().enumerate() {
-                        let id = i as u32 + 1;
-                        let centre = self.map_to_screen(
-                            canvas,
-                            cx as f32 + 0.5,
-                            (h - 1 - cy as i32) as f32 + 0.5,
-                        );
-                        if !canvas.expand(80.0).contains(centre) {
-                            continue;
-                        }
-                        if self.show_names {
-                            let name = doc.name(id);
-                            let mut p = centre - Vec2::new(0.0, 8.0);
-                            let outlined = |p: Pos2, text: &str, font: FontId, col: Color32| {
-                                for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-                                    painter.text(
-                                        p + Vec2::new(dx, dy),
-                                        Align2::CENTER_BOTTOM,
-                                        text,
-                                        font.clone(),
-                                        halo,
+                    layers.push(&self.overlays[self.active].tiles);
+                    for grid in layers {
+                        for ty in 0..grid.rows {
+                            for tx in 0..grid.cols {
+                                let Some(hnd) = &grid.handles[ty * grid.cols + tx] else {
+                                    continue;
+                                };
+                                let x0 = (tx * TILE) as f32;
+                                let y0 = (ty * TILE) as f32;
+                                let tw = ((w as usize - tx * TILE).min(TILE)) as f32;
+                                let th = ((h as usize - ty * TILE).min(TILE)) as f32;
+                                let mut mesh = egui::Mesh::with_texture(hnd.id());
+                                for shift in &shifts {
+                                    let r = egui::Rect::from_min_max(
+                                        self.map_to_screen_shift(canvas, x0, y0, *shift),
+                                        self.map_to_screen_shift(canvas, x0 + tw, y0 + th, *shift),
                                     );
+                                    if r.intersects(canvas) {
+                                        mesh.add_rect_with_uv(r, uv, Color32::WHITE);
+                                    }
                                 }
-                                painter.text(p, Align2::CENTER_BOTTOM, text, font, col)
-                            };
-                            if !name.is_empty() {
-                                let r =
-                                    outlined(p, name, FontId::proportional(size), theme::NAME_RED);
-                                p.y -= r.height() - 2.0;
+                                if !mesh.is_empty() {
+                                    painter.add(egui::Shape::mesh(mesh));
+                                }
                             }
-                            outlined(
-                                p,
-                                &format!("{id}"),
-                                FontId::proportional(size * 0.85),
-                                theme::NUMBER_BLUE,
-                            );
                         }
-                        if self.show_markers || self.show_terrain {
-                            let f = doc.flags.get(id as usize).copied().unwrap_or(0);
-                            let gate = doc.gate(id);
-                            let mut tags: Vec<(String, Color32, Vec<u16>)> = Vec::new();
-                            if self.show_terrain {
-                                let water = f & SEA != 0;
-                                tags.push((
-                                    terrain_label(f),
-                                    if water {
-                                        theme::TAG_WATER
-                                    } else {
-                                        theme::TAG_LAND
-                                    },
-                                    Vec::new(),
-                                ));
-                            }
-                            if self.show_markers && f & GOOD_START != 0 {
-                                tags.push(("Start".to_owned(), theme::TAG_START, Vec::new()));
-                            }
-                            if self.show_markers && f & NO_START != 0 {
-                                tags.push(("No start".to_owned(), theme::TAG_NO, Vec::new()));
-                            }
-                            if self.show_markers && f & GOOD_THRONE != 0 {
-                                tags.push(("Throne".to_owned(), theme::TAG_THRONE, Vec::new()));
-                            }
-                            if self.show_markers && f & BAD_THRONE != 0 {
-                                tags.push(("No throne".to_owned(), theme::TAG_NO, Vec::new()));
-                            }
-                            if self.show_markers && f & MANY_SITES != 0 {
-                                tags.push(("Sites".to_owned(), theme::TAG_SITES, Vec::new()));
-                            }
-                            if self.show_markers && gate != 0 {
-                                tags.push((format!("Gate {gate}"), theme::TAG_GATE, Vec::new()));
-                            }
-                            if self.show_markers {
-                                painter.circle(
-                                    centre,
-                                    3.0,
-                                    Color32::WHITE,
-                                    egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 30, 20)),
-                                );
-                            }
-                            let mut y = centre.y + 6.0;
-                            for (text, col, icons) in tags {
-                                let galley = painter.layout_no_wrap(
-                                    text,
-                                    FontId::proportional(badge),
-                                    Color32::from_rgb(20, 18, 16),
-                                );
-                                let icon = badge * 1.7;
-                                let icons_w = if icons.is_empty() {
-                                    0.0
-                                } else {
-                                    icons.len() as f32 * (icon + 2.0) + 2.0
+                    }
+                }
+                for shift in &shifts {
+                    let (phw, pvw) = (doc.hwrap(), doc.vwrap());
+                    let link_ends = |a: (i16, i16), b: (i16, i16)| -> [(Pos2, Pos2); 2] {
+                        let ax = a.0 as f32 + 0.5;
+                        let ay = (h - 1 - a.1 as i32) as f32 + 0.5;
+                        let bx = b.0 as f32 + 0.5;
+                        let by = (h - 1 - b.1 as i32) as f32 + 0.5;
+                        let dx = wrap_delta(bx - ax, w as f32, phw);
+                        let dy = wrap_delta(by - ay, h as f32, pvw);
+                        [
+                            (
+                                self.map_to_screen_shift(canvas, ax, ay, *shift),
+                                self.map_to_screen_shift(canvas, ax + dx, ay + dy, *shift),
+                            ),
+                            (
+                                self.map_to_screen_shift(canvas, bx - dx, by - dy, *shift),
+                                self.map_to_screen_shift(canvas, bx, by, *shift),
+                            ),
+                        ]
+                    };
+                    if self.show_links && self.zoom >= DOT_MIN_ZOOM {
+                        let thin = 2.0_f32 * self.zoom.sqrt().clamp(0.6, 1.5);
+                        for p in 1..=doc.province_count() as u32 {
+                            let ca = doc.capitals[p as usize - 1];
+                            for nb in doc.neighbours(p) {
+                                if nb <= p {
+                                    continue;
+                                }
+                                let Some(&cb) = doc.capitals.get(nb as usize - 1) else {
+                                    continue;
                                 };
-                                let text_h = galley.size().y + 2.0;
-                                let h = if icons.is_empty() {
-                                    text_h
-                                } else {
-                                    text_h.max(icon + 2.0)
+                                let ends = link_ends(ca, cb);
+                                let both = ends[0].1 != ends[1].1;
+                                let col = link_colour(doc.spec(p, nb));
+                                for (i, (a, b)) in ends.into_iter().enumerate() {
+                                    if i == 1 && !both {
+                                        break;
+                                    }
+                                    if !canvas.intersects(egui::Rect::from_two_pos(a, b)) {
+                                        continue;
+                                    }
+                                    painter.line_segment([a, b], egui::Stroke::new(thin, col));
+                                }
+                            }
+                        }
+                    }
+                    if self.tool == Tool::Link {
+                        if let Some(sel) = self.selected {
+                            for nb in doc.neighbours(sel) {
+                                let ca = doc.capitals[sel as usize - 1];
+                                let Some(&cb) = doc.capitals.get(nb as usize - 1) else {
+                                    continue;
                                 };
-                                let sz = Vec2::new(galley.size().x + 8.0 + icons_w, h);
-                                let r = egui::Rect::from_center_size(
-                                    Pos2::new(centre.x, y + sz.y * 0.5),
-                                    sz,
+                                let ends = link_ends(ca, cb);
+                                let both = ends[0].1 != ends[1].1;
+                                let col = link_colour(doc.spec(sel, nb));
+                                painter.line_segment(
+                                    [ends[0].0, ends[0].1],
+                                    egui::Stroke::new(3.0_f32, col),
                                 );
-                                painter.rect_filled(r, 3.0, col);
-                                painter.galley(
-                                    r.min + Vec2::new(4.0, (h - galley.size().y) * 0.5),
-                                    galley,
-                                    Color32::BLACK,
-                                );
-                                let mut x = r.max.x - icons_w + 2.0;
-                                for id in icons {
-                                    if let Some((_, tex)) =
-                                        self.icons.iter().find(|(k, _)| *k == id)
+                                painter.circle_filled(ends[0].1, 6.0, col);
+                                if both {
+                                    painter.line_segment(
+                                        [ends[1].0, ends[1].1],
+                                        egui::Stroke::new(3.0_f32, col),
+                                    );
+                                    painter.circle_filled(ends[1].1, 6.0, col);
+                                }
+                            }
+                        }
+                    }
+                    let labels_on = self.zoom >= LABEL_MIN_ZOOM;
+                    let dots_on = self.zoom >= DOT_MIN_ZOOM;
+                    let dot_r = (3.0 * (self.zoom / LABEL_MIN_ZOOM).sqrt()).clamp(1.5, 3.0);
+                    if (self.show_names || self.show_markers || self.show_terrain) && dots_on {
+                        let size = (14.0 * self.zoom.sqrt()).clamp(11.0, 26.0);
+                        let badge = (12.0 * self.zoom.sqrt()).clamp(10.0, 18.0);
+                        let halo = Color32::from_rgba_unmultiplied(255, 244, 214, 150);
+                        for (i, &(cx, cy)) in doc.capitals.iter().enumerate() {
+                            let id = i as u32 + 1;
+                            let centre = self.map_to_screen_shift(
+                                canvas,
+                                cx as f32 + 0.5,
+                                (h - 1 - cy as i32) as f32 + 0.5,
+                                *shift,
+                            );
+                            if !canvas.expand(80.0).contains(centre) {
+                                continue;
+                            }
+                            if self.show_names {
+                                let name = doc.name(id);
+                                let mut p = centre - Vec2::new(0.0, 8.0);
+                                let outlined = |p: Pos2, text: &str, font: FontId, col: Color32| {
+                                    for (dx, dy) in
+                                        [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)]
                                     {
-                                        let ir = egui::Rect::from_min_size(
-                                            Pos2::new(x, r.min.y + (h - icon) * 0.5),
-                                            Vec2::splat(icon),
-                                        );
-                                        painter.image(
-                                            tex.id(),
-                                            ir,
-                                            egui::Rect::from_min_max(
-                                                Pos2::ZERO,
-                                                Pos2::new(1.0, 1.0),
-                                            ),
-                                            Color32::WHITE,
+                                        painter.text(
+                                            p + Vec2::new(dx, dy),
+                                            Align2::CENTER_BOTTOM,
+                                            text,
+                                            font.clone(),
+                                            halo,
                                         );
                                     }
-                                    x += icon + 2.0;
+                                    painter.text(p, Align2::CENTER_BOTTOM, text, font, col)
+                                };
+                                if !name.is_empty() {
+                                    let r = outlined(
+                                        p,
+                                        name,
+                                        FontId::proportional(size),
+                                        theme::NAME_RED,
+                                    );
+                                    p.y -= r.height() - 2.0;
                                 }
-                                y += sz.y + 2.0;
+                                outlined(
+                                    p,
+                                    &format!("{id}"),
+                                    FontId::proportional(size * 0.85),
+                                    theme::NUMBER_BLUE,
+                                );
+                            }
+                            if self.show_markers || self.show_terrain {
+                                let f = doc.flags.get(id as usize).copied().unwrap_or(0);
+                                let gate = doc.gate(id);
+                                let mut tags: Vec<(String, Color32, Vec<u16>)> = Vec::new();
+                                if self.show_terrain && labels_on {
+                                    let water = f & SEA != 0;
+                                    tags.push((
+                                        terrain_label(f),
+                                        if water {
+                                            theme::TAG_WATER
+                                        } else {
+                                            theme::TAG_LAND
+                                        },
+                                        Vec::new(),
+                                    ));
+                                }
+                                if self.show_markers && labels_on && f & GOOD_START != 0 {
+                                    tags.push(("Start".to_owned(), theme::TAG_START, Vec::new()));
+                                }
+                                if self.show_markers && labels_on && f & NO_START != 0 {
+                                    tags.push(("No start".to_owned(), theme::TAG_NO, Vec::new()));
+                                }
+                                if self.show_markers && labels_on && f & GOOD_THRONE != 0 {
+                                    tags.push(("Throne".to_owned(), theme::TAG_THRONE, Vec::new()));
+                                }
+                                if self.show_markers && labels_on && f & BAD_THRONE != 0 {
+                                    tags.push(("No throne".to_owned(), theme::TAG_NO, Vec::new()));
+                                }
+                                if self.show_markers && labels_on && f & MANY_SITES != 0 {
+                                    tags.push(("Sites".to_owned(), theme::TAG_SITES, Vec::new()));
+                                }
+                                if self.show_markers && labels_on && gate != 0 {
+                                    tags.push((
+                                        format!("Gate {gate}"),
+                                        theme::TAG_GATE,
+                                        Vec::new(),
+                                    ));
+                                }
+                                if self.show_markers {
+                                    painter.circle(
+                                        centre,
+                                        dot_r,
+                                        Color32::WHITE,
+                                        egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 30, 20)),
+                                    );
+                                }
+                                let mut y = centre.y + 6.0;
+                                for (text, col, icons) in tags {
+                                    let galley = painter.layout_no_wrap(
+                                        text,
+                                        FontId::proportional(badge),
+                                        Color32::from_rgb(20, 18, 16),
+                                    );
+                                    let icon = badge * 1.7;
+                                    let icons_w = if icons.is_empty() {
+                                        0.0
+                                    } else {
+                                        icons.len() as f32 * (icon + 2.0) + 2.0
+                                    };
+                                    let text_h = galley.size().y + 2.0;
+                                    let h = if icons.is_empty() {
+                                        text_h
+                                    } else {
+                                        text_h.max(icon + 2.0)
+                                    };
+                                    let sz = Vec2::new(galley.size().x + 8.0 + icons_w, h);
+                                    let r = egui::Rect::from_center_size(
+                                        Pos2::new(centre.x, y + sz.y * 0.5),
+                                        sz,
+                                    );
+                                    painter.rect_filled(r, 3.0, col);
+                                    painter.galley(
+                                        r.min + Vec2::new(4.0, (h - galley.size().y) * 0.5),
+                                        galley,
+                                        Color32::BLACK,
+                                    );
+                                    let mut x = r.max.x - icons_w + 2.0;
+                                    for id in icons {
+                                        if let Some((_, tex)) =
+                                            self.icons.iter().find(|(k, _)| *k == id)
+                                        {
+                                            let ir = egui::Rect::from_min_size(
+                                                Pos2::new(x, r.min.y + (h - icon) * 0.5),
+                                                Vec2::splat(icon),
+                                            );
+                                            painter.image(
+                                                tex.id(),
+                                                ir,
+                                                egui::Rect::from_min_max(
+                                                    Pos2::ZERO,
+                                                    Pos2::new(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
+                                        }
+                                        x += icon + 2.0;
+                                    }
+                                    y += sz.y + 2.0;
+                                }
                             }
                         }
                     }
@@ -1567,11 +2352,22 @@ impl App {
                 if let Some(hp) = self.hover {
                     if let Some(pos) = resp.hover_pos() {
                         let name = doc.name(hp);
-                        let text = if name.is_empty() {
+                        let mut text = if name.is_empty() {
                             format!("{hp}")
                         } else {
                             format!("{hp}  {name}")
                         };
+                        if relief_shown {
+                            let (mx, my) = self.screen_to_map(canvas, pos);
+                            if mx >= 0 && my >= 0 && mx < w && my < h {
+                                let hv = doc.rendered.carved[(my * w + mx) as usize];
+                                if crate::render::is_channel(hv) {
+                                    text.push_str("  river");
+                                } else {
+                                    text.push_str(&format!("  height {hv:.0}"));
+                                }
+                            }
+                        }
                         let galley =
                             painter.layout_no_wrap(text, FontId::proportional(15.0), theme::INK);
                         let tl = pos + Vec2::new(16.0, 14.0);
@@ -1599,13 +2395,23 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show(ctx, |ui| {
+                ui.set_max_width(PANEL_W - 22.0);
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                self.mode_section(ui);
+                theme::rule(ui);
+                ui.add_space(2.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_max_width(PANEL_W - 22.0);
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-                        self.map_section(ui);
-                        ui.add_space(8.0);
+                        if self.mode == Mode::Generator {
+                            let blueprints = self.settings.blueprints_dir();
+                            let doc_name = self.project.as_ref().map(|p| p.base.clone());
+                            self.gen
+                                .ui(ui, PANEL_W - 50.0, &blueprints, doc_name.as_deref());
+                            return;
+                        }
                         if self.selected.is_some() {
                             self.province_section(ui);
                             ui.add_space(8.0);
@@ -1614,25 +2420,235 @@ impl App {
                         ui.add_space(8.0);
                         if self.project.is_some() {
                             self.plane_section(ui);
-                            ui.add_space(8.0);
                         }
+                    });
+            });
+    }
+
+    fn draw_right_side(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("d6sme_right")
+            .exact_width(PANEL_W)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::SIDE_FILL)
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(PANEL_W - 22.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                        self.map_section(ui);
+                        ui.add_space(8.0);
+                        if self.gen.action(ui, PANEL_W - 50.0) {
+                            self.pending_generate = true;
+                        }
+                        ui.add_space(8.0);
+                        self.settings_section(ui);
+                        ui.add_space(8.0);
                         self.view_section(ui);
                     });
             });
+    }
+
+    fn mode_section(&mut self, ui: &mut egui::Ui) {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(PANEL_W - 50.0);
+            ui.horizontal_wrapped(|ui| {
+                if theme::tab(ui, self.mode == Mode::Editor, "Editor") {
+                    self.mode = Mode::Editor;
+                }
+                if theme::tab(ui, self.mode == Mode::Generator, "Random Map Generation") {
+                    self.mode = Mode::Generator;
+                }
+            })
+            .response
+            .on_hover_text("Editor works on the loaded map; Random Map Generation rolls a new one with the game's own generator (Ctrl+N)");
+        });
+    }
+
+    fn reset_all_settings(&mut self) {
+        self.settings.reset();
+        self.gen.reset_form();
+        let fresh = Options::default();
+        let relook = self.opts != fresh;
+        self.opts = fresh;
+        self.wrap_view = false;
+        self.relief_in_height = true;
+        self.keep_rivers = true;
+        self.terrain_follows_height = true;
+        self.brush = 10;
+        self.step = 10.0;
+        self.paint_empty = false;
+        self.flatten = false;
+        self.show_markers = true;
+        self.show_links = false;
+        self.show_terrain = false;
+        self.show_names = false;
+        if relook {
+            self.rerender_all();
+        }
+    }
+
+    fn settings_section(&mut self, ui: &mut egui::Ui) {
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(PANEL_W - 50.0);
+            theme::section_first(ui, "Settings");
+            let root = self.settings.root_dir();
+            theme::dim(ui, "Path");
+            theme::path_label(ui, &root, 13.0, theme::INK);
+            theme::dim(
+                ui,
+                &format!(
+                    "Maps in {}, blueprints in {}",
+                    crate::settings::MAPS,
+                    crate::settings::BLUEPRINTS
+                ),
+            );
+            let mut changed = false;
+            ui.horizontal_wrapped(|ui| {
+                if theme::boxed_button_hint(
+                    ui,
+                    "Browse",
+                    true,
+                    "Keeps maps and blueprints under a folder of your choice instead of the game's own folder",
+                ) {
+                    let start = if root.is_dir() {
+                        root.clone()
+                    } else {
+                        self.settings.default_folder()
+                    };
+                    let picked = rfd::FileDialog::new().set_directory(start).pick_folder();
+                    if let Some(dir) = picked {
+                        self.settings.set_data_folder(dir);
+                        changed = true;
+                    }
+                }
+                if theme::boxed_button_hint(
+                    ui,
+                    "Reset",
+                    !self.settings.is_default(),
+                    "Goes back to the game's own folder",
+                ) {
+                    self.settings.reset();
+                    changed = true;
+                }
+                if theme::boxed_button_hint(ui, "Open folder", true, "Shows the folder on disk") {
+                    match crate::settings::ensure(root.clone()).and_then(|d| reveal(&d)) {
+                        Ok(()) => {
+                            self.status = format!("Opened {}", crate::settings::shown(&root))
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+            });
+            if theme::boxed_button_hint(
+                ui,
+                "Reset all settings",
+                true,
+                "Puts the folder, the generator form, the view toggles and the tool settings back to how the program starts; the open map and its seed and name stay",
+            ) {
+                self.reset_all_settings();
+                changed = true;
+            }
+            if changed {
+                match self.settings.save() {
+                    Ok(()) => {
+                        self.error = None;
+                        self.status = format!(
+                            "Maps and blueprints are kept under {}",
+                            crate::settings::shown(&self.settings.root_dir())
+                        );
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        });
     }
 
     fn map_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(PANEL_W - 50.0);
             let title = self.project.as_ref().map(|p| p.base.clone()).unwrap_or_else(|| "Dominions 6 Simple Map Editor".to_owned());
-            theme::title(ui, &title);
+            if self.renaming {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.name_draft)
+                        .desired_width(PANEL_W - 70.0)
+                        .font(egui::FontId::proportional(20.0)),
+                );
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    self.renaming = false;
+                } else if field.lost_focus() {
+                    self.renaming = false;
+                    let wanted = self.name_draft.trim().to_owned();
+                    if wanted.is_empty() {
+                        self.error = Some("a map needs a name".to_owned());
+                    } else if wanted != title {
+                        if let Some(p) = &mut self.project {
+                            p.rename(&wanted);
+                        }
+                        let now = self
+                            .project
+                            .as_ref()
+                            .map(|p| p.base.clone())
+                            .unwrap_or_default();
+                        self.status = format!("Renamed to {now}");
+                    }
+                }
+            } else {
+                let label = ui.add(
+                    egui::Label::new(egui::RichText::new(&title).size(20.0).color(theme::INK))
+                        .sense(Sense::click()),
+                );
+                if self.project.is_some() {
+                    label.clone().on_hover_text(
+                        "Click to rename the map: the title inside the .map and the file names Save uses. Enter keeps the new name, Esc leaves it alone",
+                    );
+                    if label.clicked() {
+                        self.renaming = true;
+                        self.name_draft = title.clone();
+                    }
+                }
+            }
             if let Some(p) = &self.project {
                 let dims = p.planes.get(self.active).map(|d| format!("{} x {} px, {} provinces", d.width(), d.height(), d.province_count())).unwrap_or_default();
                 theme::dim(ui, &dims);
+                if let Some(Some(tex)) = self.thumbs.get(self.active) {
+                    let side = PANEL_W - 50.0;
+                    let size = tex.size_vec2();
+                    let scale = (side / size.x).min(160.0 / size.y);
+                    let src = egui::load::SizedTexture::from_handle(tex);
+                    let img = ui
+                        .add(egui::Image::new(src).fit_to_exact_size(size * scale).sense(Sense::click()))
+                        .on_hover_text("The whole plane; click to look there");
+                    if let (Some(pos), Some(canvas)) = (img.interact_pointer_pos(), self.last_canvas) {
+                        if img.clicked() {
+                            let rel = (pos - img.rect.min) / (size * scale);
+                            let (pw, ph) = p
+                                .planes
+                                .get(self.active)
+                                .map(|d| (d.width() as f32, d.height() as f32))
+                                .unwrap_or((1.0, 1.0));
+                            let target = Vec2::new(rel.x * pw, rel.y * ph) * self.zoom;
+                            self.offset = canvas * 0.5 - target;
+                        }
+                    }
+                }
+                match p.planes.get(self.active).filter(|_| !p.unsaved) {
+                    Some(d) => theme::path_label(ui, &d.d6m_path, 14.0, theme::INK_DIM),
+                    None => {
+                        theme::dim(ui, "not saved yet");
+                    }
+                }
                 let labels: Vec<String> = p
                     .planes
                     .iter()
-                    .map(|d| if d.index == 1 { "Surface".to_owned() } else if d.index == 2 { "Caves".to_owned() } else { format!("Plane {}", d.index) })
+                    .map(|d| plane_label(d.index))
                     .collect();
                 let mut switch = None;
                 ui.horizontal_wrapped(|ui| {
@@ -1886,7 +2902,7 @@ impl App {
                 self.preset(p);
             }
             ui.horizontal(|ui| {
-                theme::dim(ui, "Gate").on_hover_text("Gateway number. A gateway connects to every other gateway with the same number, also on other planes, so armies can travel between them. 0 means no gateway");
+                theme::dim(ui, "Gate").on_hover_text("Gateway number. A gateway connects to every other gateway with the same number, also on other planes, so armies can travel between them. 0 means no gateway. Double-click the province on the map to jump to the next gateway with the same number");
                 let r = ui.add(egui::DragValue::new(&mut self.gate_edit).range(0..=999).speed(0.1)).on_hover_text("Gateway number. A gateway connects to every other gateway with the same number, also on other planes. 0 means no gateway");
                 if r.lost_focus() || (r.changed() && !r.has_focus()) {
                     let g = self.gate_edit;
@@ -2001,16 +3017,16 @@ impl App {
             ui.set_width(PANEL_W - 50.0);
             theme::section_first(ui, "Tool");
             ui.horizontal_wrapped(|ui| {
-                if theme::tab(ui, self.tool == Tool::Select, "Select (S)") {
+                if keycap::tab(ui, self.tool == Tool::Select, "Select", "S", keycap::DEFAULT) {
                     self.tool = Tool::Select;
                 }
-                if theme::tab(ui, self.tool == Tool::Link, "Link (L)") {
+                if keycap::tab(ui, self.tool == Tool::Link, "Link", "L", keycap::DEFAULT) {
                     self.tool = Tool::Link;
                 }
-                if theme::tab(ui, self.tool == Tool::Paint, "Paint area (P)") {
+                if keycap::tab(ui, self.tool == Tool::Paint, "Paint area", "P", keycap::DEFAULT) {
                     self.tool = Tool::Paint;
                 }
-                if theme::tab(ui, self.tool == Tool::Height, "Heights (H)") {
+                if keycap::tab(ui, self.tool == Tool::Height, "Heights", "H", keycap::DEFAULT) {
                     self.tool = Tool::Height;
                 }
             })
@@ -2018,7 +3034,8 @@ impl App {
             .on_hover_text("Tab cycles the tools; P or H pressed again goes back to Select");
             match self.tool {
                 Tool::Select => {
-                    theme::dim(ui, "Click a province or its capital dot to select it (S)");
+                    theme::dim(ui, "Click a province or its capital dot to select it");
+                    theme::dim(ui, "Double-click a gateway province to jump to the next gateway with the same number.");
                     ui.horizontal(|ui| {
                         theme::dim(ui, "Number");
                         let n = self.doc().map(|d| d.province_count() as u32).unwrap_or(1).max(1);
@@ -2033,7 +3050,7 @@ impl App {
                 Tool::Link => {
                     theme::dim(
                         ui,
-                        "Select a province, then click others to connect or disconnect (L)",
+                        "Select a province, then click others to connect or disconnect",
                     );
                 }
                 Tool::Height => {
@@ -2045,9 +3062,20 @@ impl App {
                         theme::dim(ui, "Step");
                         ui.add(egui::DragValue::new(&mut self.step).range(1.0..=500.0).speed(1.0));
                     });
+                    theme::check(ui, &mut self.terrain_follows_height, "Height changes terrain").on_hover_text("When a stroke ends, every province it touched gets its Sea and Deep sea marks from where most of its ground now sits: below the waterline is Sea, below -36 is Deep sea, above is Land. Other land types stay as they are");
+                    theme::check(ui, &mut self.keep_rivers, "Keep rivers").on_hover_text("Leaves the baked river channels alone so the brush cannot fill them in or lift them out; untick to reshape them like any other ground");
+                    theme::check(ui, &mut self.relief_in_height, "Height map").on_hover_text("Shows the height field as a shaded relief while this tool is active: blues below the waterline, sand at the shore, green to brown to white going up. Borders and markers stay");
+                    if self.relief_in_height {
+                        let (lo, hi) = self
+                            .relief_range
+                            .get(self.active)
+                            .copied()
+                            .unwrap_or((-1.0, 1.0));
+                        relief_legend(ui, lo, hi);
+                    }
                     theme::dim(
                         ui,
-                        "Left button raises the ground under the brush by the step, right button lowers it. Land turns to water below 0, so a valley can be dug into a lake and a shoal raised into an island (H)",
+                        "Left button raises the ground under the brush by the step, right button lowers it. Land turns to water below 0, so a valley can be dug into a lake and a shoal raised into an island",
                     );
                 }
                 Tool::Paint => {
@@ -2063,7 +3091,7 @@ impl App {
                     }
                     theme::dim(
                         ui,
-                        "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans (P)",
+                        "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans",
                     );
                 }
             }
@@ -2074,7 +3102,7 @@ impl App {
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(PANEL_W - 50.0);
             theme::section_first(ui, "Whole plane");
-            if theme::boxed_button_hint(ui, "Random terrain", true, "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds") {
+            if keycap::boxed_button(ui, "Random terrain", &["F4"], true, "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds", keycap::DEFAULT) {
                 self.randomize_terrain();
             }
             ui.horizontal_wrapped(|ui| {
@@ -2083,8 +3111,11 @@ impl App {
                 theme::dim(ui, "links, a river or pass counts");
                 ui.add(egui::DragValue::new(&mut self.nostart_crossing).range(0.0..=1.0).speed(0.05).fixed_decimals(2));
             });
-            if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start, the way the Random Map NoStart setter does. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
+            if theme::boxed_button_hint(ui, "Set no start", true, "Marks every province on this plane with fewer connections than this as No start. The game's own map editor has no such tool; this repeats what the random map generator does when it places its No start marks. Links between land and sea are not counted; a river without a bridge or a mountain pass counts as the value above instead of 1; impassable borders count 0") {
                 self.set_no_starts();
+            }
+            if theme::boxed_button_hint(ui, "Clear no start", true, "Removes the No start mark from every province on this plane") {
+                self.clear_no_starts();
             }
             let empty = self.doc().map(|d| d.empty_provinces()).unwrap_or_default();
             if !empty.is_empty() {
@@ -2100,27 +3131,7 @@ impl App {
                     }
                 });
             }
-            let (scars, cave) = self
-                .doc()
-                .map(|d| (d.scar_count(), d.index == 2))
-                .unwrap_or((0, false));
-            if cave {
-                ui.horizontal_wrapped(|ui| {
-                    if scars > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{scars} grey river pixels"))
-                                .color(theme::WARN),
-                        );
-                        if theme::boxed_button(ui, "Repair", true) {
-                            self.repair_scars();
-                        }
-                    } else {
-                        theme::dim(ui, "No grey river pixels");
-                    }
-                })
-                .response
-                .on_hover_text("Rivers saved by the game's editor keep their channel in the height data, and on the cave plane that channel paints as plain rock with no river. Repair raises it to the cave floor; the game then carves a proper river there from the connection when the map loads. The surface needs nothing: the game paints an old channel as water anyway");
-            }
+
         });
     }
 
@@ -2134,15 +3145,29 @@ impl App {
                 .spacing([16.0, 2.0])
                 .show(ui, |ui| {
                     changed |= theme::check(ui, &mut self.opts.borders, "Borders").clicked();
-                    changed |= theme::check(ui, &mut self.opts.edge_fade, "Dark edges").clicked();
-                    ui.end_row();
                     changed |= theme::check(ui, &mut self.opts.decor, "Trees and rocks").on_hover_text("Forests, mountains, huts, sites and other sprites the game scatters over a map. The game places them at random on every load, so they never match exactly").clicked();
+                    ui.end_row();
                     theme::check(ui, &mut self.show_names, "Names").on_hover_text("Province names, or the number where a province has no name");
+                    if theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate").clicked() {
+                        self.opts.capitals = self.show_markers;
+                        changed = true;
+                    }
                     ui.end_row();
-                    theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate");
                     theme::check(ui, &mut self.show_links, "Connections").on_hover_text("Every connection on the plane as a line between capitals: yellow normal, blue river, orange mountain pass, red impassable. The Link tool always shows the selected province's own");
-                    ui.end_row();
                     theme::check(ui, &mut self.show_terrain, "Terrain").on_hover_text("The terrain marks of every province in words at its capital, so a province painted as water can be told from one the game treats as sea");
+                    let (hwrap, vwrap) = self.plane_wraps();
+                    let wraps = hwrap || vwrap;
+                    let hint = if wraps {
+                        "Repeats the map across the edges it wraps on, the way the game shows it, so panning past an edge continues on the other side"
+                    } else {
+                        "This plane has no #wraparound in its .map, so there is nothing to repeat"
+                    };
+                    ui.end_row();
+                    theme::check_enabled(ui, &mut self.wrap_view, "Wraparound", wraps).on_hover_text(hint);
+                    changed |= theme::check(ui, &mut self.opts.grey_no_start, "Grey no-start").on_hover_text("Shows provinces flagged No start in greyscale, the way the game's layout pictures do. The game itself paints them in full colour on the map").clicked();
+                    ui.end_row();
+                    changed |= theme::check(ui, &mut self.opts.winter, "Winter").on_hover_text("Draws the map the way the game draws it in a winter month: snow ground on every land province the cold scale reaches, and ice on shallow water and river channels. Warmer provinces, caves and deep sea stay as they are").clicked();
+                    changed |= theme::check(ui, &mut self.opts.dirt, "Dirt").on_hover_text("The game's dirtify pass: a few hundred soft earth-coloured blotches over dry land, then a faint dark speckle over every pixel. It is what keeps a game map from looking like flat tiles").clicked();
                     ui.end_row();
                 });
             if changed {
@@ -2151,9 +3176,6 @@ impl App {
             ui.horizontal(|ui| {
                 if theme::boxed_button(ui, "Fit", self.project.is_some()) {
                     self.fit_pending = true;
-                }
-                if theme::boxed_button(ui, "Rerender", self.project.is_some()) {
-                    self.rerender_all();
                 }
                 theme::dim(ui, &format!("{:.0}%", self.zoom * 100.0));
             });
@@ -2164,66 +3186,146 @@ impl App {
         if !self.show_help {
             return;
         }
-        egui::Area::new(egui::Id::new("d6sme_help"))
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                theme::panel_frame().show(ui, |ui| {
-                    ui.set_width(520.0);
-                    theme::title(ui, "Help");
-                    theme::section(ui, "Map");
-                    ui.label("Wheel zooms, dragging pans, Home fits the map. Click a province to select it.");
-                    theme::section(ui, "Looks");
-                    ui.label("Water starts below height 0. Shallows reach down to -10, open water to -30, deep sea from -36. The presets move a province to those depths and set its Sea marks so the rules match the picture. Flatten gives every pixel the same height.");
-                    theme::section(ui, "Rivers");
-                    ui.label("A river is a connection type and a channel in the height data. Removing a river here also lifts its channel. Maps saved by the game's editor keep old channels in the height data: on the surface they still show as a sunken river with the border drawn across it, on the cave plane as plain rock. Repair on the cave plane raises them so the game carves real rivers there on load.");
-                    theme::section(ui, "Paint area");
-                    ui.label("Left button gives pixels to the selected province, right button takes them back from it, middle button or Ctrl+left drag pans.");
-                    theme::section(ui, "Keys");
-                    ui.label("Ctrl+Z undo, Ctrl+Y redo, Ctrl+S save, Ctrl+O open, F4 random terrain, F5 rerender, S select, L link, P paint, H heights, Tab next tool, PageUp and PageDown switch planes, Esc back, F1 help.");
-                    theme::section(ui, "Files");
-                    ui.label("Saving writes the .d6m and the .map beside it. The first save keeps the untouched originals as .bak copies; later saves leave those copies alone.");
-                    ui.add_space(6.0);
-                    if theme::boxed_button(ui, "Close", true) {
-                        self.show_help = false;
+        theme::modal(ctx, "d6sme_help", egui::Order::Foreground, 520.0, |ui| {
+            theme::title(ui, "Help");
+            theme::section(ui, "Map");
+            ui.label(
+                "Wheel zooms, dragging pans, Home fits the map. Click a province to select it.",
+            );
+            theme::section(ui, "Looks");
+            ui.label("Water starts below height 0. Shallows reach down to -10, open water to -30, deep sea from -36. The presets move a province to those depths and set its Sea marks so the rules match the picture. Flatten gives every pixel the same height.");
+            theme::section(ui, "Rivers");
+            ui.label("A river is a connection type: the engine carves the channel along the shared border when the map loads, so rivers can only run between two provinces and are added or removed with the Link tool. Generated maps also carry every river as a trench baked into the height data, because the recipe cannot store the engine's fresh-river marker; on load that trench paints as a sunken river with the border across it, on the cave plane as rock. Adding or removing a river with the Link tool also lifts or carves its channel here.");
+            theme::section(ui, "Paint area");
+            ui.label("Left button gives pixels to the selected province, right button takes them back from it, middle button or Ctrl+left drag pans.");
+            theme::section(ui, "Keys");
+            for (keys, what) in KEY_HELP {
+                keycap::help_row(ui, keys, what, keycap::DEFAULT);
+            }
+            theme::section(ui, "Files");
+            ui.label("Saving writes the .d6m and the .map beside it, in place.");
+            ui.add_space(6.0);
+            if theme::boxed_button(ui, "Close", true) {
+                self.show_help = false;
+            }
+        });
+    }
+
+    fn draw_generate_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_generate {
+            return;
+        }
+        let name = self
+            .project
+            .as_ref()
+            .map(|p| p.base.clone())
+            .unwrap_or_default();
+        theme::modal(
+            ctx,
+            "d6sme_generate_confirm",
+            egui::Order::Tooltip,
+            360.0,
+            |ui| {
+                theme::title(ui, "Unsaved changes");
+                ui.label(format!("Discard the unsaved changes to {name}?"));
+                ui.horizontal(|ui| {
+                    if theme::boxed_button(ui, "Save first", true) && self.save() {
+                        self.confirm_generate = false;
+                        self.gen.begin();
+                    }
+                    if theme::boxed_button(ui, "Discard", true) {
+                        if let Some(p) = &mut self.project {
+                            for d in &mut p.planes {
+                                d.dirty = false;
+                            }
+                        }
+                        self.confirm_generate = false;
+                        self.gen.begin();
+                    }
+                    if theme::boxed_button(ui, "Cancel", true) {
+                        self.confirm_generate = false;
                     }
                 });
+            },
+        );
+    }
+
+    fn draw_overwrite_dialog(&mut self, ctx: &egui::Context) {
+        if !self.confirm_overwrite {
+            return;
+        }
+        let Some((dir, base)) = self.default_target() else {
+            self.confirm_overwrite = false;
+            return;
+        };
+        let mut action = None;
+        let max_h = theme::modal_height(ctx);
+        egui::Modal::new(egui::Id::new("d6sme_overwrite"))
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                theme::scroll_body(ui, 380.0, max_h, |ui| {
+                    theme::title(ui, "File already there");
+                    ui.label(format!("Overwrite {base}?"));
+                    theme::dim(ui, &crate::settings::shown(&dir));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if theme::boxed_button(ui, "Overwrite", true) {
+                            action = Some(0);
+                        }
+                        if theme::boxed_button(ui, "Save as\u{2026}", true) {
+                            action = Some(1);
+                        }
+                        if theme::boxed_button(ui, "Cancel", true) {
+                            action = Some(2);
+                        }
+                    });
+                });
             });
+        match action {
+            Some(0) => {
+                self.confirm_overwrite = false;
+                if self.retarget_to(dir, &base) {
+                    self.write_planes();
+                }
+            }
+            Some(1) => {
+                self.confirm_overwrite = false;
+                if self.pick_save_target() {
+                    self.write_planes();
+                }
+            }
+            Some(2) => self.confirm_overwrite = false,
+            _ => {}
+        }
     }
 
     fn draw_close_dialog(&mut self, ctx: &egui::Context) {
         if !self.confirm_close {
             return;
         }
-        egui::Area::new(egui::Id::new("d6sme_close"))
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .order(egui::Order::Tooltip)
-            .show(ctx, |ui| {
-                theme::panel_frame().show(ui, |ui| {
-                    ui.set_width(320.0);
-                    theme::title(ui, "Unsaved changes");
-                    ui.label("The map has changes that are not saved.");
-                    ui.horizontal(|ui| {
-                        if theme::boxed_button(ui, "Save and exit", true) {
-                            if self.save() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                            self.confirm_close = false;
+        theme::modal(ctx, "d6sme_close", egui::Order::Tooltip, 320.0, |ui| {
+            theme::title(ui, "Unsaved changes");
+            ui.label("The map has changes that are not saved.");
+            ui.horizontal(|ui| {
+                if theme::boxed_button(ui, "Save and exit", true) {
+                    if self.save() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    self.confirm_close = false;
+                }
+                if theme::boxed_button(ui, "Discard", true) {
+                    if let Some(p) = &mut self.project {
+                        for d in &mut p.planes {
+                            d.dirty = false;
                         }
-                        if theme::boxed_button(ui, "Discard", true) {
-                            if let Some(p) = &mut self.project {
-                                for d in &mut p.planes {
-                                    d.dirty = false;
-                                }
-                            }
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if theme::boxed_button(ui, "Cancel", true) {
-                            self.confirm_close = false;
-                        }
-                    });
-                });
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if theme::boxed_button(ui, "Cancel", true) {
+                    self.confirm_close = false;
+                }
             });
+        });
     }
 }
 
@@ -2248,19 +3350,157 @@ impl eframe::App for App {
                 self.confirm_close = true;
             }
         }
+        if let Some(g) = self.gen.poll() {
+            self.open_generated(g);
+        }
+        if std::mem::take(&mut self.pending_generate) {
+            let edited = self
+                .project
+                .as_ref()
+                .map(|p| p.planes.iter().any(|d| d.edited))
+                .unwrap_or(false);
+            if edited {
+                self.confirm_generate = true;
+            } else {
+                self.gen.begin();
+            }
+        }
+        let gen_wrap = self.gen.wrap_axes();
+        if (gen_wrap.0 && !self.gen_wrap.0) || (gen_wrap.1 && !self.gen_wrap.1) {
+            self.wrap_view = true;
+        }
+        self.gen_wrap = gen_wrap;
         self.draw_side(ctx);
+        self.draw_right_side(ctx);
         self.draw_canvas(ctx);
         self.draw_help(ctx);
         self.draw_close_dialog(ctx);
+        self.draw_generate_dialog(ctx);
+        self.draw_overwrite_dialog(ctx);
+        if self.center_pending.is_some() {
+            ctx.request_repaint();
+        }
     }
 }
 
-pub fn default_maps_dir() -> Option<PathBuf> {
-    let appdata = std::env::var_os("APPDATA")?;
-    let p = PathBuf::from(appdata).join("Dominions6").join("maps");
-    if p.is_dir() {
-        Some(p)
-    } else {
-        None
+fn terrain_tally(doc: &PlaneDoc) -> String {
+    let mut forests = 0;
+    let mut farms = 0;
+    let mut swamps = 0;
+    let mut wastes = 0;
+    let mut highlands = 0;
+    let mut kelp = 0;
+    let mut gorges = 0;
+    for f in doc.flags.iter().skip(1) {
+        let sea = f & SEA != 0;
+        let deep = f & DEEP_SEA != 0;
+        if sea {
+            if f & FOREST != 0 && !deep {
+                kelp += 1;
+            }
+            if f & HIGHLAND != 0 && deep {
+                gorges += 1;
+            }
+            continue;
+        }
+        if f & FOREST != 0 {
+            forests += 1;
+        }
+        if f & FARM != 0 {
+            farms += 1;
+        }
+        if f & SWAMP != 0 {
+            swamps += 1;
+        }
+        if f & WASTE != 0 {
+            wastes += 1;
+        }
+        if f & HIGHLAND != 0 {
+            highlands += 1;
+        }
     }
+    format!(
+        "{forests} forests, {farms} farms, {swamps} swamps, {wastes} wastes, {highlands} highlands, {kelp} kelp, {gorges} gorges"
+    )
+}
+
+pub fn default_maps_dir() -> Option<PathBuf> {
+    crate::settings::game_maps_dir()
+}
+
+fn relief_legend(ui: &mut egui::Ui, lo: f32, hi: f32) {
+    let width = ui.available_width().min(PANEL_W - 70.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 14.0), Sense::hover());
+    let painter = ui.painter();
+    let steps = 64;
+    let span = hi - lo;
+    for i in 0..steps {
+        let t0 = i as f32 / steps as f32;
+        let t1 = (i + 1) as f32 / steps as f32;
+        let hv = lo + span * (t0 + t1) * 0.5;
+        let c = crate::render::relief_tint(hv, lo, hi);
+        let r = egui::Rect::from_min_max(
+            Pos2::new(rect.min.x + width * t0, rect.min.y),
+            Pos2::new(rect.min.x + width * t1, rect.max.y),
+        );
+        painter.rect_filled(
+            r,
+            0.0,
+            Color32::from_rgb(c[0] as u8, c[1] as u8, c[2] as u8),
+        );
+    }
+    let sea_x = rect.min.x + width * ((0.0 - lo) / span).clamp(0.0, 1.0);
+    painter.line_segment(
+        [Pos2::new(sea_x, rect.min.y), Pos2::new(sea_x, rect.max.y)],
+        egui::Stroke::new(1.0_f32, theme::INK),
+    );
+    ui.horizontal(|ui| {
+        theme::dim(ui, &format!("{lo:.0}"));
+        ui.add_space((width * ((0.0 - lo) / span).clamp(0.0, 1.0) - 40.0).max(0.0));
+        theme::dim(ui, "sea 0");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            theme::dim(ui, &format!("{hi:.0}"));
+        });
+    });
+}
+
+pub fn elide_left(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max < 2 {
+        return text.to_owned();
+    }
+    let tail: String = chars[chars.len() - (max - 1)..].iter().collect();
+    format!("\u{2026}{tail}")
+}
+
+fn became_status(became: &[(u32, u64)]) -> String {
+    let parts: Vec<String> = became
+        .iter()
+        .map(|&(p, f)| {
+            let kind = if f & terrain::DEEP_SEA != 0 {
+                "deep sea"
+            } else if f & terrain::SEA != 0 {
+                "sea"
+            } else {
+                "land"
+            };
+            format!("{p} {kind}")
+        })
+        .collect();
+    format!("Now {}", parts.join(", "))
+}
+
+pub fn reveal(path: &Path) -> Result<(), String> {
+    let cmd = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(cmd)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{cmd}: {e}"))
 }

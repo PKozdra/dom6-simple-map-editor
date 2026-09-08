@@ -62,6 +62,8 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.interact_size.y = 22.0;
         style.spacing.combo_width = 120.0;
         style.spacing.slider_width = 150.0;
+        style.interaction.tooltip_delay = 0.2;
+        style.interaction.tooltip_grace_time = 0.1;
         let v = &mut style.visuals;
         *v = egui::Visuals::dark();
         v.panel_fill = SIDE_FILL;
@@ -145,6 +147,35 @@ pub fn section(ui: &mut egui::Ui, text: &str) {
     section_first(ui, text);
 }
 
+pub const CODE_BG: Color32 = Color32::from_rgb(40, 40, 44);
+pub const CODE_INK: Color32 = Color32::from_rgb(220, 214, 196);
+
+pub fn path_label(ui: &mut egui::Ui, path: &std::path::Path, size: f32, ink: Color32) {
+    let parts = crate::settings::shown_parts(path);
+    let full = path.display().to_string();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if let Some(p) = parts.placeholder {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(p)
+                        .monospace()
+                        .size(size)
+                        .color(CODE_INK)
+                        .background_color(CODE_BG),
+                )
+                .sense(egui::Sense::hover()),
+            )
+            .on_hover_text(&full);
+        }
+        ui.add(
+            egui::Label::new(egui::RichText::new(&parts.rest).size(size).color(ink))
+                .sense(egui::Sense::hover()),
+        )
+        .on_hover_text(&full);
+    });
+}
+
 pub fn dim(ui: &mut egui::Ui, text: &str) -> Response {
     ui.label(egui::RichText::new(text).color(INK_DIM))
 }
@@ -185,6 +216,61 @@ pub fn tab(ui: &mut egui::Ui, selected: bool, text: &str) -> bool {
             .stroke(Stroke::new(1.0_f32, INK_ACTIVE));
     }
     ui.add(b).clicked()
+}
+
+pub fn primary_action(
+    ui: &mut egui::Ui,
+    text: &str,
+    sprite: Option<&egui::TextureHandle>,
+    sprite_size: f32,
+) -> Response {
+    let width = ui.available_width();
+    let height = 44.0;
+    let (rect, r) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hot = r.hovered();
+        let fill = if hot {
+            Color32::from_rgb(92, 79, 50)
+        } else {
+            Color32::from_rgb(72, 62, 40)
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(3), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(3),
+            Stroke::new(1.0_f32, INK_ACTIVE),
+            egui::StrokeKind::Inside,
+        );
+        let galley = painter.layout_no_wrap(
+            text.to_owned(),
+            FontId::proportional(19.0),
+            if hot { INK_HOT } else { INK_ACTIVE },
+        );
+        let gap = 10.0;
+        let extra = sprite.map(|_| gap + sprite_size).unwrap_or(0.0);
+        let left = rect.center().x - (galley.size().x + extra) * 0.5;
+        let text_end = left + galley.size().x;
+        painter.galley(
+            egui::pos2(left, rect.center().y - galley.size().y * 0.5),
+            galley,
+            INK_ACTIVE,
+        );
+        if let Some(tex) = sprite {
+            let x = text_end + gap;
+            let image = egui::Rect::from_min_size(
+                egui::pos2(x, rect.center().y - sprite_size * 0.5),
+                egui::vec2(sprite_size, sprite_size),
+            );
+            painter.image(
+                tex.id(),
+                image,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    }
+    r
 }
 
 pub fn check(ui: &mut egui::Ui, value: &mut bool, text: &str) -> Response {
@@ -262,4 +348,46 @@ pub fn rule(ui: &mut egui::Ui) {
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().rect_filled(rect, 0.0, PANEL_EDGE_DIM);
     ui.add_space(3.0);
+}
+
+pub fn modal<R>(
+    ctx: &egui::Context,
+    id: &str,
+    order: egui::Order,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let screen = ctx.screen_rect();
+    let width = width.min(screen.width() - 24.0);
+    let max_h = (screen.height() - 24.0).max(80.0);
+    egui::Area::new(egui::Id::new(id))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .order(order)
+        .show(ctx, |ui| scroll_body(ui, width, max_h, add))
+        .inner
+}
+
+pub fn scroll_body<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    max_h: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    panel_frame()
+        .show(ui, |ui| {
+            ui.set_width(width);
+            egui::ScrollArea::vertical()
+                .max_height(max_h - 24.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    add(ui)
+                })
+                .inner
+        })
+        .inner
+}
+
+pub fn modal_height(ctx: &egui::Context) -> f32 {
+    (ctx.screen_rect().height() - 24.0).max(80.0)
 }
