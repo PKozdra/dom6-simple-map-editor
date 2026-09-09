@@ -77,12 +77,15 @@ pub fn cave_layout_index(kind: CaveLayout) -> usize {
     CaveLayout::ALL.iter().position(|k| *k == kind).unwrap_or(0)
 }
 
+static SEED_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn random_seed() -> u32 {
     let t = web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0) as u64;
-    let mut x = t ^ 0x9e37_79b9_7f4a_7c15;
+    let draw = SEED_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut x = t ^ 0x9e37_79b9_7f4a_7c15 ^ draw.wrapping_mul(0x2545_f491_4f6c_dd1d);
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;

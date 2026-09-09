@@ -22,6 +22,9 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+      - name: Drop the runner's preinstalled toolchain so the cache key only sees ours
+        shell: bash
+        run: rustup toolchain list | grep -v '^1\.88' | awk '{print $1}' | xargs -r -n1 rustup toolchain uninstall
       - uses: Swatinem/rust-cache@v2
         with:
           key: lint
@@ -41,6 +44,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+      - name: Drop the runner's preinstalled toolchain so the cache key only sees ours
+        shell: bash
+        run: rustup toolchain list | grep -v '^1\.88' | awk '{print $1}' | xargs -r -n1 rustup toolchain uninstall
       - uses: Swatinem/rust-cache@v2
         with:
           key: test
@@ -55,6 +61,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
+      - name: Drop the runner's preinstalled toolchain so the cache key only sees ours
+        shell: bash
+        run: rustup toolchain list | grep -v '^1\.88' | awk '{print $1}' | xargs -r -n1 rustup toolchain uninstall
       - uses: Swatinem/rust-cache@v2
         with:
           key: release
