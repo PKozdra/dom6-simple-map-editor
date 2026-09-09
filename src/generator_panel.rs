@@ -1003,7 +1003,7 @@ impl GeneratorPanel {
         }
     }
 
-    pub fn action(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+    pub fn action(&mut self, ui: &mut egui::Ui, width: f32, show_key: bool) -> bool {
         if let Some(run) = &self.run {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
             let mut cancel = false;
@@ -1028,7 +1028,7 @@ impl GeneratorPanel {
         keycap::primary_action(
             ui,
             "Generate",
-            Some("G"),
+            show_key.then_some("G"),
             sprite.as_ref(),
             ACTION_SPRITE_SIZE,
             keycap::DEFAULT,

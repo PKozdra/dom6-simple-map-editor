@@ -13,6 +13,10 @@ pub enum Paint {
     NoStartSea,
 }
 
+fn stacked(ctx: &egui::Context) -> bool {
+    ctx.screen_rect().width() < 720.0
+}
+
 impl Paint {
     pub const ALL: [Paint; 4] = [
         Paint::Land,
@@ -432,7 +436,11 @@ impl BlueprintEditor {
     pub fn show(&mut self, ctx: &egui::Context, at: Subject<'_>) -> Outcome {
         let mut outcome = Outcome::Open;
         let max_h = theme::modal_height(ctx);
-        let width = self.view_size(ctx).x + 250.0;
+        let width = if stacked(ctx) {
+            ctx.screen_rect().width() - 24.0
+        } else {
+            self.view_size(ctx).x + 250.0
+        };
         let response = egui::Modal::new(egui::Id::new("blueprint_editor"))
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
@@ -461,14 +469,20 @@ impl BlueprintEditor {
             );
         }
         ui.add_space(6.0);
-        ui.horizontal_top(|ui| {
+        if stacked(ui.ctx()) {
             self.canvas_ui(ui, at.guide);
-            ui.add_space(10.0);
-            ui.vertical(|ui| {
-                ui.set_width(220.0);
-                self.tools_ui(ui, at);
+            ui.add_space(8.0);
+            self.tools_ui(ui, at);
+        } else {
+            ui.horizontal_top(|ui| {
+                self.canvas_ui(ui, at.guide);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(220.0);
+                    self.tools_ui(ui, at);
+                });
             });
-        });
+        }
         ui.add_space(8.0);
         theme::rule(ui);
         ui.horizontal(|ui| {
@@ -484,12 +498,22 @@ impl BlueprintEditor {
 
     fn view_scale(&self, ctx: &egui::Context) -> f32 {
         let screen = ctx.screen_rect();
-        let max_w = (screen.width() - 320.0).max(200.0);
-        let max_h = (screen.height() - 200.0).max(200.0);
+        let (max_w, max_h) = if stacked(ctx) {
+            (
+                (screen.width() - 64.0).max(120.0),
+                (screen.height() * 0.4).max(120.0),
+            )
+        } else {
+            (
+                (screen.width() - 320.0).max(200.0),
+                (screen.height() - 200.0).max(200.0),
+            )
+        };
         (max_w / self.canvas.w as f32)
             .min(max_h / self.canvas.h as f32)
-            .clamp(1.0, 8.0)
+            .clamp(0.25, 8.0)
             .floor()
+            .max(0.5)
     }
 
     fn view_size(&self, ctx: &egui::Context) -> egui::Vec2 {

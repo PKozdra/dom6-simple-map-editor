@@ -20,10 +20,18 @@ fn main() -> eframe::Result<()> {
     let rest: Vec<&String> = args.iter().filter(|a| *a != "--random").collect();
     let initial = rest.first().map(|a| PathBuf::from(a.as_str()));
     let preselect = rest.get(1).and_then(|a| a.parse::<u32>().ok());
+    let window = std::env::var("D6SME_WINDOW").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
+    });
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Dominions 6 Simple Map Editor")
-        .with_inner_size([1400.0, 900.0])
-        .with_min_inner_size([720.0, 480.0])
+        .with_inner_size(window.unwrap_or([1400.0, 900.0]))
+        .with_min_inner_size(if window.is_some() {
+            [320.0, 320.0]
+        } else {
+            [720.0, 480.0]
+        })
         .with_drag_and_drop(true);
     if let Some(ic) = icon() {
         viewport = viewport.with_icon(Arc::new(ic));

@@ -23,6 +23,7 @@ const KEY_HELP: &[(&[&str], &str)] = &[
     (&["Esc"], "Back"),
     (&["F1"], "Help"),
 ];
+use crate::layout::{self, Kind, Layout, Sheet};
 use crate::mapfile::plane_file_name;
 use crate::project::{union, wrap_delta, wrap_point, FlagOp, HeightOp, PlaneDoc, Project};
 use crate::render::{Options, Rect};
@@ -34,7 +35,7 @@ use egui::{Align2, Color32, FontId, Key, PointerButton, Pos2, Sense, StrokeKind,
 use std::path::{Path, PathBuf};
 
 const TILE: usize = 1024;
-const PANEL_W: f32 = 340.0;
+
 const ICON_CELL: f32 = 48.0;
 pub const REPO_URL: &str = "https://github.com/PKozdra/dom6-simple-map-editor";
 
@@ -604,6 +605,11 @@ pub struct App {
     brush: i32,
     paint_empty: bool,
     painting: Option<PointerButton>,
+    stroke_phys: Option<PointerButton>,
+    paint_erase: bool,
+    lay: Layout,
+    sheet: Option<Sheet>,
+    style_kind: Option<Kind>,
     show_markers: bool,
     show_links: bool,
     show_terrain: bool,
@@ -724,6 +730,11 @@ impl App {
             confirm_overwrite: false,
             ctx: cc.egui_ctx.clone(),
             folder_files: Vec::new(),
+            stroke_phys: None,
+            paint_erase: false,
+            lay: Layout::probe(&cc.egui_ctx),
+            sheet: None,
+            style_kind: None,
         };
         if let Some(p) = initial {
             app.open(&p);
@@ -2130,6 +2141,35 @@ impl App {
         }
     }
 
+    fn zoom_about(&mut self, canvas: egui::Rect, pos: Pos2, factor: f32) {
+        if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, 16.0);
+        let k = new_zoom / self.zoom;
+        let rel = pos - canvas.min;
+        self.offset = rel - (rel - self.offset) * k;
+        self.zoom = new_zoom;
+    }
+
+    fn end_stroke(&mut self) {
+        self.painting = None;
+        self.stroke_phys = None;
+        self.stroke_last = None;
+        self.stroke_decor = None;
+        let follow = self.tool == Tool::Height && self.terrain_follows_height;
+        let done = self.with_doc(|d, tex, opts| d.paint_end_follow(follow, tex, opts));
+        if let Some((rect, became)) = done {
+            if let Some(rect) = rect {
+                self.mark_tiles(Some(rect));
+            }
+            if !became.is_empty() {
+                self.status = became_status(&became);
+            }
+        }
+        self.refresh_selection();
+    }
+
     fn draw_canvas(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS))
@@ -2144,7 +2184,11 @@ impl App {
                     ui.painter().text(
                         p,
                         Align2::CENTER_CENTER,
-                        "Drop a .d6m or .map here, or use Open map",
+                        if self.lay.compact() {
+                            "Tap here to open a map, or use Generate"
+                        } else {
+                            "Drop a .d6m or .map here, or use Open map"
+                        },
                         FontId::proportional(20.0),
                         theme::INK_DIM,
                     );
@@ -2199,15 +2243,25 @@ impl App {
                     && !placing
                     && (resp.double_clicked_by(PointerButton::Primary)
                         || resp.triple_clicked_by(PointerButton::Primary));
-                let pan = resp.dragged_by(PointerButton::Middle)
-                    || (!paint_tool && resp.dragged_by(PointerButton::Secondary))
-                    || ((!paint_tool || ctrl)
-                        && !jump_click
-                        && resp.dragged_by(PointerButton::Primary));
+                let multi = ctx.input(|i| i.multi_touch());
+                if let Some(mt) = multi {
+                    if self.painting.is_some() {
+                        self.end_stroke();
+                    }
+                    self.offset += mt.translation_delta;
+                    self.zoom_about(canvas, mt.center_pos, mt.zoom_delta);
+                }
+                let gesture = multi.is_some();
+                let pan = !gesture
+                    && (resp.dragged_by(PointerButton::Middle)
+                        || (!paint_tool && resp.dragged_by(PointerButton::Secondary))
+                        || ((!paint_tool || ctrl)
+                            && !jump_click
+                            && resp.dragged_by(PointerButton::Primary)));
                 if pan {
                     self.offset += resp.drag_delta();
                 }
-                if let Some(pos) = resp.hover_pos() {
+                if let Some(pos) = resp.hover_pos().filter(|_| !gesture) {
                     let scroll = ctx.input(|i| i.raw_scroll_delta.y);
                     let zd = ctx.input(|i| i.zoom_delta());
                     let factor = if scroll != 0.0 {
@@ -2215,13 +2269,7 @@ impl App {
                     } else {
                         zd
                     };
-                    if factor != 1.0 {
-                        let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, 16.0);
-                        let k = new_zoom / self.zoom;
-                        let rel = pos - canvas.min;
-                        self.offset = rel - (rel - self.offset) * k;
-                        self.zoom = new_zoom;
-                    }
+                    self.zoom_about(canvas, pos, factor);
                     let (x, y) = self.screen_to_map(canvas, pos);
                     self.hover = self.doc().map(|d| d.owner_at(x, y)).filter(|&p| p > 0);
                     if placing && resp.clicked_by(PointerButton::Primary) {
@@ -2269,18 +2317,24 @@ impl App {
                     if paint_tool && !ctrl && !placing {
                         let (primary, secondary) =
                             ctx.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
-                        let button = if primary {
+                        let phys = if primary {
                             Some(PointerButton::Primary)
                         } else if secondary {
                             Some(PointerButton::Secondary)
                         } else {
                             None
                         };
-                        if let Some(b) = button {
-                            let started = resp.contains_pointer() || self.painting == Some(b);
+                        if let Some(pb) = phys {
+                            let b = if pb == PointerButton::Primary && self.paint_erase {
+                                PointerButton::Secondary
+                            } else {
+                                pb
+                            };
+                            let started = resp.contains_pointer() || self.stroke_phys == Some(pb);
                             if started {
-                                if self.painting != Some(b) {
+                                if self.stroke_phys != Some(pb) {
                                     self.painting = Some(b);
+                                    self.stroke_phys = Some(pb);
                                     self.stroke_last = None;
                                     let label = match (self.tool, b) {
                                         (Tool::Height, _) => "Height brush",
@@ -2297,24 +2351,10 @@ impl App {
                 } else {
                     self.hover = None;
                 }
-                if let Some(b) = self.painting {
-                    let still = ctx.input(|i| i.pointer.button_down(b));
+                if let Some(pb) = self.stroke_phys {
+                    let still = ctx.input(|i| i.pointer.button_down(pb));
                     if !still {
-                        self.painting = None;
-                        self.stroke_last = None;
-                        self.stroke_decor = None;
-                        let follow = self.tool == Tool::Height && self.terrain_follows_height;
-                        let done =
-                            self.with_doc(|d, tex, opts| d.paint_end_follow(follow, tex, opts));
-                        if let Some((rect, became)) = done {
-                            if let Some(rect) = rect {
-                                self.mark_tiles(Some(rect));
-                            }
-                            if !became.is_empty() {
-                                self.status = became_status(&became);
-                            }
-                        }
-                        self.refresh_selection();
+                        self.end_stroke();
                     }
                 }
                 let active = self.active;
@@ -2695,7 +2735,7 @@ impl App {
 
     fn draw_side(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("d6sme_side")
-            .exact_width(PANEL_W)
+            .exact_width(layout::SIDE_W)
             .resizable(false)
             .frame(
                 egui::Frame::NONE
@@ -2703,7 +2743,7 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show(ctx, |ui| {
-                ui.set_max_width(PANEL_W - 22.0);
+                ui.set_max_width(self.lay.inner_w());
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                 self.mode_section(ui);
                 theme::rule(ui);
@@ -2711,13 +2751,13 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_max_width(PANEL_W - 22.0);
+                        ui.set_max_width(self.lay.inner_w());
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                         if self.mode == Mode::Generator {
                             let blueprints = self.settings.blueprints_dir();
                             let doc_name = self.project.as_ref().map(|p| p.base.clone());
                             self.gen
-                                .ui(ui, PANEL_W - 50.0, &blueprints, doc_name.as_deref());
+                                .ui(ui, self.lay.section_w(), &blueprints, doc_name.as_deref());
                             return;
                         }
                         self.tools_section(ui);
@@ -2735,7 +2775,7 @@ impl App {
 
     fn draw_right_side(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("d6sme_right")
-            .exact_width(PANEL_W)
+            .exact_width(layout::SIDE_W)
             .resizable(false)
             .frame(
                 egui::Frame::NONE
@@ -2762,11 +2802,11 @@ impl App {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.set_max_width(PANEL_W - 22.0);
+                                ui.set_max_width(self.lay.inner_w());
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
                                 self.map_section(ui);
                                 ui.add_space(8.0);
-                                if self.gen.action(ui, PANEL_W - 50.0) {
+                                if self.gen.action(ui, self.lay.section_w(), true) {
                                     self.pending_generate = true;
                                 }
                                 ui.add_space(8.0);
@@ -2778,9 +2818,107 @@ impl App {
             });
     }
 
+    fn draw_sheet(&mut self, ctx: &egui::Context) {
+        let sheet_h = self.lay.sheet_h();
+        egui::TopBottomPanel::bottom("d6sme_sheet")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::SIDE_FILL)
+                    .inner_margin(egui::Margin::symmetric(10, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(self.lay.inner_w());
+                if let Some(sheet) = self.sheet {
+                    egui::ScrollArea::vertical()
+                        .id_salt(sheet.label())
+                        .max_height(sheet_h)
+                        .min_scrolled_height(sheet_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_max_width(self.lay.inner_w());
+                            self.sheet_body(ui, sheet);
+                        });
+                    theme::rule(ui);
+                }
+                self.sheet_tabs(ui);
+            });
+    }
+
+    fn sheet_tabs(&mut self, ui: &mut egui::Ui) {
+        let n = Sheet::ALL.len();
+        let gap = ui.spacing().item_spacing.x;
+        let w = (self.lay.inner_w() - gap * (n as f32 - 1.0)) / n as f32;
+        let h = 40.0;
+        ui.horizontal(|ui| {
+            for sheet in Sheet::ALL {
+                let open = self.sheet == Some(sheet);
+                let text = egui::RichText::new(sheet.label())
+                    .size(16.0)
+                    .color(if open { theme::INK_ACTIVE } else { theme::INK });
+                let btn = egui::Button::new(text)
+                    .min_size(egui::vec2(w, h))
+                    .fill(if open {
+                        theme::PANEL_FILL
+                    } else {
+                        Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if open {
+                            theme::PANEL_EDGE
+                        } else {
+                            theme::PANEL_EDGE_DIM
+                        },
+                    ));
+                if ui.add(btn).clicked() {
+                    self.sheet = if open { None } else { Some(sheet) };
+                }
+            }
+        });
+    }
+
+    fn sheet_body(&mut self, ui: &mut egui::Ui, sheet: Sheet) {
+        ui.spacing_mut().item_spacing = egui::vec2(10.0, 9.0);
+        match sheet {
+            Sheet::Map => {
+                self.map_section(ui);
+                ui.add_space(6.0);
+                self.settings_section(ui);
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    github_link(ui, self.github.as_ref());
+                });
+            }
+            Sheet::Tools => {
+                self.tools_section(ui);
+                ui.add_space(6.0);
+                if self.selected.is_some() {
+                    self.province_section(ui);
+                    ui.add_space(6.0);
+                }
+                if self.project.is_some() {
+                    self.plane_section(ui);
+                }
+            }
+            Sheet::Generate => {
+                if self.gen.action(ui, self.lay.section_w(), false) {
+                    self.pending_generate = true;
+                }
+                ui.add_space(6.0);
+                let blueprints = self.settings.blueprints_dir();
+                let doc_name = self.project.as_ref().map(|p| p.base.clone());
+                self.gen
+                    .ui(ui, self.lay.section_w(), &blueprints, doc_name.as_deref());
+            }
+            Sheet::View => self.view_section(ui),
+        }
+    }
+
     fn mode_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             ui.horizontal_wrapped(|ui| {
                 if theme::tab(ui, self.mode == Mode::Editor, "Editor") {
                     self.mode = Mode::Editor;
@@ -2820,7 +2958,7 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn settings_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             theme::section_first(ui, "Folder");
             let folder = crate::io::dir_name();
             if crate::web::can_pick_directory() {
@@ -2884,7 +3022,7 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn settings_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             theme::section_first(ui, "Settings");
             let root = self.settings.root_dir();
             theme::dim(ui, "Path");
@@ -2960,12 +3098,12 @@ impl App {
 
     fn map_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             let title = self.project.as_ref().map(|p| p.base.clone()).unwrap_or_else(|| "Dominions 6 Simple Map Editor".to_owned());
             if self.renaming {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.name_draft)
-                        .desired_width(PANEL_W - 70.0)
+                        .desired_width(self.lay.section_w() - 20.0)
                         .font(egui::FontId::proportional(20.0)),
                 );
                 if !field.has_focus() && !field.lost_focus() {
@@ -3009,7 +3147,7 @@ impl App {
                 let dims = p.planes.get(self.active).map(|d| format!("{} x {} px, {} provinces", d.width(), d.height(), d.province_count())).unwrap_or_default();
                 theme::dim(ui, &dims);
                 if let Some(Some(tex)) = self.thumbs.get(self.active) {
-                    let side = PANEL_W - 50.0;
+                    let side = self.lay.section_w();
                     let size = tex.size_vec2();
                     let scale = (side / size.x).min(160.0 / size.y);
                     let src = egui::load::SizedTexture::from_handle(tex);
@@ -3161,7 +3299,7 @@ impl App {
             self.gate_edit = gate;
         }
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             ui.horizontal(|ui| {
                 theme::title(ui, &format!("{prov}"));
                 let r = ui.add(egui::TextEdit::singleline(&mut self.name_edit).hint_text("Province name").desired_width(ui.available_width() - 8.0));
@@ -3445,28 +3583,38 @@ impl App {
 
     fn tools_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             theme::section_first(ui, "Tool");
+            let compact = self.lay.compact();
             ui.horizontal_wrapped(|ui| {
-                if keycap::tab(ui, self.tool == Tool::Select, "Select", "S", keycap::DEFAULT) {
-                    self.tool = Tool::Select;
-                }
-                if keycap::tab(ui, self.tool == Tool::Link, "Link", "L", keycap::DEFAULT) {
-                    self.tool = Tool::Link;
-                }
-                if keycap::tab(ui, self.tool == Tool::Paint, "Paint area", "P", keycap::DEFAULT) {
-                    self.tool = Tool::Paint;
-                }
-                if keycap::tab(ui, self.tool == Tool::Height, "Heights", "H", keycap::DEFAULT) {
-                    self.tool = Tool::Height;
+                for (tool, text, key) in [
+                    (Tool::Select, "Select", "S"),
+                    (Tool::Link, "Link", "L"),
+                    (Tool::Paint, "Paint area", "P"),
+                    (Tool::Height, "Heights", "H"),
+                ] {
+                    let on = self.tool == tool;
+                    let hit = if compact {
+                        theme::tab(ui, on, text)
+                    } else {
+                        keycap::tab(ui, on, text, key, keycap::DEFAULT)
+                    };
+                    if hit {
+                        self.tool = tool;
+                    }
                 }
             })
             .response
             .on_hover_text("Tab cycles the tools; P or H pressed again goes back to Select");
             match self.tool {
                 Tool::Select => {
-                    theme::dim(ui, "Click a province or its capital dot to select it");
-                    theme::dim(ui, "Double-click a gateway province to jump to the next gateway with the same number.");
+                    if compact {
+                        theme::dim(ui, "Tap a province to select it; drag pans, pinch zooms");
+                        theme::dim(ui, "Double-tap a gateway province to jump to the next gateway with the same number.");
+                    } else {
+                        theme::dim(ui, "Click a province or its capital dot to select it");
+                        theme::dim(ui, "Double-click a gateway province to jump to the next gateway with the same number.");
+                    }
                     ui.horizontal(|ui| {
                         theme::dim(ui, "Number");
                         let n = self.doc().map(|d| d.province_count() as u32).unwrap_or(1).max(1);
@@ -3481,7 +3629,11 @@ impl App {
                 Tool::Link => {
                     theme::dim(
                         ui,
-                        "Select a province, then click others to connect or disconnect",
+                        if compact {
+                            "Select a province, then tap others to connect or disconnect"
+                        } else {
+                            "Select a province, then click others to connect or disconnect"
+                        },
                     );
                 }
                 Tool::Height => {
@@ -3493,6 +3645,9 @@ impl App {
                         theme::dim(ui, "Step");
                         ui.add(egui::DragValue::new(&mut self.step).range(1.0..=500.0).speed(1.0));
                     });
+                    if compact {
+                        self.stroke_direction(ui, "Raise", "Lower");
+                    }
                     theme::check(ui, &mut self.terrain_follows_height, "Height changes terrain").on_hover_text("When a stroke ends, every province it touched gets its Sea and Deep sea marks from where most of its ground now sits: below the waterline is Sea, below -36 is Deep sea, above is Land. Other land types stay as they are");
                     theme::check(ui, &mut self.keep_rivers, "Keep rivers").on_hover_text("Leaves the baked river channels alone so the brush cannot fill them in or lift them out; untick to reshape them like any other ground");
                     theme::check(ui, &mut self.relief_in_height, "Height map").on_hover_text("Shows the height field as a shaded relief while this tool is active: blues below the waterline, sand at the shore, green to brown to white going up. Borders and markers stay");
@@ -3506,7 +3661,11 @@ impl App {
                     }
                     theme::dim(
                         ui,
-                        "Left button raises the ground under the brush by the step, right button lowers it. Land turns to water below 0, so a valley can be dug into a lake and a shoal raised into an island",
+                        if compact {
+                            "One finger moves the ground under the brush by the step; two fingers pan and zoom. Land turns to water below 0, so a valley can be dug into a lake and a shoal raised into an island"
+                        } else {
+                            "Left button raises the ground under the brush by the step, right button lowers it. Land turns to water below 0, so a valley can be dug into a lake and a shoal raised into an island"
+                        },
                     );
                 }
                 Tool::Paint => {
@@ -3514,6 +3673,9 @@ impl App {
                         theme::dim(ui, "Brush");
                         ui.add(egui::Slider::new(&mut self.brush, 1..=60).suffix(" px"));
                     });
+                    if compact {
+                        self.stroke_direction(ui, "Add", "Remove");
+                    }
                     theme::check(ui, &mut self.paint_empty, "Paint no province").on_hover_text("The left button takes pixels away from every province instead of giving them to the selected one; the right button still restores what was there when the map was opened");
                     if theme::boxed_button_hint(ui, if self.placing_new { "Click the map..." } else { "New province" }, self.project.is_some() && !self.placing_new, "Adds a province numbered after the last one. Click where its capital should be; a disc of the brush size around that point becomes its first area, and it takes the sea or cave marks of the province it was cut from. Then paint the rest of it. Escape cancels") {
                         self.placing_new = true;
@@ -3522,18 +3684,39 @@ impl App {
                     }
                     theme::dim(
                         ui,
-                        "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans",
+                        if compact {
+                            "Add gives pixels under the brush to the selected province. Remove undoes the painting there, giving every pixel back to the province that had it when the map was opened. Two fingers pan and zoom"
+                        } else {
+                            "Left button: give pixels to the selected province. Right button: undo the painting under the brush, giving every pixel back to the province that had it when the map was opened. Middle or Ctrl+left drag pans"
+                        },
                     );
                 }
             }
         });
     }
 
+    fn stroke_direction(&mut self, ui: &mut egui::Ui, add: &str, remove: &str) {
+        ui.horizontal(|ui| {
+            if theme::tab(ui, !self.paint_erase, add) {
+                self.paint_erase = false;
+            }
+            if theme::tab(ui, self.paint_erase, remove) {
+                self.paint_erase = true;
+            }
+        });
+    }
+
     fn plane_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             theme::section_first(ui, "Whole plane");
-            if keycap::boxed_button(ui, "Random terrain", &["F4"], true, "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds", keycap::DEFAULT) {
+            let hint = "F4 in the game's editor: clears the land types and site marks of every province on this plane and rolls new ones with the game's own odds";
+            let hit = if self.lay.compact() {
+                theme::boxed_button_hint(ui, "Random terrain", true, hint)
+            } else {
+                keycap::boxed_button(ui, "Random terrain", &["F4"], true, hint, keycap::DEFAULT)
+            };
+            if hit {
                 self.randomize_terrain();
             }
             ui.horizontal_wrapped(|ui| {
@@ -3568,7 +3751,7 @@ impl App {
 
     fn view_section(&mut self, ui: &mut egui::Ui) {
         theme::panel_frame().show(ui, |ui| {
-            ui.set_width(PANEL_W - 50.0);
+            ui.set_width(self.lay.section_w());
             theme::section_first(ui, "View");
             let mut changed = false;
             egui::Grid::new("view_flags")
@@ -3620,18 +3803,27 @@ impl App {
         theme::modal(ctx, "d6sme_help", egui::Order::Foreground, 700.0, |ui| {
             theme::title(ui, "Help");
             theme::section(ui, "Map");
-            ui.label(
-                "Wheel zooms, dragging pans, Home fits the map. Click a province to select it.",
-            );
+            let compact = self.lay.compact();
+            ui.label(if compact {
+                "Drag pans, pinch zooms, Fit in the View tab fits the map. Tap a province to select it."
+            } else {
+                "Wheel zooms, dragging pans, Home fits the map. Click a province to select it."
+            });
             theme::section(ui, "Looks");
             ui.label("Water starts below height 0. Shallows reach down to -10, open water to -30, deep sea from -36. The presets move a province to those depths and set its Sea marks so the rules match the picture. Flatten gives every pixel the same height.");
             theme::section(ui, "Rivers");
             ui.label("A river is a connection type: the engine carves the channel along the shared border when the map loads, so rivers can only run between two provinces and are added or removed with the Link tool. Generated maps also carry every river as a trench baked into the height data, because the recipe cannot store the engine's fresh-river marker; on load that trench paints as a sunken river with the border across it, on the cave plane as rock. Adding or removing a river with the Link tool also lifts or carves its channel here.");
             theme::section(ui, "Paint area");
-            ui.label("Left button gives pixels to the selected province, right button takes them back from it, middle button or Ctrl+left drag pans.");
-            theme::section(ui, "Keys");
-            for (keys, what) in KEY_HELP {
-                keycap::help_row(ui, keys, what, keycap::DEFAULT);
+            ui.label(if compact {
+                "Add gives pixels to the selected province, Remove takes them back from it, two fingers pan and zoom."
+            } else {
+                "Left button gives pixels to the selected province, right button takes them back from it, middle button or Ctrl+left drag pans."
+            });
+            if !compact {
+                theme::section(ui, "Keys");
+                for (keys, what) in KEY_HELP {
+                    keycap::help_row(ui, keys, what, keycap::DEFAULT);
+                }
             }
             theme::section(ui, "Files");
             if crate::io::IS_WEB {
@@ -3812,8 +4004,17 @@ impl eframe::App for App {
             self.wrap_view = true;
         }
         self.gen_wrap = gen_wrap;
-        self.draw_side(ctx);
-        self.draw_right_side(ctx);
+        self.lay = Layout::probe(ctx);
+        if self.style_kind != Some(self.lay.kind) {
+            layout::apply_style(ctx, self.lay.kind);
+            self.style_kind = Some(self.lay.kind);
+        }
+        if self.lay.compact() {
+            self.draw_sheet(ctx);
+        } else {
+            self.draw_side(ctx);
+            self.draw_right_side(ctx);
+        }
         self.draw_canvas(ctx);
         self.draw_help(ctx);
         self.draw_close_dialog(ctx);
@@ -3921,7 +4122,7 @@ fn github_link(ui: &mut egui::Ui, mark: Option<&egui::TextureHandle>) {
 }
 
 fn relief_legend(ui: &mut egui::Ui, lo: f32, hi: f32) {
-    let width = ui.available_width().min(PANEL_W - 70.0);
+    let width = ui.available_width().min(layout::SIDE_W - 70.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 14.0), Sense::hover());
     let painter = ui.painter();
     let steps = 64;

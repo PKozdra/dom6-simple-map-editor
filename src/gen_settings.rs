@@ -63,7 +63,7 @@ fn push_image(out: &mut Vec<String>, key: &str, own: &OwnImage) {
 pub fn encode(form: &Form) -> Vec<String> {
     let mut out = Vec::new();
     out.push("-- generator settings; loading this map restores them".to_string());
-    push(&mut out, "app", env!("CARGO_PKG_VERSION"));
+    push(&mut out, "app", env!("D6SME_VERSION"));
     push(&mut out, "pool", dom6_mapgen::rng::pool_id());
     push(&mut out, "seed", form.seed);
     push(&mut out, "name", &form.name);

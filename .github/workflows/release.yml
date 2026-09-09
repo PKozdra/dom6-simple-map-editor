@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the v prefix (must match Cargo.toml)"
+        description: "Version to release, X.Y.Z (the tag is created for you)"
         required: true
 
 permissions:
@@ -29,9 +29,9 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
-          C=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
-          if [ "$V" != "$C" ]; then
-            echo "tag version $V does not match Cargo.toml version $C" >&2
+          V="${V#v}"
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "version $V is not X.Y.Z" >&2
             exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
@@ -70,8 +70,15 @@ jobs:
         with:
           targets: ${{ matrix.target || '' }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.label }}
+      - name: Use every runner core
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
       - name: Build
         shell: bash
+        env:
+          D6SME_VERSION: ${{ needs.version.outputs.version }}
         run: |
           if [ -n "${{ matrix.target }}" ]; then
             cargo build --release --locked --target "${{ matrix.target }}"

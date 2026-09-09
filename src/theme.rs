@@ -367,6 +367,8 @@ pub fn modal<R>(
         .inner
 }
 
+pub const MODAL_FILL: Color32 = Color32::from_rgb(18, 18, 19);
+
 pub fn scroll_body<R>(
     ui: &mut egui::Ui,
     width: f32,
@@ -374,6 +376,7 @@ pub fn scroll_body<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     panel_frame()
+        .fill(MODAL_FILL)
         .show(ui, |ui| {
             ui.set_width(width);
             let r = ui.max_rect();

@@ -6,8 +6,33 @@ on:
     tags-ignore: ["v*"]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  check:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: Use every runner core
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown --bins --locked -- -D warnings
+
+  test:
     strategy:
       fail-fast: false
       matrix:
@@ -16,18 +41,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo clippy --target wasm32-unknown-unknown --bins --locked -- -D warnings
-        if: matrix.os == 'ubuntu-22.04'
-      - run: cargo test --release --locked
+        with:
+          key: test
+      - name: Use every runner core
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
+      - run: cargo test --locked
+
+  windows-build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Use every runner core
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
       - run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
-        if: matrix.os == 'windows-latest'
         with:
           name: dom6-simple-map-editor-windows-x64
           path: target/release/dom6-simple-map-editor.exe

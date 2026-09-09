@@ -19,12 +19,17 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.88
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: wasm
+      - name: Use every runner core
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)" >> "$GITHUB_ENV"
       - name: Install trunk
         shell: bash
         run: |
@@ -35,7 +40,10 @@ jobs:
           enablement: true
       - name: Build
         shell: bash
-        run: trunk build --release --locked --public-url "./"
+        run: |
+          export D6SME_VERSION="$(git describe --tags --match 'v*' --always)"
+          echo "web build version $D6SME_VERSION"
+          trunk build --release --locked --public-url "./"
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist/web

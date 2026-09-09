@@ -7,6 +7,7 @@ pub mod gen_settings;
 pub mod generator_panel;
 pub mod io;
 pub mod keycap;
+pub mod layout;
 pub mod mapfile;
 pub mod nations;
 pub mod par;
