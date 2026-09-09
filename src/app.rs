@@ -3023,18 +3023,30 @@ impl App {
                             .unwrap_or((1.0, 1.0));
                         let k = size * scale / Vec2::new(pw, ph);
                         let painter = ui.painter();
-                        if let Some(b) = doc.and_then(|d| d.bbox(sel)) {
-                            let r = egui::Rect::from_min_max(
-                                img.rect.min + Vec2::new(b.x0 as f32 * k.x, b.y0 as f32 * k.y),
-                                img.rect.min + Vec2::new((b.x1 + 1) as f32 * k.x, (b.y1 + 1) as f32 * k.y),
-                            )
-                            .expand(1.0);
-                            painter.rect_stroke(
-                                r,
-                                1.0,
-                                egui::Stroke::new(1.5, theme::INK_ACTIVE),
-                                egui::StrokeKind::Outside,
-                            );
+                        if let Some(d) = doc {
+                            let cols = (size.x * scale).round().max(1.0) as i32;
+                            let rows = (size.y * scale).round().max(1.0) as i32;
+                            let fill = theme::INK_ACTIVE.gamma_multiply(0.75);
+                            for ty in 0..rows {
+                                let my = ((ty as f32 + 0.5) / k.y) as i32;
+                                let mut run: Option<i32> = None;
+                                for tx in 0..=cols {
+                                    let inside = tx < cols
+                                        && d.owner_at(((tx as f32 + 0.5) / k.x) as i32, my) == sel;
+                                    match (run, inside) {
+                                        (None, true) => run = Some(tx),
+                                        (Some(x0), false) => {
+                                            let r = egui::Rect::from_min_max(
+                                                img.rect.min + Vec2::new(x0 as f32, ty as f32),
+                                                img.rect.min + Vec2::new(tx as f32, ty as f32 + 1.0),
+                                            );
+                                            painter.rect_filled(r, 0.0, fill);
+                                            run = None;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
                         if let Some((cx, cy)) = doc.and_then(|d| d.capital(sel)) {
                             let c = img.rect.min + Vec2::new(cx as f32 * k.x, cy as f32 * k.y);
