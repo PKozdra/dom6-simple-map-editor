@@ -983,3 +983,29 @@ fn generator_settings_survive_save_and_reopen() {
     assert_eq!(restored.form.seed, 77);
     assert!(restored.form.manual_seed);
 }
+
+#[test]
+fn isolated_provinces_get_linked_to_the_province_they_touch() {
+    let dir = temp_dir("isolated");
+    let (p1, map_path) = make_map(&dir, "isolated", 1, false);
+    let text = std::fs::read_to_string(&map_path).unwrap();
+    std::fs::write(
+        &map_path,
+        text.replace(
+            "#neighbour 1 2
+",
+            "",
+        ),
+    )
+    .unwrap();
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    assert!(doc.neighbours(1).is_empty());
+    assert_eq!(doc.raster_neighbours(1), vec![(2, 12)]);
+    let linked = doc.link_isolated(&t, &opts);
+    assert_eq!(linked, vec![(1, 2)]);
+    assert_eq!(doc.neighbours(1), vec![2]);
+    assert!(doc.link_isolated(&t, &opts).is_empty());
+}

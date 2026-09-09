@@ -869,6 +869,23 @@ impl App {
         removed
     }
 
+    fn link_isolated_provinces(&mut self) -> usize {
+        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
+        let opts = self.opts;
+        let mut linked = 0;
+        if let Some(p) = &mut self.project {
+            for d in &mut p.planes {
+                linked += d.link_isolated(&tex, &opts).len();
+            }
+        }
+        self.tex = tex;
+        if linked > 0 {
+            self.mark_tiles(None);
+            self.refresh_selection();
+        }
+        linked
+    }
+
     fn open_generated(&mut self, g: GeneratedMap) {
         let dir = self.settings.maps_dir();
         let planes: Vec<(&[u8], &str)> = g
@@ -882,6 +899,7 @@ impl App {
                 p.set_generator_settings(&self.gen.settings_lines());
                 self.adopt_project(p);
                 let dropped = self.remove_empty_provinces();
+                let linked = self.link_isolated_provinces();
                 let counts = self
                     .project
                     .as_ref()
@@ -913,6 +931,13 @@ impl App {
                         "{}. Dropped {dropped} province{} that had no area",
                         self.status,
                         if dropped == 1 { "" } else { "s" }
+                    );
+                }
+                if linked > 0 {
+                    self.status = format!(
+                        "{}. Connected {linked} province{} that had no neighbour",
+                        self.status,
+                        if linked == 1 { "" } else { "s" }
                     );
                 }
                 if !g.wants.is_empty() {

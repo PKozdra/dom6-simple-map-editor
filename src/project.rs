@@ -859,6 +859,73 @@ impl PlaneDoc {
         self.push(edit, tex, opts)
     }
 
+    pub fn raster_neighbours(&self, prov: u32) -> Vec<(u32, u32)> {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let mut shared: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        for y in 0..h {
+            for x in 0..w {
+                if self.owner_at(x, y) != prov {
+                    continue;
+                }
+                for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, ny) = wrap_point(x + dx, y + dy, w, h, self.hwrap(), self.vwrap());
+                    let o = self.owner_at(nx, ny);
+                    if o != 0 && o != prov {
+                        *shared.entry(o).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(u32, u32)> = shared.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    pub fn link_isolated(&mut self, tex: &TexSet, opts: &Options) -> Vec<(u32, u32)> {
+        let mut linked = Vec::new();
+        let n = self.province_count() as u32;
+        for p in 1..=n {
+            if !self.neighbours(p).is_empty()
+                || self.pixel_counts.get(p as usize).copied().unwrap_or(0) == 0
+            {
+                continue;
+            }
+            let target = match self.raster_neighbours(p).first() {
+                Some(&(q, _)) => Some(q),
+                None => self.nearest_capital(p),
+            };
+            if let Some(q) = target {
+                if self.set_link(p, q, true, tex, opts) {
+                    linked.push((p, q));
+                }
+            }
+        }
+        linked
+    }
+
+    fn nearest_capital(&self, prov: u32) -> Option<u32> {
+        let (cx, cy) = self.capital(prov)?;
+        let w = self.d6m.width as f32;
+        let h = self.d6m.height as f32;
+        let mut best: Option<(f32, u32)> = None;
+        for q in 1..=self.province_count() as u32 {
+            if q == prov {
+                continue;
+            }
+            let Some((qx, qy)) = self.capital(q) else {
+                continue;
+            };
+            let dx = wrap_delta((qx - cx) as f32, w, self.hwrap());
+            let dy = wrap_delta((qy - cy) as f32, h, self.vwrap());
+            let d = dx * dx + dy * dy;
+            if best.map(|(b, _)| d < b).unwrap_or(true) {
+                best = Some((d, q));
+            }
+        }
+        best.map(|(_, q)| q)
+    }
+
     pub fn set_link(
         &mut self,
         a: u32,
