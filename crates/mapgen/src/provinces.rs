@@ -147,8 +147,6 @@ pub fn place_and_grow(world: &mut World, opts: &Options, sink: &mut dyn Sink) ->
     }
 
     let saved_height = world.heights.clone();
-    let full_w = world.w;
-    let full_h = world.h;
 
     downsample_random_map_work_buffers_2x(world);
     downsample_random_map_work_buffers_2x(world);
@@ -197,9 +195,10 @@ pub fn place_and_grow(world: &mut World, opts: &Options, sink: &mut dyn Sink) ->
         return Control::Cancel;
     }
 
-    world.w = full_w;
-    world.h = full_h;
+    let pixels = (world.w * world.h).max(0) as usize;
     world.heights = saved_height;
+    world.heights.truncate(pixels);
+    world.heights.resize(pixels, 0.0);
     Control::Continue
 }
 

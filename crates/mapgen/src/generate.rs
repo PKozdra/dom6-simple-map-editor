@@ -115,7 +115,11 @@ pub fn generate_plane(
 }
 
 pub fn caves_plane_fits(surface: &PlaneOut) -> bool {
-    surface.provinces.len() - 1 + CAVE_BUDGET_MARGIN < PROVINCE_BUDGET
+    caves_plane_fits_with_requested_count(surface, 0)
+}
+
+pub fn caves_plane_fits_with_requested_count(surface: &PlaneOut, requested: i32) -> bool {
+    surface.provinces.len() - 1 + CAVE_BUDGET_MARGIN + (requested.max(0) as usize) < PROVINCE_BUDGET
 }
 
 pub fn generate(
@@ -306,7 +310,7 @@ pub fn generate_new_game_per_player(
     surface_opts.caves_plane = false;
     let surface = generate_plane(&surface_opts, seed, &format!("__randommap_{name}"), sink)?;
     let mut planes = vec![surface];
-    if opts.caves_plane && caves_plane_fits(&planes[0]) {
+    if opts.caves_plane && caves_plane_fits_with_requested_count(&planes[0], nprov) {
         let cave_opts = surface_opts.caves_plane_options(NEWGAME_CAVE_MAP_W, NEWGAME_CAVE_MAP_H);
         planes.push(generate_plane(
             &cave_opts,

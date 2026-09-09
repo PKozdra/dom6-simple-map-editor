@@ -226,6 +226,9 @@ pub fn upscale_blueprint(bp: &Blueprint, req_w: i32, req_h: i32, crt: &mut CrtRn
     Blueprint { w, h, bgra: px }
 }
 
+pub const MAPSIZE_MIN_AXIS: i32 = 100;
+pub const MAPSIZE_MAX_AXIS: i32 = 11000;
+
 pub fn round_map_dimensions(
     width: i32,
     height: i32,
@@ -235,7 +238,10 @@ pub fn round_map_dimensions(
     let (rw, rh) = if width < 1 || height < 1 {
         (AUTO_WIDTH, AUTO_HEIGHT)
     } else {
-        (width, height)
+        (
+            width.clamp(MAPSIZE_MIN_AXIS, MAPSIZE_MAX_AXIS),
+            height.clamp(MAPSIZE_MIN_AXIS, MAPSIZE_MAX_AXIS),
+        )
     };
     let snap = |v: i32| {
         let t = ((v & !1) + 0x100) & !(WRAP_GRID - 1);
@@ -1155,9 +1161,12 @@ mod tests {
         );
         assert_eq!(round_map_dimensions(600, 600, true, true), Ok((512, 512)));
         assert_eq!(round_map_dimensions(100, 100, true, true), Ok((512, 512)));
-        assert!(round_map_dimensions(48, 600, false, false).is_err());
-        assert!(round_map_dimensions(600, 49, false, false).is_err());
-        assert_eq!(round_map_dimensions(600, 50, false, false), Ok((600, 50)));
+        assert_eq!(round_map_dimensions(48, 600, false, false), Ok((100, 600)));
+        assert_eq!(round_map_dimensions(64, 64, false, false), Ok((100, 100)));
+        assert_eq!(
+            round_map_dimensions(99999, 600, false, false),
+            Ok((11000, 600))
+        );
     }
 
     #[test]

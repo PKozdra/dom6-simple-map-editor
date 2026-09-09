@@ -1,5 +1,11 @@
 pub const POOL_LEN: usize = 500;
-const POOL_BYTES: &[u8; POOL_LEN * 4] = include_bytes!("rng_pool.bin");
+const POOL_BYTES: &[u8; POOL_LEN * 4] = include_bytes!(concat!(env!("OUT_DIR"), "/rng_pool.bin"));
+pub const ENGINE_POOL: bool = cfg!(engine_pool);
+
+pub fn pool_id() -> String {
+    let kind = if ENGINE_POOL { "engine" } else { "synthetic" };
+    format!("{kind} {:016x}", crate::hash::fnv64(POOL_BYTES))
+}
 pub const POOL: [u32; POOL_LEN] = decode_pool();
 
 const fn decode_pool() -> [u32; POOL_LEN] {

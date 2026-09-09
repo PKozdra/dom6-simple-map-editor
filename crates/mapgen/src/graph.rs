@@ -873,7 +873,19 @@ fn count_all_region_pixels(w: &World) -> Vec<i32> {
         )
 }
 
-pub fn ensure_land_exits(w: &mut World) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoadedPlaneProvinces {
+    pub first: i32,
+    pub last: i32,
+}
+
+pub const NO_PLANE_LOADED_DURING_GENERATION: LoadedPlaneProvinces =
+    LoadedPlaneProvinces { first: 0, last: -1 };
+
+pub fn ensure_land_exits(w: &mut World, plane: LoadedPlaneProvinces) {
+    if plane.first < 1 || plane.last < plane.first {
+        return;
+    }
     let n = w.nprov() as i32;
     for a in 1..=n {
         if !w.provinces[a as usize].nbors.is_empty() {
@@ -885,7 +897,7 @@ pub fn ensure_land_exits(w: &mut World) {
         );
         let mut best = -1i32;
         let mut bestd = 99_999_999.0f64;
-        for b in 1..=n {
+        for b in plane.first..=plane.last.min(n) {
             if b == a {
                 continue;
             }
@@ -1088,7 +1100,11 @@ mod tests {
         w.provinces[2].y = 0;
         w.provinces[3].x = 3;
         w.provinces[3].y = 0;
-        ensure_land_exits(&mut w);
+        ensure_land_exits(&mut w, LoadedPlaneProvinces { first: 1, last: 3 });
         assert!(w.provinces[1].nbors.contains(&3u16));
+        let mut idle = tiny();
+        idle.provinces = vec![Default::default(); 4];
+        ensure_land_exits(&mut idle, NO_PLANE_LOADED_DURING_GENERATION);
+        assert!(idle.provinces[1].nbors.is_empty());
     }
 }

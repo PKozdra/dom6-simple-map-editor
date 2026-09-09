@@ -1,0 +1,104 @@
+id	name	epithet	era	likesterr	uwnation	coastnation	cavenation	riverstart
+5	Arcoscephale	Golden Era	1	0	0	0	0	0
+6	Mekone	Brazen Giants	1	0	0	0	0	0
+7	Pangaea	Age of Revelry	1	128	0	0	0	0
+8	Ermor	New Faith	1	0	0	0	0	0
+9	Sauromatia	Amazon Queens	1	0	0	0	0	0
+10	Fomoria	The Cursed Ones	1	0	0	1	0	0
+11	Tir na n'Og	Land of the Ever Young	1	0	0	0	0	0
+12	Marverni	Time of Druids	1	0	0	0	0	0
+13	Ulm	Enigma of Steel	1	128	0	0	0	0
+14	Pyrène	Kingdom of the Bekrydes	1	0	0	0	3	0
+15	Agartha	Pale Ones	1	0	0	0	2	1
+16	Abysia	Children of Flame	1	64	0	0	1	0
+17	Hinnom	Sons of the Fallen	1	64	0	0	0	0
+18	Ubar	Kingdom of the Unseen	1	64	0	0	0	0
+19	Ur	The First City	1	0	0	0	0	0
+20	Kailasa	Rise of the Ape Kings	1	128	0	0	0	0
+21	Lanka	Land of Demons	1	128	0	0	0	0
+22	T'ien Ch'i	Spring and Autumn	1	0	0	0	0	0
+23	Yomi	Oni Kings	1	8388624	0	0	0	0
+24	Caelum	Eagle Kings	1	8388624	0	0	0	0
+25	Mictlan	Reign of Blood	1	0	0	0	0	0
+26	Xibalba	Vigil of the Sun	1	128	0	0	3	0
+27	C'tis	Lizard Kings	1	32	0	0	0	1
+28	Machaka	Lion Kings	1	0	0	0	0	0
+29	Berytos	The Phoenix Empire	1	0	0	1	0	0
+30	Vanheim	Age of Vanir	1	0	0	0	0	0
+31	Helheim	Dusk and Death	1	0	0	0	0	0
+32	Rus	Sons of Heaven	1	128	0	0	0	0
+33	Niefelheim	Sons of Winter	1	0	0	0	0	0
+34	Muspelheim	Sons of Fire	1	0	0	0	0	0
+40	Pelagia	Pearl Kings	1	0	1	0	0	0
+41	Oceania	Coming of the Capricorns	1	0	1	0	0	0
+42	Therodos	Telkhine Spectre	1	0	1	0	0	0
+43	Atlantis	Emergence of the Deep Ones	1	2048	1	0	0	0
+44	R'lyeh	Time of Aboleths	1	2048	1	0	0	0
+50	Arcoscephale	The Old Kingdom	2	0	0	0	0	0
+51	Phlegra	Deformed Giants	2	0	0	0	0	0
+52	Pangaea	Age of Bronze	2	128	0	0	0	0
+53	Asphodel	Carrion Woods	2	128	0	0	0	0
+54	Ermor	Ashen Empire	2	64	0	0	0	0
+55	Sceleria	The Reformed Empire	2	0	0	0	0	0
+56	Pythium	Emerald Empire	2	0	0	0	0	0
+57	Man	Tower of Avalon	2	0	0	0	0	0
+58	Eriu	Last of the Tuatha	2	0	0	0	0	0
+59	Agartha	Golem Cult	2	0	0	0	2	0
+60	Ulm	Forges of Ulm	2	0	0	0	0	0
+61	Marignon	Fiery Justice	2	0	0	0	0	0
+62	Pyrène	Time of the Akelarre	2	0	0	0	0	0
+63	Abysia	Blood and Fire	2	64	0	0	1	0
+64	Ashdod	Reign of the Anakim	2	0	0	0	0	0
+65	Na'Ba	Queens of the Desert	2	64	0	0	0	0
+66	Uruk	City States	2	0	0	0	0	0
+67	Ind	Magnificent Kingdom of Exalted Virtue	2	0	0	0	0	0
+68	Bandar Log	Land of the Apes	2	128	0	0	0	0
+69	T'ien Ch'i	Imperial Bureaucracy	2	0	0	0	0	0
+70	Shinuyama	Land of the Bakemono	2	8388736	0	0	0	0
+71	Caelum	Reign of the Seraphim	2	8388624	0	0	0	0
+72	Nazca	Kingdom of the Sun	2	8388688	0	0	0	0
+73	Mictlan	Reign of the Lawgiver	2	0	0	0	0	0
+74	Xibalba	Flooded Caves	2	128	0	0	1	1
+75	C'tis	Miasma	2	32	0	0	0	1
+76	Machaka	Reign of Sorcerors	2	0	0	0	0	0
+77	Phaeacia	Isle of the Dark Ships	2	0	0	0	0	0
+78	Vanheim	Arrival of Man	2	0	0	0	0	0
+79	Vanarus	Land of the Chuds	2	0	0	0	0	0
+80	Jotunheim	Iron Woods	2	0	0	0	0	0
+81	Nidavangr	Bear, Wolf and Crow	2	0	0	0	0	0
+85	Ys	Morgen Queens	2	0	1	0	0	0
+86	Pelagia	Triton Kings	2	0	1	0	0	0
+87	Oceania	Mermidons	2	0	1	0	0	0
+88	Atlantis	Kings of the Deep	2	0	1	0	0	0
+89	R'lyeh	Fallen Star	2	2048	1	0	0	0
+95	Arcoscephale	Sibylline Guidance	3	0	0	0	0	0
+96	Phlegra	Sleeping Giants	3	0	0	0	0	0
+97	Pangaea	New Era	3	128	0	0	0	0
+98	Pythium	Serpent Cult	3	0	0	0	0	0
+99	Lemuria	Soul Gates	3	64	0	0	0	0
+100	Man	Towers of Chelms	3	0	0	0	0	0
+101	Ulm	Black Forest	3	0	0	0	0	0
+102	Agartha	Ktonian Dead	3	0	0	0	2	0
+103	Marignon	Conquerors of the Sea	3	0	0	1	0	0
+104	Abysia	Blood of Humans	3	64	0	0	1	0
+105	Ragha	Dual Kingdom	3	8388688	0	0	0	0
+106	Caelum	Return of the Raptors	3	8388624	0	0	0	0
+107	Gath	Last of the Giants	3	0	0	0	0	0
+108	Patala	Reign of the Nagas	3	128	0	0	0	0
+109	T'ien Ch'i	Barbarian Kings	3	0	0	0	0	0
+110	Jomon	Human Daimyos	3	0	0	0	0	0
+111	Mictlan	Blood and Rain	3	128	0	0	0	0
+112	Xibalba	Return of the Zotz	3	128	0	0	1	1
+113	C'tis	Desert Tombs	3	64	0	0	0	1
+115	Midgård	Age of Men	3	0	0	0	0	0
+116	Bogarus	Age of Heroes	3	0	0	0	0	0
+117	Utgård	Well of Urd	3	0	0	0	0	0
+118	Vaettiheim	Wolf Kin Jarldom	3	0	0	0	0	0
+119	Feminie	Sage-Queens	3	0	0	0	0	0
+120	Piconye	Legacy of the Prester King	3	0	0	0	0	0
+121	Andramania	Dog Republic	3	0	0	0	0	0
+123	Pyrène	Cambion Kings	3	0	0	0	0	0
+124	Zemaitia	Sylvan Knights	3	128	0	0	0	0
+125	Erytheia	Kingdom of Two Worlds	3	0	0	3	0	1
+126	Atlantis	Frozen Sea	3	0	0	3	0	1
+127	R'lyeh	Dreamlands	3	2048	1	0	0	0

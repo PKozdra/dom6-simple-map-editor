@@ -137,6 +137,14 @@ fn mapfile_parse_and_terrain_rewrite() {
 }
 
 #[test]
+fn repeated_neighbourspec_lines_add_up_like_the_game() {
+    let text =
+        "#neighbour 3 4\n#neighbourspec 3 4 2\n#neighbourspec 3 4 16\n#neighbourspec 4 3 8\n";
+    let m = MapFile::parse(text, Path::new("test.map"));
+    assert_eq!(m.spec_between(3, 4), 2 | 16 | 8);
+}
+
+#[test]
 fn real_recipes_roundtrip_byte_exact() {
     let Some(appdata) = std::env::var_os("APPDATA") else {
         return;

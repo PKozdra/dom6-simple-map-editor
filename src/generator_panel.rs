@@ -16,8 +16,12 @@ use dom6_mapgen::{Control, Sink};
 
 use crate::blueprint_editor::{BlueprintEditor, Outcome, Subject};
 use crate::keycap;
+use crate::nations::{self, Nation};
+use crate::starts::Want;
 use crate::theme;
 use crate::wire::{self, Job, Mode};
+
+const PLAYER_LIST: bool = false;
 
 pub const PROVINCES: RangeInclusive<i32> = 10..=1980;
 pub const AXIS: RangeInclusive<i32> = 500..=7500;
@@ -126,6 +130,10 @@ pub struct Form {
     pub per_player_bucket: i32,
     pub custom_count: bool,
     pub manual_seed: bool,
+    pub roster: Vec<u32>,
+    pub era: u8,
+    pub generic_starts: bool,
+    pub auto_starts: bool,
 }
 
 impl Default for Form {
@@ -146,6 +154,10 @@ impl Default for Form {
             per_player_bucket: 15,
             custom_count: false,
             manual_seed: false,
+            roster: Vec::new(),
+            era: 1,
+            generic_starts: false,
+            auto_starts: true,
             opts: GenOptions {
                 caves_plane: true,
                 ..GenOptions::default()
@@ -308,6 +320,8 @@ pub struct GeneratedMap {
     pub planes: Vec<GeneratedPlane>,
     pub gates: Vec<Gate>,
     pub elapsed: Duration,
+    pub wants: Vec<Want>,
+    pub generic: bool,
 }
 
 enum Msg {
@@ -476,6 +490,146 @@ pub struct GeneratorPanel {
     cave_guide: Option<Blueprint>,
     sprite: Option<egui::TextureHandle>,
     editor: Option<BlueprintEditor>,
+    nations: Vec<Nation>,
+    add_id: u32,
+    place_request: bool,
+    mod_note: Option<String>,
+    gallery: Option<Gallery>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gallery {
+    Surface,
+    Cave,
+}
+
+const CARD_W: f32 = 300.0;
+const CARD_GAP: f32 = 12.0;
+
+fn layout_gallery(
+    ctx: &egui::Context,
+    title: &str,
+    thumbs: &mut [Option<egui::TextureHandle>],
+    bytes: &[&[u8]],
+    labels: &[&str],
+    hints: &[&str],
+    selected: usize,
+) -> (Option<usize>, bool) {
+    let screen = ctx.screen_rect();
+    let cols = (((screen.width() - 80.0 + CARD_GAP) / (CARD_W + CARD_GAP)).floor() as usize)
+        .clamp(1, 4)
+        .min(labels.len());
+    let width = cols as f32 * CARD_W + (cols - 1) as f32 * CARD_GAP;
+    let max_h = theme::modal_height(ctx);
+    let mut picked = None;
+    let response = egui::Modal::new(egui::Id::new(title))
+        .frame(egui::Frame::NONE)
+        .show(ctx, |ui| {
+            theme::scroll_body(ui, width, max_h, |ui| {
+                theme::title(ui, title);
+                theme::dim(ui, "Click a layout to use it");
+                ui.add_space(8.0);
+                egui::Grid::new(format!("{title}_grid"))
+                    .num_columns(cols)
+                    .spacing(egui::vec2(CARD_GAP, CARD_GAP))
+                    .show(ui, |ui| {
+                        for i in 0..labels.len() {
+                            let tex = layout_thumb(ui.ctx(), thumbs, bytes, title, i);
+                            if layout_card(ui, tex.as_ref(), labels[i], hints[i], i == selected) {
+                                picked = Some(i);
+                            }
+                            if (i + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+                theme::rule(ui);
+                if theme::boxed_button(ui, "Close", true) {
+                    picked = Some(selected);
+                }
+            });
+        });
+    let close = picked.is_some() || response.should_close();
+    (picked.filter(|&i| i != selected), close)
+}
+
+fn layout_card(
+    ui: &mut egui::Ui,
+    tex: Option<&egui::TextureHandle>,
+    label: &str,
+    hint: &str,
+    selected: bool,
+) -> bool {
+    let thumb_h = tex
+        .map(|t| {
+            let s = t.size_vec2();
+            (CARD_W - 16.0) * s.y / s.x
+        })
+        .unwrap_or(CARD_W * 0.66);
+    let hint_galley = ui.fonts(|f| {
+        f.layout(
+            hint.to_owned(),
+            egui::FontId::proportional(13.0),
+            theme::INK_DIM,
+            CARD_W - 16.0,
+        )
+    });
+    let hint_h = hint_galley.size().y.max(2.0 * hint_galley.rows[0].height());
+    let size = egui::vec2(CARD_W, thumb_h + 8.0 + 24.0 + hint_h + 14.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let hot = resp.hovered();
+    let stroke = if selected {
+        egui::Stroke::new(2.0, theme::BRASS)
+    } else if hot {
+        egui::Stroke::new(1.0, theme::INK_HOT)
+    } else {
+        egui::Stroke::new(1.0, theme::PANEL_EDGE_DIM)
+    };
+    let p = ui.painter();
+    p.rect(
+        rect,
+        3.0,
+        if hot || selected {
+            egui::Color32::from_rgb(40, 36, 26)
+        } else {
+            egui::Color32::from_rgb(26, 24, 18)
+        },
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let img = egui::Rect::from_min_size(
+        rect.min + egui::vec2(8.0, 8.0),
+        egui::vec2(CARD_W - 16.0, thumb_h),
+    );
+    if let Some(t) = tex {
+        p.image(
+            t.id(),
+            img,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    p.text(
+        img.left_bottom() + egui::vec2(0.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(16.0),
+        if selected {
+            theme::INK_ACTIVE
+        } else {
+            theme::INK
+        },
+    );
+    p.galley(
+        img.left_bottom() + egui::vec2(0.0, 30.0),
+        hint_galley,
+        theme::INK_DIM,
+    );
+    if hot {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
 }
 
 const ACTION_ICON: &[u8] = include_bytes!("../assets/icons/156.png");
@@ -524,6 +678,190 @@ impl GeneratorPanel {
         self.run.is_some()
     }
 
+    fn ensure_nations(&mut self) {
+        if self.nations.is_empty() {
+            self.nations = nations::vanilla();
+        }
+    }
+
+    pub fn nation_name(&self, id: u32) -> String {
+        self.nations
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| format!("Nation {id}"))
+    }
+
+    pub fn wants(&self) -> Vec<Want> {
+        self.form
+            .roster
+            .iter()
+            .map(|&id| match self.nations.iter().find(|n| n.id == id) {
+                Some(n) => Want {
+                    nation: id,
+                    uw: n.uw,
+                    coast: n.coast,
+                    cave: n.cave,
+                    likesterr: n.likesterr,
+                },
+                None => Want {
+                    nation: id,
+                    uw: false,
+                    coast: false,
+                    cave: 0,
+                    likesterr: 0,
+                },
+            })
+            .collect()
+    }
+
+    pub fn generic_starts(&self) -> bool {
+        self.form.generic_starts
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.form.seed
+    }
+
+    pub fn settings_lines(&self) -> Vec<String> {
+        crate::gen_settings::encode(&self.form)
+    }
+
+    pub fn apply_settings(&mut self, lines: &[String]) -> Option<String> {
+        let applied = crate::gen_settings::decode(lines)?;
+        self.form = applied.form;
+        self.own_tex = None;
+        self.cave_own_tex = None;
+        let mut note = "generator settings restored".to_string();
+        let here = dom6_mapgen::rng::pool_id();
+        match &applied.pool {
+            Some(p) if *p != here => note.push_str(
+                "; made with a different random pool, so the seed will not give the same map here",
+            ),
+            None => {
+                note.push_str("; the random pool is unknown, the seed may give a different map")
+            }
+            _ => {}
+        }
+        if applied.unknown > 0 {
+            note.push_str(&format!(
+                "; {} settings from another version were skipped",
+                applied.unknown
+            ));
+        }
+        Some(note)
+    }
+
+    pub fn take_place_request(&mut self) -> bool {
+        std::mem::take(&mut self.place_request)
+    }
+
+    pub fn load_mod_text(&mut self, label: &str, text: &str) {
+        self.ensure_nations();
+        let found = nations::parse_dm(text, &self.nations);
+        let count = found.len();
+        let changed: Vec<String> = found.iter().map(|n| n.name.clone()).take(6).collect();
+        nations::merge(&mut self.nations, found);
+        self.mod_note = Some(if count == 0 {
+            format!("{label}: no nation blocks")
+        } else {
+            format!("{label}: {count} nations ({})", changed.join(", "))
+        });
+    }
+
+    fn players_section(&mut self, ui: &mut egui::Ui, width: f32, doc_open: bool) {
+        self.ensure_nations();
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut mod_pick: Option<(String, String)> = None;
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(width);
+            theme::section_first(ui, "Players");
+            ui.horizontal_wrapped(|ui| {
+                for era in 1..=3u8 {
+                    if theme::tab(ui, self.form.era == era, nations::era_label(era)) {
+                        self.form.era = era;
+                    }
+                }
+            });
+            let era = self.form.era;
+            let choices: Vec<(u32, String)> = self
+                .nations
+                .iter()
+                .filter(|n| (n.era == era || n.era == 0) && !self.form.roster.contains(&n.id))
+                .map(|n| (n.id, n.title()))
+                .collect();
+            let mut picked: Option<u32> = None;
+            egui::ComboBox::from_id_salt("add_nation")
+                .selected_text("Add a nation")
+                .width(width - 8.0)
+                .truncate()
+                .show_ui(ui, |ui| {
+                    for (id, title) in &choices {
+                        if ui.selectable_label(false, format!("{id}  {title}")).clicked() {
+                            picked = Some(*id);
+                        }
+                    }
+                });
+            ui.horizontal(|ui| {
+                theme::dim(ui, "Number");
+                ui.add(egui::DragValue::new(&mut self.add_id).range(5..=999).speed(0.5));
+                if theme::boxed_button(ui, "Add", !self.form.roster.contains(&self.add_id)) {
+                    picked = Some(self.add_id);
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if theme::boxed_button_hint(ui, "Load .dm", true, "Reads the nations of a mod so they can be added") {
+                    mod_pick = pick_mod_file();
+                }
+                #[cfg(target_arch = "wasm32")]
+                if theme::boxed_button_hint(ui, "Load .dm", true, "Reads the nations of a mod so they can be added") {
+                    crate::web::pick(crate::web::Purpose::Mod, crate::web::MOD_FILES, false, ui.ctx().clone());
+                }
+            });
+            if let Some(id) = picked {
+                if !self.nations.iter().any(|n| n.id == id) {
+                    self.nations.push(Nation::blank(id));
+                    self.nations.sort_by_key(|n| n.id);
+                }
+                self.form.roster.push(id);
+            }
+            if let Some(note) = &self.mod_note {
+                theme::dim(ui, note);
+            }
+            let mut remove: Option<usize> = None;
+            for (i, id) in self.form.roster.iter().enumerate() {
+                let (title, pref) = match self.nations.iter().find(|n| n.id == *id) {
+                    Some(n) => (n.title(), n.start_label()),
+                    None => (format!("Nation {id}"), "any land".to_string()),
+                };
+                ui.horizontal(|ui| {
+                    if theme::text_button(ui, "\u{00d7}", true) {
+                        remove = Some(i);
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(width - 40.0);
+                        ui.label(egui::RichText::new(format!("{id}  {title}")).color(theme::INK));
+                        theme::dim(ui, &pref);
+                    });
+                });
+            }
+            if let Some(i) = remove {
+                self.form.roster.remove(i);
+            }
+            if !self.form.roster.is_empty() {
+                theme::dim(ui, &format!("{} players from the list", self.form.roster.len()));
+                theme::check(ui, &mut self.form.generic_starts, "Generic starts")
+                    .on_hover_text("Marks the start provinces with #start so any nation can take them, instead of #specstart per nation");
+                theme::check(ui, &mut self.form.auto_starts, "Place starts after generating");
+                if theme::boxed_button_hint(ui, "Place starts", doc_open, "Chooses a start province per player on the open map, spread apart and matching each nation's preferred terrain") {
+                    self.place_request = true;
+                }
+            }
+        });
+        if let Some((label, text)) = mod_pick {
+            self.load_mod_text(&label, &text);
+        }
+    }
+
     pub fn set_own(&mut self, cave: bool, label: String, bytes: &[u8]) -> Result<(), String> {
         let image = load_blueprint_bytes(&label, bytes)?;
         let own = OwnImage { label, image };
@@ -563,6 +901,10 @@ impl GeneratorPanel {
         self.note = None;
         let opts = self.form.options(blueprint, cave_blueprint);
         let new_game = self.form.new_game;
+        if !self.form.roster.is_empty() {
+            self.form.players =
+                (self.form.roster.len() as i32).clamp(*PLAYERS.start(), *PLAYERS.end());
+        }
         let players = self.form.players;
         let per_player_bucket = self.form.per_player_bucket;
         let custom_count = self.form.custom_count;
@@ -625,12 +967,20 @@ impl GeneratorPanel {
                     let name = run.name.clone();
                     let seed = run.seed;
                     self.run = None;
+                    let wants = if self.form.auto_starts {
+                        self.wants()
+                    } else {
+                        Vec::new()
+                    };
+                    let generic = self.form.generic_starts;
                     return Some(GeneratedMap {
                         name,
                         seed,
                         planes,
                         gates,
                         elapsed,
+                        wants,
+                        generic,
                     });
                 }
                 Ok(Msg::Failed(e)) => {
@@ -751,38 +1101,8 @@ impl GeneratorPanel {
         let f = &mut self.form;
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(width);
-            theme::section_first(ui, "Seed");
-            theme::check(ui, &mut f.manual_seed, "Set seed manually").on_hover_text(
-                "Off: every Generate rolls a fresh seed and the status line names it",
-            );
-            if f.manual_seed {
-                ui.horizontal(|ui| {
-                    ui.add_sized([80.0, 20.0], egui::Label::new("Seed"));
-                    let mut seed = f.seed as i64;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut seed)
-                                .range(0..=2_147_483_647)
-                                .speed(1.0),
-                        )
-                        .changed()
-                    {
-                        set_seed(f, seed as u32);
-                    }
-                    if theme::boxed_button_hint(ui, "Roll", true, "Picks a fresh seed") {
-                        let s = random_seed();
-                        set_seed(f, s);
-                    }
-                });
-            }
-        });
-        ui.add_space(8.0);
-        theme::panel_frame().show(ui, |ui| {
-            ui.set_width(width);
-            theme::section_first(ui, "New-game mode");
-            theme::check(ui, &mut f.new_game, "Roll it the way a new game does")
-                .on_hover_text("Rolls the map the way starting a new game does: the province count comes from the players and the size below, and the caves plane comes with it");
-            if f.new_game {
+            theme::section_first(ui, "Number of players");
+            ui.add_enabled_ui(f.new_game, |ui| {
                 row(ui, "Players", |ui| {
                     ui.add(egui::DragValue::new(&mut f.players).range(PLAYERS).speed(0.2));
                 });
@@ -818,27 +1138,43 @@ impl GeneratorPanel {
                         );
                     });
                 }
+            });
+            if !f.new_game {
+                theme::dim(ui, "Off while the province count is set by hand");
             }
         });
+        if PLAYER_LIST {
+            ui.add_space(8.0);
+            self.players_section(ui, width, doc_name.is_some());
+        }
         ui.add_space(8.0);
+        let f = &mut self.form;
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(width);
             theme::section_first(ui, "Size and provinces");
-            let free = !f.new_game;
+            let mut manual = !f.new_game;
+            if theme::check(ui, &mut manual, "Adjust province count manually")
+                .on_hover_text("Sets the province count directly instead of deriving it from the number of players; the caves plane then follows the cave settings alone")
+                .clicked()
+            {
+                f.new_game = !manual;
+            }
             ui.horizontal(|ui| {
                 ui.add_sized([80.0, 20.0], egui::Label::new("Provinces"));
                 ui.add_enabled(
-                    free,
+                    manual,
                     egui::DragValue::new(&mut f.opts.provinces)
                         .range(PROVINCES)
                         .speed(1.0),
                 );
             });
-            if !free {
-                theme::dim(ui, "The new-game path picks the province count");
+            let mut overwrite = !f.auto_size;
+            if theme::check(ui, &mut overwrite, "Overwrite size")
+                .on_hover_text("Off: the size follows the province count, wrapped axes round up to a multiple of 512 and unwrapped axes gain a 192 pixel margin on each side")
+                .clicked()
+            {
+                f.auto_size = !overwrite;
             }
-            theme::check(ui, &mut f.auto_size, "Size fits the province count")
-                .on_hover_text("Wrapped axes round up to a multiple of 512; unwrapped axes gain a 192 pixel margin on each side");
             if !f.auto_size {
                 row(ui, "Width", |ui| {
                     ui.add(egui::DragValue::new(&mut f.width).range(AXIS).speed(8.0));
@@ -852,31 +1188,23 @@ impl GeneratorPanel {
         let thumbs = &mut self.thumbs;
         let own_tex = &mut self.own_tex;
         let mut open_editor = false;
+        let mut open_gallery: Option<Gallery> = None;
         theme::panel_frame().show(ui, |ui| {
             ui.set_width(width);
             theme::section_first(ui, "Blueprint");
-            let mut chosen = layout_index(f.layout);
             let picked = f.own.is_some();
-            egui::ComboBox::from_id_salt("layout")
-                .selected_text(f.layout.label())
-                .width(160.0)
-                .truncate()
-                .show_ui(ui, |ui| {
-                    for (i, kind) in Layout::ALL.iter().enumerate() {
-                        if ui
-                            .selectable_value(&mut chosen, i, kind.label())
-                            .on_hover_text(LAYOUT_HINTS[i])
-                            .changed()
-                        {
-                            f.layout = *kind;
-                            f.opts.blue_acc = layout_blue_acc(*kind);
-                        }
-                    }
-                });
             let index = layout_index(f.layout);
+            ui.horizontal(|ui| {
+                if theme::boxed_button_hint(ui, "Choose", true, "Shows every layout at once") {
+                    open_gallery = Some(Gallery::Surface);
+                }
+                ui.label(egui::RichText::new(f.layout.label()).color(theme::INK));
+            });
             theme::dim(ui, LAYOUT_HINTS[index]);
             if let Some(tex) = layout_thumb(ui.ctx(), thumbs, &LAYOUT_THUMBS, "layout", index) {
-                show_thumb(ui, &tex, width);
+                if show_thumb(ui, &tex, width).clicked() {
+                    open_gallery = Some(Gallery::Surface);
+                }
             }
             ui.add_space(4.0);
             let label = match &f.own {
@@ -978,28 +1306,20 @@ impl GeneratorPanel {
             );
             if f.opts.caves_plane {
                 percent_row(ui, "Cave part", &mut f.opts.cave_part);
-                let mut chosen = cave_layout_index(f.cave_layout);
-                egui::ComboBox::from_id_salt("cave_layout")
-                    .selected_text(f.cave_layout.label())
-                    .width(160.0)
-                    .truncate()
-                    .show_ui(ui, |ui| {
-                        for (i, kind) in CaveLayout::ALL.iter().enumerate() {
-                            if ui
-                                .selectable_value(&mut chosen, i, kind.label())
-                                .on_hover_text(CAVE_LAYOUT_HINTS[i])
-                                .changed()
-                            {
-                                f.cave_layout = *kind;
-                            }
-                        }
-                    });
                 let index = cave_layout_index(f.cave_layout);
+                ui.horizontal(|ui| {
+                    if theme::boxed_button_hint(ui, "Choose", true, "Shows every cave layout at once") {
+                        open_gallery = Some(Gallery::Cave);
+                    }
+                    ui.label(egui::RichText::new(f.cave_layout.label()).color(theme::INK));
+                });
                 theme::dim(ui, CAVE_LAYOUT_HINTS[index]);
                 if let Some(tex) =
                     layout_thumb(ui.ctx(), cave_thumbs, &CAVE_LAYOUT_THUMBS, "cave_layout", index)
                 {
-                    show_thumb(ui, &tex, width);
+                    if show_thumb(ui, &tex, width).clicked() {
+                        open_gallery = Some(Gallery::Cave);
+                    }
                 }
                 ui.add_space(4.0);
                 let label = match &f.cave_own {
@@ -1039,6 +1359,77 @@ impl GeneratorPanel {
                 });
             }
         });
+        ui.add_space(8.0);
+        theme::panel_frame().show(ui, |ui| {
+            ui.set_width(width);
+            theme::section_first(ui, "Seed");
+            theme::check(ui, &mut f.manual_seed, "Set seed manually").on_hover_text(
+                "Off: every Generate rolls a fresh seed and the status line names it",
+            );
+            if f.manual_seed {
+                ui.horizontal(|ui| {
+                    ui.add_sized([80.0, 20.0], egui::Label::new("Seed"));
+                    let mut seed = f.seed as i64;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut seed)
+                                .range(0..=2_147_483_647)
+                                .speed(1.0),
+                        )
+                        .changed()
+                    {
+                        set_seed(f, seed as u32);
+                    }
+                    if theme::boxed_button_hint(ui, "Roll", true, "Picks a fresh seed") {
+                        let s = random_seed();
+                        set_seed(f, s);
+                    }
+                });
+            }
+        });
+        if open_gallery.is_some() {
+            self.gallery = open_gallery;
+        }
+        match self.gallery {
+            Some(Gallery::Surface) => {
+                let labels: Vec<&str> = Layout::ALL.iter().map(|k| k.label()).collect();
+                let (picked, close) = layout_gallery(
+                    ui.ctx(),
+                    "Choose a blueprint",
+                    &mut self.thumbs,
+                    &LAYOUT_THUMBS,
+                    &labels,
+                    &LAYOUT_HINTS,
+                    layout_index(self.form.layout),
+                );
+                if let Some(i) = picked {
+                    self.form.layout = Layout::ALL[i];
+                    self.form.opts.blue_acc = layout_blue_acc(Layout::ALL[i]);
+                }
+                if close {
+                    self.gallery = None;
+                }
+            }
+            Some(Gallery::Cave) => {
+                let labels: Vec<&str> = CaveLayout::ALL.iter().map(|k| k.label()).collect();
+                let (picked, close) = layout_gallery(
+                    ui.ctx(),
+                    "Choose a cave layout",
+                    &mut self.cave_thumbs,
+                    &CAVE_LAYOUT_THUMBS,
+                    &labels,
+                    &CAVE_LAYOUT_HINTS,
+                    cave_layout_index(self.form.cave_layout),
+                );
+                if let Some(i) = picked {
+                    self.form.cave_layout = CaveLayout::ALL[i];
+                }
+                if close {
+                    self.gallery = None;
+                }
+            }
+            None => {}
+        }
         if open_cave_editor && self.cave_editor.is_none() {
             self.cave_guide = self.form.blueprint();
             self.cave_editor = Some(BlueprintEditor::new(
@@ -1061,6 +1452,19 @@ impl GeneratorPanel {
             });
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn pick_mod_file() -> Option<(String, String)> {
+    let mut dlg = rfd::FileDialog::new().add_filter("Dominions 6 mod", &["dm"]);
+    if let Some(d) = crate::settings::game_user_dir().map(|d| d.join("mods")) {
+        if crate::io::is_dir(&d) {
+            dlg = dlg.set_directory(d);
+        }
+    }
+    let p = dlg.pick_file()?;
+    let bytes = crate::io::read(&p).ok()?;
+    Some((file_label(&p), String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 fn file_label(path: &Path) -> String {
@@ -1163,12 +1567,18 @@ fn layout_thumb(
     thumbs[index].clone()
 }
 
-fn show_thumb(ui: &mut egui::Ui, tex: &egui::TextureHandle, width: f32) {
+fn show_thumb(ui: &mut egui::Ui, tex: &egui::TextureHandle, width: f32) -> egui::Response {
     let side = (width - 24.0).clamp(64.0, 240.0);
     let size = tex.size_vec2();
     let scale = side / size.x;
     let src = egui::load::SizedTexture::from_handle(tex);
-    ui.add(egui::Image::new(src).fit_to_exact_size(size * scale));
+    ui.add(
+        egui::Image::new(src)
+            .fit_to_exact_size(size * scale)
+            .sense(egui::Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text("Shows every layout at once")
 }
 
 fn set_seed(f: &mut Form, seed: u32) {
@@ -1333,6 +1743,10 @@ mod tests {
             per_player_bucket: 15,
             custom_count: false,
             manual_seed: true,
+            roster: Vec::new(),
+            era: 1,
+            generic_starts: false,
+            auto_starts: true,
         };
         let mut d = GeneratorPanel {
             form,

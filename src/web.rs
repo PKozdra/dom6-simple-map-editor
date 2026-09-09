@@ -32,6 +32,7 @@ extern "C" {
 
 pub const MAP_FILES: &str = "d6m,map";
 pub const IMAGE_FILES: &str = "png,tga";
+pub const MOD_FILES: &str = "dm";
 
 pub struct PickedFile {
     pub name: String,
@@ -44,6 +45,7 @@ pub enum Purpose {
     Open,
     AddPlane,
     Blueprint { cave: bool },
+    Mod,
 }
 
 pub enum Event {

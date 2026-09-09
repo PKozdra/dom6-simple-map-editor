@@ -239,7 +239,8 @@ pub fn province_bboxes(p: &Plane) -> Vec<[i32; 4]> {
 }
 
 pub fn carve_rivers(p: &Plane, work: &mut [f32], bboxes: &[[i32; 4]], within: Option<Rect>) {
-    let r = (p.scale * 0.05) as i32;
+    let base = (p.scale * 0.05) as i32;
+    let wobble_limit = base / 4;
     let w = p.w;
     let h = p.h;
     for &(a, b) in p.rivers {
@@ -255,11 +256,13 @@ pub fn carve_rivers(p: &Plane, work: &mut [f32], bboxes: &[[i32; 4]], within: Op
             continue;
         }
         if let Some(lim) = within {
-            let reach = Rect { x0, y0, x1, y1 }.expand(r + 1, w, h);
+            let reach = Rect { x0, y0, x1, y1 }.expand(base + wobble_limit + 1, w, h);
             if !reach.intersects(lim) {
                 continue;
             }
         }
+        let mut rng = decor::Rng::new((a as u64) << 32 | b as u64);
+        let mut wobble = 0i32;
         let (a, b) = (a as i32, b as i32);
         for y in y0..=y1 {
             for x in x0..=x1 {
@@ -280,7 +283,7 @@ pub fn carve_rivers(p: &Plane, work: &mut [f32], bboxes: &[[i32; 4]], within: Op
                 if other != a && other != b {
                     continue;
                 }
-                let rr = r;
+                let rr = base + wobble;
                 for dy in -rr..=rr {
                     for dx in -rr..=rr {
                         let xx = wrap_clamp(x + dx, w, p.hwrap);
@@ -293,9 +296,58 @@ pub fn carve_rivers(p: &Plane, work: &mut [f32], bboxes: &[[i32; 4]], within: Op
                         }
                     }
                 }
+                if rng.below(100) < 10 {
+                    wobble = (wobble + rng.below(3) - 1).clamp(-wobble_limit, wobble_limit);
+                }
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Surface {
+    Land(Tex),
+    Water(Tex),
+    DeepBlend(f32),
+}
+
+pub fn surface_at(flags: u64, land: Tex, winter: bool, height: f32) -> Surface {
+    let always_water = flags & ALWAYS_WATER != 0;
+    if height >= SEA_LEVEL && !always_water {
+        return Surface::Land(land);
+    }
+    let mut depth = SEA_LEVEL - height;
+    if always_water && depth <= 10.1 {
+        depth = 10.1;
+    }
+    if winter && (height == RIVER_SENTINEL || depth < 10.0) {
+        Surface::Water(Tex::Frozen)
+    } else if height == RIVER_SENTINEL && !always_water {
+        Surface::Water(Tex::Shallowsea)
+    } else if flags & CAVE_LOOK != 0 {
+        Surface::Water(Tex::Cave)
+    } else if flags == KELP_EXACT {
+        Surface::Water(Tex::Kelpforest)
+    } else if depth < 10.0 {
+        Surface::Water(Tex::Shallowsea)
+    } else if depth <= WATER_BAND {
+        Surface::Water(Tex::Water)
+    } else {
+        Surface::DeepBlend((depth - WATER_BAND) * 0.166_666_67)
+    }
+}
+
+pub fn province_surface(flags: u64, season: bool, height: f32) -> Option<Surface> {
+    if flags & UNKNOWN != 0 {
+        return None;
+    }
+    let winter = province_winter(flags, season);
+    Some(surface_at(
+        flags,
+        land_texture(flags, winter),
+        winter,
+        height,
+    ))
 }
 
 struct ProvLook {
@@ -361,57 +413,38 @@ fn color_rows_into(
             let f = p.flags[id];
             let look = &looks[id];
             let hv = work[i];
-            let b60 = f & ALWAYS_WATER != 0;
             let mut c: [i32; 4];
-            if hv < SEA_LEVEL || b60 {
-                let mut depth = SEA_LEVEL - hv;
-                if b60 && depth <= 10.1 {
-                    depth = 10.1;
+            let mut gorge = false;
+            match surface_at(f, look.land, look.winter, hv) {
+                Surface::Land(t) => {
+                    let s = tex.sample(t, x, y);
+                    c = [s[0] as i32, s[1] as i32, s[2] as i32, s[3] as i32];
                 }
-                let t = if look.winter && (hv == RIVER_SENTINEL || depth < 10.0) {
-                    Some(Tex::Frozen)
-                } else if hv == RIVER_SENTINEL && !b60 {
-                    Some(Tex::Shallowsea)
-                } else if f & CAVE_LOOK != 0 {
-                    Some(Tex::Cave)
-                } else if f == KELP_EXACT {
-                    Some(Tex::Kelpforest)
-                } else if depth < 10.0 {
-                    Some(Tex::Shallowsea)
-                } else if depth <= WATER_BAND {
-                    Some(Tex::Water)
-                } else {
-                    None
-                };
-                c = match t {
-                    Some(t) => {
-                        let s = tex.sample(t, x, y);
-                        [s[0] as i32, s[1] as i32, s[2] as i32, s[3] as i32]
-                    }
-                    None => {
-                        let k = (depth - WATER_BAND) * 0.166_666_67;
-                        let deep = tex.sample(Tex::Deepsea, x, y);
-                        if k < 1.0 {
-                            let water = tex.sample(Tex::Water, x, y);
-                            blend_channels(deep, water, k)
-                        } else {
-                            [
-                                deep[0] as i32,
-                                deep[1] as i32,
-                                deep[2] as i32,
-                                deep[3] as i32,
-                            ]
-                        }
-                    }
-                };
-                if (f as u8) & 0x14 == 0x14 {
-                    c[0] = (c[0] as f64 * 0.9) as i32;
-                    c[1] = (c[1] as f64 * 0.9) as i32;
-                    c[2] = (c[2] as f64 * 0.9) as i32;
+                Surface::Water(t) => {
+                    let s = tex.sample(t, x, y);
+                    c = [s[0] as i32, s[1] as i32, s[2] as i32, s[3] as i32];
+                    gorge = true;
                 }
-            } else {
-                let s = tex.sample(look.land, x, y);
-                c = [s[0] as i32, s[1] as i32, s[2] as i32, s[3] as i32];
+                Surface::DeepBlend(k) => {
+                    let deep = tex.sample(Tex::Deepsea, x, y);
+                    c = if k < 1.0 {
+                        let water = tex.sample(Tex::Water, x, y);
+                        blend_channels(deep, water, k)
+                    } else {
+                        [
+                            deep[0] as i32,
+                            deep[1] as i32,
+                            deep[2] as i32,
+                            deep[3] as i32,
+                        ]
+                    };
+                    gorge = true;
+                }
+            }
+            if gorge && (f as u8) & 0x14 == 0x14 {
+                c[0] = (c[0] as f64 * 0.9) as i32;
+                c[1] = (c[1] as f64 * 0.9) as i32;
+                c[2] = (c[2] as f64 * 0.9) as i32;
             }
             if c[0] == 255 && c[1] == 255 && c[2] == 255 {
                 c[0] = 254;

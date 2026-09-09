@@ -432,16 +432,12 @@ impl BlueprintEditor {
     pub fn show(&mut self, ctx: &egui::Context, at: Subject<'_>) -> Outcome {
         let mut outcome = Outcome::Open;
         let max_h = theme::modal_height(ctx);
+        let width = self.view_size(ctx).x + 250.0;
         let response = egui::Modal::new(egui::Id::new("blueprint_editor"))
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                theme::panel_frame().show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(max_h - 24.0)
-                        .auto_shrink([true, true])
-                        .show(ui, |ui| {
-                            self.body(ui, at, &mut outcome);
-                        });
+                theme::scroll_body(ui, width, max_h, |ui| {
+                    self.body(ui, at, &mut outcome);
                 });
             });
         if matches!(outcome, Outcome::Open) && response.should_close() {
@@ -486,15 +482,24 @@ impl BlueprintEditor {
         });
     }
 
-    fn canvas_ui(&mut self, ui: &mut egui::Ui, guide: Option<&Blueprint>) {
-        let screen = ui.ctx().screen_rect();
+    fn view_scale(&self, ctx: &egui::Context) -> f32 {
+        let screen = ctx.screen_rect();
         let max_w = (screen.width() - 320.0).max(200.0);
-        let max_h = (screen.height() - 220.0).max(200.0);
-        let scale = (max_w / self.canvas.w as f32)
+        let max_h = (screen.height() - 200.0).max(200.0);
+        (max_w / self.canvas.w as f32)
             .min(max_h / self.canvas.h as f32)
-            .clamp(1.0, 3.0)
-            .floor();
-        let size = egui::vec2(self.canvas.w as f32 * scale, self.canvas.h as f32 * scale);
+            .clamp(1.0, 8.0)
+            .floor()
+    }
+
+    fn view_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        let scale = self.view_scale(ctx);
+        egui::vec2(self.canvas.w as f32 * scale, self.canvas.h as f32 * scale)
+    }
+
+    fn canvas_ui(&mut self, ui: &mut egui::Ui, guide: Option<&Blueprint>) {
+        let scale = self.view_scale(ui.ctx());
+        let size = self.view_size(ui.ctx());
         let tex = self.texture(ui.ctx(), guide);
         let (response, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = response.rect;

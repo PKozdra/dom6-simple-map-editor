@@ -16,6 +16,8 @@ pub struct MapFile {
     pub gates: BTreeMap<u32, i32>,
     pub neighbours: Vec<(u32, u32)>,
     pub specs: BTreeMap<(u32, u32), i64>,
+    pub specstarts: Vec<(u32, u32)>,
+    pub starts: Vec<u32>,
     pub pb_count: usize,
     pub modified: bool,
 }
@@ -123,8 +125,18 @@ impl MapFile {
                 "#neighbourspec" => {
                     if args.len() >= 3 {
                         if let (Some((a, b)), Some(s)) = (first_two(rest), parse_i64(args[2])) {
-                            m.specs.insert(pair(a, b), s);
+                            *m.specs.entry(pair(a, b)).or_insert(0) |= s;
                         }
+                    }
+                }
+                "#specstart" => {
+                    if let Some((nation, prov)) = first_two(rest) {
+                        m.specstarts.push((nation, prov));
+                    }
+                }
+                "#start" => {
+                    if let Some(p) = args.first().and_then(|a| a.parse::<u32>().ok()) {
+                        m.starts.push(p);
                     }
                 }
                 "#pb" => m.pb_count += 1,
@@ -302,6 +314,36 @@ impl MapFile {
         }
     }
 
+    pub fn set_specstarts(&mut self, starts: &[(u32, u32)]) {
+        if self.specstarts == starts {
+            return;
+        }
+        self.remove_where(|c, _| c == "#specstart");
+        self.specstarts = starts.to_vec();
+        for (nation, prov) in starts {
+            self.insert_after_last(
+                &["#specstart", "#start", "#gate", "#terrain", "#landname"],
+                format!("#specstart {nation} {prov}"),
+            );
+        }
+        self.modified = true;
+    }
+
+    pub fn set_starts(&mut self, starts: &[u32]) {
+        if self.starts == starts {
+            return;
+        }
+        self.remove_where(|c, _| c == "#start");
+        self.starts = starts.to_vec();
+        for prov in starts {
+            self.insert_after_last(
+                &["#start", "#specstart", "#gate", "#terrain", "#landname"],
+                format!("#start {prov}"),
+            );
+        }
+        self.modified = true;
+    }
+
     pub fn renumber(&mut self, map: impl Fn(u32) -> u32) {
         const FIRST: [&str; 16] = [
             "#terrain",
@@ -363,13 +405,16 @@ impl MapFile {
         self.gates.remove(&p);
         self.neighbours.retain(|&(a, b)| a != p && b != p);
         self.specs.retain(|&(a, b), _| a != p && b != p);
+        self.specstarts.retain(|&(_, prov)| prov != p);
+        self.starts.retain(|&prov| prov != p);
         let ps = p.to_string();
         self.remove_where(|c, r| {
             let mut it = r.split_whitespace();
             let first = it.next();
             let second = it.next();
             match c {
-                "#terrain" | "#landname" | "#gate" => first == Some(ps.as_str()),
+                "#terrain" | "#landname" | "#gate" | "#start" => first == Some(ps.as_str()),
+                "#specstart" => second == Some(ps.as_str()),
                 "#neighbour" | "#neighbourspec" => {
                     first == Some(ps.as_str()) || second == Some(ps.as_str())
                 }
@@ -469,6 +514,27 @@ impl MapFile {
 
     pub fn to_text(&self) -> String {
         self.lines.join(&self.newline)
+    }
+
+    pub fn comment_lines(&self, prefix: &str) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter(|l| l.trim_start().starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_comment_lines(&mut self, prefix: &str, lines: &[String]) {
+        self.lines.retain(|l| !l.trim_start().starts_with(prefix));
+        let at = self
+            .last_line_with("#description")
+            .or_else(|| self.last_line_with("#dom2title"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        for (k, l) in lines.iter().enumerate() {
+            self.lines.insert(at + k, l.clone());
+        }
+        self.modified = true;
     }
 }
 

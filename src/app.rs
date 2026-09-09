@@ -10,7 +10,10 @@ const KEY_HELP: &[(&[&str], &str)] = &[
     (&["G"], "Generate a random map"),
     (&["F4"], "Random terrain"),
     (&["S"], "Select"),
-    (&["L"], "Link"),
+    (
+        &["L"],
+        "Link; right-click a connected province to change the border type",
+    ),
     (&["P"], "Paint area"),
     (&["H"], "Heights"),
     (&["Tab"], "Next tool"),
@@ -290,8 +293,6 @@ enum Pending {
 
 const BORDER_KINDS: [(i64, &str); 6] = [
     (0, "Normal"),
-    (BORDER_RIVER as i64, "River"),
-    (BORDER_BRIDGE as i64, "Bridge"),
     (
         (BORDER_MOUNTAIN_LINE | BORDER_IMPASSABLE) as i64,
         "Mountains",
@@ -300,6 +301,8 @@ const BORDER_KINDS: [(i64, &str); 6] = [
         (BORDER_MOUNTAIN_LINE | BORDER_MOUNTAIN_PASS) as i64,
         "Mountain pass",
     ),
+    (BORDER_RIVER as i64, "River"),
+    (BORDER_BRIDGE as i64, "Bridge"),
     (BORDER_IMPASSABLE as i64, "Impassable"),
 ];
 
@@ -799,6 +802,73 @@ impl App {
         }
     }
 
+    fn place_starts(&mut self, wants: &[crate::starts::Want], generic: bool) {
+        if wants.is_empty() {
+            self.status = "Add players to the list first".to_owned();
+            return;
+        }
+        let Some(project) = &self.project else {
+            return;
+        };
+        let (planes, gates) = project.graph();
+        let seed = self.gen.seed() as u64;
+        let placed = crate::starts::place(&planes, &gates, wants, seed);
+        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
+        let opts = self.opts;
+        let n = self
+            .project
+            .as_mut()
+            .map(|p| p.apply_starts(&placed, generic, &tex, &opts))
+            .unwrap_or(0);
+        self.tex = tex;
+        self.mark_tiles(None);
+        self.refresh_selection();
+        let missing = wants.len().saturating_sub(n);
+        self.status = if missing > 0 {
+            format!("Placed {n} starts; {missing} players found no fitting province")
+        } else if generic {
+            format!("Placed {n} start provinces")
+        } else {
+            format!("Placed {n} nation starts")
+        };
+    }
+
+    fn remove_empty_provinces(&mut self) -> usize {
+        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
+        let opts = self.opts;
+        let mut removed = 0;
+        let mut orphan_gates: Vec<i32> = Vec::new();
+        if let Some(p) = &mut self.project {
+            for d in &mut p.planes {
+                while let Some(&e) = d.empty_provinces().first() {
+                    let g = d.gate(e);
+                    if !d.remove_province(e, &tex, &opts) {
+                        break;
+                    }
+                    if g != 0 {
+                        orphan_gates.push(g);
+                    }
+                    removed += 1;
+                }
+            }
+            for g in orphan_gates {
+                for d in &mut p.planes {
+                    for q in 1..=d.province_count() as u32 {
+                        if d.gate(q) == g {
+                            d.set_gate(q, 0, &tex, &opts);
+                        }
+                    }
+                }
+            }
+        }
+        self.tex = tex;
+        if removed > 0 {
+            self.mark_tiles(None);
+            self.refresh_selection();
+        }
+        removed
+    }
+
     fn open_generated(&mut self, g: GeneratedMap) {
         let dir = self.settings.maps_dir();
         let planes: Vec<(&[u8], &str)> = g
@@ -808,8 +878,10 @@ impl App {
             .collect();
         let gates: Vec<(u16, u16)> = g.gates.iter().map(|g| (g.surface, g.cave)).collect();
         match Project::from_generated(dir, &g.name, &planes, &gates, &self.tex, &self.opts) {
-            Ok(p) => {
+            Ok(mut p) => {
+                p.set_generator_settings(&self.gen.settings_lines());
                 self.adopt_project(p);
+                let dropped = self.remove_empty_provinces();
                 let counts = self
                     .project
                     .as_ref()
@@ -836,6 +908,18 @@ impl App {
                     g.elapsed.as_secs_f32(),
                     counts
                 );
+                if dropped > 0 {
+                    self.status = format!(
+                        "{}. Dropped {dropped} province{} that had no area",
+                        self.status,
+                        if dropped == 1 { "" } else { "s" }
+                    );
+                }
+                if !g.wants.is_empty() {
+                    let summary = std::mem::take(&mut self.status);
+                    self.place_starts(&g.wants, g.generic);
+                    self.status = format!("{summary}. {}", self.status);
+                }
             }
             Err(e) => self.error = Some(e),
         }
@@ -853,6 +937,10 @@ impl App {
                 };
                 if !notes.is_empty() {
                     self.status = format!("{} ({})", self.status, notes.join("; "));
+                }
+                let restored = self.gen.apply_settings(&p.generator_settings());
+                if let Some(note) = restored {
+                    self.status = format!("{}; {}", self.status, note);
                 }
                 let status = std::mem::take(&mut self.status);
                 self.adopt_project(p);
@@ -1312,12 +1400,18 @@ impl App {
             return false;
         };
         let mut written = Vec::new();
+        let mut warnings = Vec::new();
         for d in &mut p.planes {
             if !d.dirty {
                 continue;
             }
             match d.save() {
-                Ok(files) => written.extend(files),
+                Ok(files) => {
+                    written.extend(files);
+                    if let Some(w) = d.area_warning() {
+                        warnings.push(format!("plane {}: {w}", d.index));
+                    }
+                }
                 Err(e) => {
                     self.error = Some(e);
                     return false;
@@ -1343,6 +1437,9 @@ impl App {
                 format!("Saved {} in {dir}", names.join(", "))
             }
         };
+        if !warnings.is_empty() {
+            self.status = format!("{}. {}", self.status, warnings.join("; "));
+        }
         true
     }
 
@@ -1388,6 +1485,12 @@ impl App {
                         if let Err(e) = self.gen.set_own(cave, f.name, &f.bytes) {
                             self.error = Some(e);
                         }
+                    }
+                }
+                Event::Picked(Purpose::Mod, files) => {
+                    if let Some(f) = files.into_iter().next() {
+                        let text = String::from_utf8_lossy(&f.bytes).into_owned();
+                        self.gen.load_mod_text(&f.name, &text);
                     }
                 }
                 Event::Directory(Some(name)) => {
@@ -1714,6 +1817,36 @@ impl App {
         }
     }
 
+    fn cycle_link(&mut self, prov: u32) {
+        let Some(sel) = self.selected else {
+            self.status = "Select a province first, then right-click a connected one".to_owned();
+            return;
+        };
+        if sel == prov {
+            return;
+        }
+        let Some(doc) = self.doc() else {
+            return;
+        };
+        if !doc.linked(sel, prov) {
+            self.status = format!("{sel} and {prov} are not connected");
+            return;
+        }
+        let current = doc.spec(sel, prov);
+        let i = BORDER_KINDS
+            .iter()
+            .position(|(v, _)| *v == current)
+            .unwrap_or(0);
+        let (next, label) = BORDER_KINDS[(i + 1) % BORDER_KINDS.len()];
+        let res = self.with_doc(|d, tex, opts| {
+            let ok = d.set_spec(sel, prov, next, tex, opts);
+            (ok, union(d.bbox(sel), d.bbox(prov)))
+        });
+        if let Some((ok, rect)) = res {
+            self.after_edit(ok, rect, &format!("{sel} to {prov}: {label}"));
+        }
+    }
+
     fn undo_all(&mut self) {
         let n = self
             .with_doc(|d, tex, opts| d.undo_all(tex, opts))
@@ -1979,6 +2112,9 @@ impl App {
                 let (canvas, resp) =
                     ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
                 if self.project.is_none() {
+                    if resp.clicked() {
+                        self.pending = Pending::Open(None);
+                    }
                     let p = canvas.center();
                     ui.painter().text(
                         p,
@@ -1990,8 +2126,10 @@ impl App {
                     return;
                 }
                 let size = canvas.size();
-                if self.last_canvas.map(|s| s != size).unwrap_or(false) {
-                    self.fit_pending = true;
+                if let Some(old) = self.last_canvas {
+                    if old != size {
+                        self.offset += (size - old) * 0.5;
+                    }
                 }
                 self.last_canvas = Some(size);
                 let axes_now = self.wrap_axes();
@@ -2083,6 +2221,10 @@ impl App {
                                 self.jump_to_gateway(p);
                                 self.last_click_prov = None;
                             }
+                        }
+                    } else if self.tool == Tool::Link && resp.clicked_by(PointerButton::Secondary) {
+                        if let Some(p) = self.hover {
+                            self.cycle_link(p);
                         }
                     } else if !paint_tool && resp.clicked_by(PointerButton::Primary) {
                         let dot = if self.tool == Tool::Select {
@@ -2186,6 +2328,17 @@ impl App {
                     }
                 }
                 let painter = ui.painter_at(canvas);
+                let start_tags: Vec<(u32, String)> = self
+                    .project
+                    .as_ref()
+                    .map(|p| {
+                        p.specstarts()
+                            .into_iter()
+                            .filter(|&(_, pl, _)| pl == self.active)
+                            .map(|(n, _, pr)| (pr, format!("{} start", self.gen.nation_name(n))))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let Some(doc) = self.doc() else {
                     return;
                 };
@@ -2368,8 +2521,18 @@ impl App {
                                         Vec::new(),
                                     ));
                                 }
-                                if self.show_markers && labels_on && f & GOOD_START != 0 {
-                                    tags.push(("Start".to_owned(), theme::TAG_START, Vec::new()));
+                                if self.show_markers && labels_on {
+                                    match start_tags.iter().find(|(p, _)| *p == id) {
+                                        Some((_, label)) => {
+                                            tags.push((label.clone(), theme::TAG_START, Vec::new()))
+                                        }
+                                        None if f & GOOD_START != 0 => tags.push((
+                                            "Start".to_owned(),
+                                            theme::TAG_START,
+                                            Vec::new(),
+                                        )),
+                                        None => {}
+                                    }
                                 }
                                 if self.show_markers && labels_on && f & NO_START != 0 {
                                     tags.push(("No start".to_owned(), theme::TAG_NO, Vec::new()));
@@ -2532,12 +2695,12 @@ impl App {
                                 .ui(ui, PANEL_W - 50.0, &blueprints, doc_name.as_deref());
                             return;
                         }
+                        self.tools_section(ui);
+                        ui.add_space(8.0);
                         if self.selected.is_some() {
                             self.province_section(ui);
                             ui.add_space(8.0);
                         }
-                        self.tools_section(ui);
-                        ui.add_space(8.0);
                         if self.project.is_some() {
                             self.plane_section(ui);
                         }
@@ -2828,6 +2991,31 @@ impl App {
                     let img = ui
                         .add(egui::Image::new(src).fit_to_exact_size(size * scale).sense(Sense::click()))
                         .on_hover_text("The whole plane; click to look there");
+                    if let Some(sel) = self.selected {
+                        let doc = p.planes.get(self.active);
+                        let (pw, ph) = doc
+                            .map(|d| (d.width() as f32, d.height() as f32))
+                            .unwrap_or((1.0, 1.0));
+                        let k = size * scale / Vec2::new(pw, ph);
+                        let painter = ui.painter();
+                        if let Some(b) = doc.and_then(|d| d.bbox(sel)) {
+                            let r = egui::Rect::from_min_max(
+                                img.rect.min + Vec2::new(b.x0 as f32 * k.x, b.y0 as f32 * k.y),
+                                img.rect.min + Vec2::new((b.x1 + 1) as f32 * k.x, (b.y1 + 1) as f32 * k.y),
+                            )
+                            .expand(1.0);
+                            painter.rect_stroke(
+                                r,
+                                1.0,
+                                egui::Stroke::new(1.5, theme::INK_ACTIVE),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+                        if let Some((cx, cy)) = doc.and_then(|d| d.capital(sel)) {
+                            let c = img.rect.min + Vec2::new(cx as f32 * k.x, cy as f32 * k.y);
+                            painter.circle_filled(c, 2.5, theme::INK_ACTIVE);
+                        }
+                    }
                     if let (Some(pos), Some(canvas)) = (img.interact_pointer_pos(), self.last_canvas) {
                         if img.clicked() {
                             let rel = (pos - img.rect.min) / (size * scale);
@@ -3564,6 +3752,11 @@ impl eframe::App for App {
         }
         if let Some(g) = self.gen.poll() {
             self.open_generated(g);
+        }
+        if self.gen.take_place_request() {
+            let wants = self.gen.wants();
+            let generic = self.gen.generic_starts();
+            self.place_starts(&wants, generic);
         }
         if std::mem::take(&mut self.pending_generate) {
             let edited = self

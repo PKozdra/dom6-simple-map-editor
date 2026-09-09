@@ -1588,7 +1588,7 @@ impl PlaneDoc {
             if spec & terrain::BORDER_IMPASSABLE != 0 {
                 continue;
             }
-            let river = spec & terrain::BORDER_RIVER != 0 && spec & terrain::BORDER_BRIDGE == 0;
+            let river = spec & terrain::BORDER_RIVER != 0;
             let pass = spec & terrain::BORDER_MOUNTAIN_PASS != 0;
             score += if river || pass { crossing } else { 1.0 };
         }
@@ -2014,13 +2014,24 @@ impl PlaneDoc {
         self.rendered = r;
     }
 
-    pub fn save(&mut self) -> Result<Vec<PathBuf>, String> {
+    pub fn area_warning(&self) -> Option<String> {
         let empty = self.empty_provinces();
-        if let Some(p) = empty.first() {
-            return Err(format!(
-                "Province {p} has no area. Paint some pixels for it or undo before saving"
-            ));
+        match empty.as_slice() {
+            [] => None,
+            [p] => Some(format!("province {p} has no area")),
+            all => {
+                let shown: Vec<String> = all.iter().take(6).map(u32::to_string).collect();
+                let more = if all.len() > 6 { ", ..." } else { "" };
+                Some(format!(
+                    "{} provinces have no area: {}{more}",
+                    all.len(),
+                    shown.join(", ")
+                ))
+            }
         }
+    }
+
+    pub fn save(&mut self) -> Result<Vec<PathBuf>, String> {
         let mut written = Vec::new();
         let bytes = self.d6m.to_bytes();
         write_replace(&self.d6m_path, &bytes)?;
@@ -2147,6 +2158,20 @@ impl Project {
             notes,
             unsaved: false,
         })
+    }
+
+    pub fn generator_settings(&self) -> Vec<String> {
+        self.planes
+            .first()
+            .and_then(|p| p.map.as_ref())
+            .map(|m| m.comment_lines("-- gen"))
+            .unwrap_or_default()
+    }
+
+    pub fn set_generator_settings(&mut self, lines: &[String]) {
+        if let Some(m) = self.planes.first_mut().and_then(|p| p.map.as_mut()) {
+            m.set_comment_lines("-- gen", lines);
+        }
     }
 
     pub fn from_generated(
@@ -2337,6 +2362,151 @@ impl Project {
         }
         self.planes.pop();
         Ok(moved)
+    }
+
+    pub fn plane_offset(&self, plane: usize) -> u32 {
+        self.planes
+            .iter()
+            .take(plane)
+            .map(|d| d.province_count() as u32)
+            .sum()
+    }
+
+    pub fn locate_global(&self, global: u32) -> Option<(usize, u32)> {
+        let mut rest = global;
+        for (i, d) in self.planes.iter().enumerate() {
+            let n = d.province_count() as u32;
+            if rest >= 1 && rest <= n {
+                return Some((i, rest));
+            }
+            rest = rest.saturating_sub(n);
+        }
+        None
+    }
+
+    pub fn specstarts(&self) -> Vec<(u32, usize, u32)> {
+        let Some(m) = self.planes.first().and_then(|d| d.map.as_ref()) else {
+            return Vec::new();
+        };
+        m.specstarts
+            .iter()
+            .filter_map(|&(nation, global)| {
+                self.locate_global(global)
+                    .map(|(plane, prov)| (nation, plane, prov))
+            })
+            .collect()
+    }
+
+    pub fn generic_starts(&self) -> Vec<(usize, u32)> {
+        let Some(m) = self.planes.first().and_then(|d| d.map.as_ref()) else {
+            return Vec::new();
+        };
+        m.starts
+            .iter()
+            .filter_map(|&global| self.locate_global(global))
+            .collect()
+    }
+
+    pub fn start_nation(&self, plane: usize, prov: u32) -> Option<u32> {
+        self.specstarts()
+            .into_iter()
+            .find(|&(_, pl, pr)| pl == plane && pr == prov)
+            .map(|(n, _, _)| n)
+    }
+
+    pub fn graph(&self) -> (Vec<crate::starts::PlaneGraph>, Vec<crate::starts::Link>) {
+        let planes = self
+            .planes
+            .iter()
+            .map(|d| {
+                let n = d.province_count();
+                let nbors = (0..=n)
+                    .map(|p| {
+                        if p == 0 {
+                            Vec::new()
+                        } else {
+                            d.neighbours(p as u32)
+                        }
+                    })
+                    .collect();
+                crate::starts::PlaneGraph {
+                    flags: d.flags.clone(),
+                    nbors,
+                    areas: d.pixel_counts.clone(),
+                    cave: d.index > 1,
+                }
+            })
+            .collect();
+        let mut gate_numbers: Vec<i32> = self
+            .planes
+            .iter()
+            .flat_map(|d| (1..=d.province_count() as u32).map(move |p| d.gate(p)))
+            .filter(|&g| g != 0)
+            .collect();
+        gate_numbers.sort_unstable();
+        gate_numbers.dedup();
+        let mut links = Vec::new();
+        for g in gate_numbers {
+            let ring = self.gateway_ring(g);
+            for pair in ring.windows(2) {
+                links.push((pair[0], pair[1]));
+            }
+        }
+        (planes, links)
+    }
+
+    pub fn apply_starts(
+        &mut self,
+        placed: &[crate::starts::Placed],
+        generic: bool,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> usize {
+        let old: Vec<(usize, u32)> = self
+            .specstarts()
+            .into_iter()
+            .map(|(_, pl, pr)| (pl, pr))
+            .chain(self.generic_starts())
+            .collect();
+        for (pl, pr) in old {
+            if let Some(d) = self.planes.get_mut(pl) {
+                let f = d.flags.get(pr as usize).copied().unwrap_or(0);
+                if f & terrain::GOOD_START != 0
+                    && !placed.iter().any(|p| p.plane == pl && p.prov == pr)
+                {
+                    d.set_flags(pr, f & !terrain::GOOD_START, "Place starts", tex, opts);
+                }
+            }
+        }
+        let mut count = 0;
+        for p in placed {
+            if let Some(d) = self.planes.get_mut(p.plane) {
+                let f = d.flags.get(p.prov as usize).copied().unwrap_or(0);
+                if f & terrain::GOOD_START == 0 {
+                    d.set_flags(p.prov, f | terrain::GOOD_START, "Place starts", tex, opts);
+                }
+                count += 1;
+            }
+        }
+        let globals: Vec<(u32, u32)> = placed
+            .iter()
+            .map(|p| (p.nation, self.plane_offset(p.plane) + p.prov))
+            .collect();
+        if let Some(d) = self.planes.first_mut() {
+            if let Some(m) = &mut d.map {
+                if generic {
+                    m.set_specstarts(&[]);
+                    m.set_starts(&globals.iter().map(|&(_, g)| g).collect::<Vec<_>>());
+                } else {
+                    m.set_starts(&[]);
+                    m.set_specstarts(&globals);
+                }
+                if m.modified {
+                    d.dirty = true;
+                }
+            }
+        }
+        count
     }
 
     pub fn gateway_ring(&self, gate: i32) -> Vec<(usize, u32)> {

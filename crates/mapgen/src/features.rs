@@ -907,7 +907,7 @@ pub fn finish_edges(
     sink: &mut dyn Sink,
 ) -> Control {
     graph::disown_random_map_edges(w, alpha);
-    graph::ensure_land_exits(w);
+    graph::ensure_land_exits(w, graph::NO_PLANE_LOADED_DURING_GENERATION);
     if !w.blueprint_mask.is_empty() {
         let mask = std::mem::take(&mut w.blueprint_mask);
         mark_no_mans_land(

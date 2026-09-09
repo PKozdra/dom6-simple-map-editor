@@ -357,8 +357,10 @@ fn no_start_setter_counts_crossings_fractionally() {
     assert_eq!(doc.connection_score(2, 0.5), 0.0);
     doc.flags[2] &= !SEA;
     assert_eq!(doc.connection_score(1, 0.5), 1.0);
-    assert!(doc.set_spec(1, 2, (BORDER_RIVER | BORDER_BRIDGE) as i64, &t, &opts));
+    assert!(doc.set_spec(1, 2, BORDER_BRIDGE as i64, &t, &opts));
     assert_eq!(doc.connection_score(1, 0.5), 1.0);
+    assert!(doc.set_spec(1, 2, (BORDER_RIVER | BORDER_BRIDGE) as i64, &t, &opts));
+    assert_eq!(doc.connection_score(1, 0.5), 0.5);
     assert!(doc.set_spec(1, 2, BORDER_RIVER as i64, &t, &opts));
     assert_eq!(doc.connection_score(1, 0.5), 0.5);
     assert_eq!(doc.set_no_starts(0.5, 0.5, &t, &opts), 0);
@@ -441,7 +443,7 @@ fn provinces_can_be_added_and_capitals_moved() {
 }
 
 #[test]
-fn saving_refuses_an_empty_province() {
+fn saving_warns_about_an_empty_province_but_still_writes() {
     let dir = temp_dir("emptyprov");
     let (p1, _) = make_map(&dir, "emptyprov", 1, false);
     let t = tex();
@@ -453,9 +455,14 @@ fn saving_refuses_an_empty_province() {
     assert!(doc.paint(1, 5, 5, 3, &t, &opts).is_some());
     doc.paint_end(&t, &opts);
     assert_eq!(doc.pixel_counts[p as usize], 0);
-    assert!(doc.save().is_err());
+    assert_eq!(
+        doc.area_warning().as_deref(),
+        Some(format!("province {p} has no area").as_str())
+    );
+    assert!(doc.save().is_ok());
     assert!(doc.undo_last(&t, &opts).is_some());
     assert!(doc.undo_last(&t, &opts).is_some());
+    assert!(doc.area_warning().is_none());
     assert!(doc.save().is_ok());
 }
 
@@ -848,4 +855,131 @@ fn no_start_marks_can_be_cleared_for_the_whole_plane() {
     assert_eq!(doc.clear_no_starts(&t, &opts), 0);
     assert!(doc.undo_last(&t, &opts).is_some());
     assert_eq!(doc.flags[1] & NO_START, NO_START);
+}
+
+#[test]
+fn nation_starts_land_on_fitting_provinces_and_reach_the_map_file() {
+    use dom6_simple_map_editor::starts::{place, Want};
+    use dom6_simple_map_editor::terrain::{CAVE, GOOD_START};
+    let opts = dom6_mapgen::Options {
+        width: 512,
+        height: 512,
+        caves_plane: true,
+        ..dom6_mapgen::Options::default()
+    };
+    let g = dom6_mapgen::generate::generate_new_game(
+        &opts,
+        11,
+        4,
+        10,
+        "random_11",
+        &mut dom6_mapgen::stage::NoSink,
+    )
+    .unwrap();
+    let planes: Vec<(&[u8], &str)> = g
+        .planes
+        .iter()
+        .map(|p| (p.d6m.as_slice(), p.map_text.as_str()))
+        .collect();
+    let gates: Vec<(u16, u16)> = g.gates.iter().map(|g| (g.surface, g.cave)).collect();
+    let t = tex();
+    let ropts = Options::default();
+    let dir = temp_dir("starts");
+    let mut proj =
+        Project::from_generated(dir.clone(), "random_11", &planes, &gates, &t, &ropts).unwrap();
+    let wants = vec![
+        Want {
+            nation: 43,
+            uw: true,
+            coast: false,
+            cave: 0,
+            likesterr: DEEP_SEA,
+        },
+        Want {
+            nation: 15,
+            uw: false,
+            coast: false,
+            cave: 2,
+            likesterr: 0,
+        },
+        Want {
+            nation: 5,
+            uw: false,
+            coast: false,
+            cave: 0,
+            likesterr: 0,
+        },
+        Want {
+            nation: 29,
+            uw: false,
+            coast: true,
+            cave: 0,
+            likesterr: 0,
+        },
+    ];
+    let (graph, links) = proj.graph();
+    assert_eq!(graph.len(), 2);
+    assert!(!links.is_empty());
+    let placed = place(&graph, &links, &wants, 11);
+    assert_eq!(placed.len(), 4);
+    let n = proj.apply_starts(&placed, false, &t, &ropts);
+    assert_eq!(n, 4);
+    for p in &placed {
+        let d = &proj.planes[p.plane];
+        let f = d.flags[p.prov as usize];
+        assert!(f & GOOD_START != 0);
+        assert!(f & NO_START == 0);
+        match p.nation {
+            43 => assert!(f & SEA != 0),
+            15 => assert!(p.plane == 1 || f & CAVE != 0),
+            _ => assert!(f & SEA == 0),
+        }
+    }
+    assert_eq!(proj.specstarts().len(), 4);
+    assert_eq!(proj.start_nation(placed[0].plane, placed[0].prov), Some(43));
+    let text = proj.planes[0].map.as_ref().unwrap().to_text();
+    assert_eq!(text.matches("#specstart ").count(), 4);
+    let cave = placed.iter().find(|p| p.nation == 15).unwrap();
+    let global = proj.plane_offset(cave.plane) + cave.prov;
+    assert!(text.contains(&format!("#specstart 15 {global}")));
+    assert!(global > proj.planes[0].province_count() as u32);
+    proj.apply_starts(&placed[..2], true, &t, &ropts);
+    let text = proj.planes[0].map.as_ref().unwrap().to_text();
+    assert_eq!(text.matches("#specstart ").count(), 0);
+    assert_eq!(text.matches("#start ").count(), 2);
+    assert_eq!(proj.generic_starts().len(), 2);
+    let dropped = placed[3];
+    assert!(proj.planes[dropped.plane].flags[dropped.prov as usize] & GOOD_START == 0);
+    for d in &mut proj.planes {
+        assert!(d.save().is_ok());
+    }
+    let reopened = Project::open(&dir.join("random_11.d6m"), &t, &ropts).unwrap();
+    assert_eq!(reopened.generic_starts().len(), 2);
+}
+
+#[test]
+fn generator_settings_survive_save_and_reopen() {
+    use dom6_simple_map_editor::gen_settings;
+    use dom6_simple_map_editor::generator_panel::Form;
+    let dir = temp_dir("gensettings");
+    let (p1, map_path) = make_map(&dir, "gensettings", 1, true);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    assert!(proj.generator_settings().is_empty());
+    let form = Form {
+        seed: 77,
+        ..Form::default()
+    };
+    proj.set_generator_settings(&gen_settings::encode(&form));
+    proj.planes[0].save().unwrap();
+    let text = std::fs::read_to_string(&map_path).unwrap();
+    let title = text.find("#dom2title").unwrap();
+    let block = text.find("-- gen.seed 77").unwrap();
+    assert!(block > title);
+    assert!(block < text.find("#terrain").unwrap());
+    let reopened = Project::open(&p1, &t, &opts).unwrap();
+    let restored = gen_settings::decode(&reopened.generator_settings()).unwrap();
+    assert_eq!(restored.form.seed, 77);
+    assert!(restored.form.manual_seed);
 }
