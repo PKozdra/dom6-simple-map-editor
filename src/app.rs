@@ -3166,7 +3166,7 @@ impl App {
                             let rows = (size.y * scale).round().max(1.0) as i32;
                             let fill = theme::INK_ACTIVE.gamma_multiply(0.75);
                             for ty in 0..rows {
-                                let my = ((ty as f32 + 0.5) / k.y) as i32;
+                                let my = ph as i32 - 1 - ((ty as f32 + 0.5) / k.y) as i32;
                                 let mut run: Option<i32> = None;
                                 for tx in 0..=cols {
                                     let inside = tx < cols
@@ -3187,7 +3187,8 @@ impl App {
                             }
                         }
                         if let Some((cx, cy)) = doc.and_then(|d| d.capital(sel)) {
-                            let c = img.rect.min + Vec2::new(cx as f32 * k.x, cy as f32 * k.y);
+                            let c = img.rect.min
+                                + Vec2::new((cx as f32 + 0.5) * k.x, (ph - 1.0 - cy as f32 + 0.5) * k.y);
                             painter.circle_filled(c, 2.5, theme::INK_ACTIVE);
                         }
                     }
