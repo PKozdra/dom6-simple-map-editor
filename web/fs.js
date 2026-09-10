@@ -139,3 +139,105 @@ export function download(name, bytes) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
+
+function fromEntry(entry) {
+  return new Promise((resolve) => {
+    entry.file(
+      async (f) => resolve({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()), handle: null }),
+      () => resolve(null),
+    );
+  });
+}
+
+async function readEntryDirectory(dir) {
+  const reader = dir.createReader();
+  const all = [];
+  for (;;) {
+    const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+    if (!batch.length) {
+      break;
+    }
+    all.push(...batch);
+  }
+  const out = [];
+  for (const en of all) {
+    if (en.isFile && /\.(d6m|map)$/i.test(en.name)) {
+      const f = await fromEntry(en);
+      if (f) {
+        out.push(f);
+      }
+    }
+  }
+  return out;
+}
+
+export function installDrop(cb) {
+  window.addEventListener(
+    "dragover",
+    (e) => {
+      e.preventDefault();
+    },
+    true,
+  );
+  window.addEventListener(
+    "drop",
+    (e) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const items = e.dataTransfer ? Array.from(e.dataTransfer.items || []) : [];
+      const handlePromises = [];
+      const entries = [];
+      const plain = [];
+      for (const it of items) {
+        if (it.kind !== "file") {
+          continue;
+        }
+        if (typeof it.getAsFileSystemHandle === "function") {
+          handlePromises.push(it.getAsFileSystemHandle());
+        } else if (typeof it.webkitGetAsEntry === "function" && it.webkitGetAsEntry()) {
+          entries.push(it.webkitGetAsEntry());
+        } else {
+          const f = it.getAsFile();
+          if (f) {
+            plain.push(f);
+          }
+        }
+      }
+      (async () => {
+        const files = [];
+        const dirs = [];
+        for (const p of handlePromises) {
+          let h = null;
+          try {
+            h = await p;
+          } catch (err) {
+            h = null;
+          }
+          if (!h) {
+            continue;
+          }
+          if (h.kind === "directory") {
+            dirs.push(h);
+          } else {
+            files.push(await fromHandle(h));
+          }
+        }
+        for (const en of entries) {
+          if (en.isDirectory) {
+            files.push(...(await readEntryDirectory(en)));
+          } else if (en.isFile) {
+            const f = await fromEntry(en);
+            if (f) {
+              files.push(f);
+            }
+          }
+        }
+        for (const f of plain) {
+          files.push({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()), handle: null });
+        }
+        cb({ files, dirs });
+      })();
+    },
+    true,
+  );
+}

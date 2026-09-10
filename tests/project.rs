@@ -1104,3 +1104,15 @@ fn incremental_thumbnail_matches_a_full_one() {
     let inc = thumbnail(&doc.rendered, true, 5, Some(first), Some(dirty));
     assert_eq!(full.rgba, inc.rgba);
 }
+
+#[test]
+fn a_recipe_without_its_map_is_refused() {
+    let dir = temp_dir("nomap");
+    let (p1, map_path) = make_map(&dir, "nomap", 1, false);
+    std::fs::remove_file(&map_path).unwrap();
+    let t = tex();
+    let opts = Options::default();
+    let err = Project::open(&p1, &t, &opts).err().unwrap();
+    assert!(err.contains("nomap.map"), "{err}");
+    assert!(err.contains("needs both files"), "{err}");
+}

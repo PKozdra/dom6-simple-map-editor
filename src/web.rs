@@ -28,6 +28,8 @@ extern "C" {
     fn list_directory_js(dir: &JsValue, accept: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = download)]
     fn download_js(name: &str, bytes: &[u8]);
+    #[wasm_bindgen(js_name = installDrop)]
+    fn install_drop_js(cb: &Closure<dyn FnMut(JsValue)>);
 }
 
 pub const MAP_FILES: &str = "d6m,map";
@@ -214,21 +216,93 @@ pub fn pick_directory(ctx: egui::Context) {
     });
 }
 
+async fn names_in(dir: &JsValue) -> Vec<String> {
+    match JsFuture::from(list_directory_js(dir, MAP_FILES)).await {
+        Ok(v) => Array::from(&v)
+            .iter()
+            .filter_map(|n| n.as_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn list_directory(ctx: egui::Context) {
     spawn_local(async move {
         let Some(dir) = io::dir() else {
             push(Event::Listed(Vec::new()), &ctx);
             return;
         };
-        let names = match JsFuture::from(list_directory_js(&dir, MAP_FILES)).await {
-            Ok(v) => Array::from(&v)
-                .iter()
-                .filter_map(|n| n.as_string())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let names = names_in(&dir).await;
         push(Event::Listed(names), &ctx);
     });
+}
+
+pub fn complete_maps(names: &[String]) -> Vec<String> {
+    let lower: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    names
+        .iter()
+        .filter(|n| {
+            let l = n.to_ascii_lowercase();
+            let Some(stem) = l.strip_suffix(".map") else {
+                return false;
+            };
+            strip_plane_suffix(stem).1 == 1 && lower.contains(&format!("{stem}.d6m"))
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn install_drop(ctx: egui::Context) {
+    let cb = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
+        let files = Reflect::get(&v, &JsValue::from_str("files"))
+            .map(|a| parse_files(&a))
+            .unwrap_or_default();
+        let dirs: Vec<JsValue> = Reflect::get(&v, &JsValue::from_str("dirs"))
+            .map(|a| Array::from(&a).iter().collect())
+            .unwrap_or_default();
+        let ctx = ctx.clone();
+        spawn_local(async move { handle_drop(files, dirs, ctx).await });
+    });
+    install_drop_js(&cb);
+    cb.forget();
+}
+
+async fn handle_drop(mut files: Vec<PickedFile>, dirs: Vec<JsValue>, ctx: egui::Context) {
+    if let Some(h) = dirs.into_iter().next() {
+        let name = handle_name_js(&h);
+        io::set_dir(Some((h.clone(), name.clone())));
+        push(Event::Directory(Some(name.clone())), &ctx);
+        let names = names_in(&h).await;
+        push(Event::Listed(names.clone()), &ctx);
+        if files.is_empty() {
+            let maps = complete_maps(&names);
+            match maps.as_slice() {
+                [] => push(
+                    Event::Error(format!(
+                        "{name} holds no complete map: a map is a .map file with its .d6m beside it"
+                    )),
+                    &ctx,
+                ),
+                [one] => open_from_directory(one.clone(), ctx),
+                many => push(
+                    Event::Status(format!(
+                        "{name} holds {} maps; pick one in the Folder box",
+                        many.len()
+                    )),
+                    &ctx,
+                ),
+            }
+            return;
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    if let Some(dir) = io::dir() {
+        let more = siblings(&dir, &files).await;
+        files.extend(more);
+    }
+    push(Event::Picked(Purpose::Open, files), &ctx);
 }
 
 pub fn forget_directory() {

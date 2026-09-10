@@ -2275,7 +2275,7 @@ impl Project {
             return Err(format!("{} is not a .d6m or .map file", path.display()));
         }
         let mut planes = Vec::new();
-        let mut notes = Vec::new();
+        let notes = Vec::new();
         for plane in 1..=9u32 {
             let d6m_path = dir.join(plane_file_name(&base, plane, "d6m"));
             if !crate::io::exists(&d6m_path) {
@@ -2283,30 +2283,34 @@ impl Project {
             }
             let d6m = D6m::load(&d6m_path).map_err(|e| format!("{}: {e}", d6m_path.display()))?;
             let map_path = dir.join(plane_file_name(&base, plane, "map"));
-            let map = if crate::io::exists(&map_path) {
-                match MapFile::load(&map_path) {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        notes.push(format!("{}: {e}", map_path.display()));
-                        None
-                    }
+            if !crate::io::exists(&map_path) {
+                let map_name = map_path.file_name().unwrap().to_string_lossy().into_owned();
+                if crate::io::IS_WEB {
+                    return Err(format!(
+                        "{map_name} is not open in the browser. Drop the map folder, or the .d6m and .map files together (Ctrl-click both in the picker). The game reads terrain, names and connections from the .map, so the editor needs both files"
+                    ));
                 }
-            } else {
-                notes.push(format!(
-                    "no {} beside the recipe; terrain flags taken from the .d6m snapshot",
-                    map_path.file_name().unwrap().to_string_lossy()
+                return Err(format!(
+                    "no {map_name} beside {}. The game reads terrain, names and connections from the .map, so the editor needs both files",
+                    d6m_path.display()
                 ));
-                None
-            };
-            let map_path = map.as_ref().map(|_| map_path);
+            }
+            let map =
+                MapFile::load(&map_path).map_err(|e| format!("{}: {e}", map_path.display()))?;
             planes.push(PlaneDoc::build(
-                plane, d6m_path, map_path, d6m, map, tex, opts,
+                plane,
+                d6m_path,
+                Some(map_path),
+                d6m,
+                Some(map),
+                tex,
+                opts,
             ));
         }
         if planes.is_empty() {
             if crate::io::IS_WEB {
                 return Err(format!(
-                    "{base}.d6m is not open in the browser. Select the .d6m together with its .map in the file picker (Ctrl-click both), or open the .d6m now and the .map already picked will be used; choosing the maps folder first makes the editor read both files itself"
+                    "{base}.d6m is not open in the browser. Drop the map folder, or the .d6m and .map files together (Ctrl-click both in the picker). The game reads terrain, names and connections from the .map, so the editor needs both files"
                 ));
             }
             return Err(format!("no {}.d6m found in {}", base, dir.display()));

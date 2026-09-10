@@ -681,6 +681,8 @@ impl App {
         random: bool,
     ) -> App {
         theme::install(&cc.egui_ctx);
+        #[cfg(target_arch = "wasm32")]
+        crate::web::install_drop(cc.egui_ctx.clone());
         cc.egui_ctx.options_mut(|o| {
             o.input_options.max_double_click_delay = 0.5;
             o.input_options.max_click_dist = 8.0;
@@ -745,7 +747,11 @@ impl App {
             name_edit: String::new(),
             name_for: None,
             gate_edit: 0,
-            status: "Open a map, or drop a .d6m or .map file on the window".to_owned(),
+            status: if crate::io::IS_WEB {
+                "Open a map: drop its folder, or the .d6m and .map files together".to_owned()
+            } else {
+                "Open a map, or drop a .d6m or .map file on the window".to_owned()
+            },
             error: None,
             pending: Pending::None,
             confirm_close: false,
@@ -2288,17 +2294,39 @@ impl App {
                         self.pending = Pending::Open(None);
                     }
                     let p = canvas.center();
+                    let (main, sub) = match (self.lay.compact(), crate::io::IS_WEB) {
+                        (true, true) => (
+                            "Tap here to open a map: pick its .d6m and .map together",
+                            None,
+                        ),
+                        (true, false) => ("Tap here to open a map, or use Generate", None),
+                        (false, true) => (
+                            "Drop a map folder here, or its .d6m and .map together",
+                            Some("Open map picks files; Choose folder lets the editor find the pair itself"),
+                        ),
+                        (false, false) => ("Drop a .d6m or .map here, or use Open map", None),
+                    };
+                    let main_pos = if sub.is_some() {
+                        p - Vec2::new(0.0, 12.0)
+                    } else {
+                        p
+                    };
                     ui.painter().text(
-                        p,
+                        main_pos,
                         Align2::CENTER_CENTER,
-                        if self.lay.compact() {
-                            "Tap here to open a map, or use Generate"
-                        } else {
-                            "Drop a .d6m or .map here, or use Open map"
-                        },
+                        main,
                         FontId::proportional(20.0),
                         theme::INK_DIM,
                     );
+                    if let Some(sub) = sub {
+                        ui.painter().text(
+                            p + Vec2::new(0.0, 16.0),
+                            Align2::CENTER_CENTER,
+                            sub,
+                            FontId::proportional(14.0),
+                            theme::INK_DIM,
+                        );
+                    }
                     return;
                 }
                 let size = canvas.size();
