@@ -1009,3 +1009,99 @@ fn isolated_provinces_get_linked_to_the_province_they_touch() {
     assert_eq!(doc.neighbours(1), vec![2]);
     assert!(doc.link_isolated(&t, &opts).is_empty());
 }
+
+#[test]
+fn bounding_boxes_stay_exact_through_strokes_undo_and_redo() {
+    use dom6_simple_map_editor::render::province_bboxes;
+    let dir = temp_dir("bboxes");
+    let (p1, _) = make_map(&dir, "bboxes", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    let check = |doc: &dom6_simple_map_editor::project::PlaneDoc| {
+        assert_eq!(doc.rendered.bboxes, province_bboxes(&doc.plane()));
+    };
+    check(doc);
+    doc.paint_begin("Paint area");
+    assert!(doc
+        .paint_many(Some(1), &[(12, 5), (14, 6), (15, 7)], 2, &t, &opts)
+        .is_some());
+    check(doc);
+    assert!(doc.paint_many(None, &[(14, 6)], 1, &t, &opts).is_some());
+    check(doc);
+    assert!(doc.paint_many(Some(0), &[(3, 3)], 2, &t, &opts).is_some());
+    check(doc);
+    doc.paint_end(&t, &opts);
+    check(doc);
+    assert!(doc.undo_last(&t, &opts).is_some());
+    check(doc);
+    assert!(doc.redo_last(&t, &opts).is_some());
+    check(doc);
+    doc.paint_begin("Paint area");
+    assert!(doc.paint(1, 15, 5, 30, &t, &opts).is_some());
+    doc.paint_end(&t, &opts);
+    check(doc);
+    assert!(doc.bbox(2).is_none());
+    assert_eq!(doc.pixel_counts[2], 0);
+    assert!(doc.undo_last(&t, &opts).is_some());
+    check(doc);
+    assert!(doc.bbox(2).is_some());
+}
+
+#[test]
+fn capital_marks_toggle_without_a_re_render() {
+    let dir = temp_dir("capitals");
+    let (p1, _) = make_map(&dir, "capitals", 1, false);
+    let t = tex();
+    let with = Options::default();
+    let without = Options {
+        capitals: false,
+        ..with
+    };
+    let mut proj = Project::open(&p1, &t, &with).unwrap();
+    let doc = &mut proj.planes[0];
+    let marked = doc.rendered.rgba.clone();
+    let cap = ((5 * 20 + 4) * 4) as usize;
+    assert_eq!(&marked[cap..cap + 4], &[255, 255, 255, 255]);
+    doc.set_capitals(false);
+    let plain = doc.rendered.rgba.clone();
+    doc.rerender(&t, &without);
+    assert_eq!(plain, doc.rendered.rgba);
+    assert_ne!(&plain[cap..cap + 4], &[255, 255, 255, 255]);
+    doc.set_capitals(true);
+    assert_eq!(marked, doc.rendered.rgba);
+    doc.paint_begin("Paint area");
+    assert!(doc.paint(2, 4, 5, 1, &t, &without).is_some());
+    doc.paint_end(&t, &without);
+    doc.set_capitals(false);
+    let after = doc.rendered.rgba.clone();
+    doc.rerender(&t, &without);
+    assert_eq!(after, doc.rendered.rgba);
+}
+
+#[test]
+fn incremental_thumbnail_matches_a_full_one() {
+    use dom6_simple_map_editor::render::{thumbnail, Rect};
+    let dir = temp_dir("thumb");
+    let (p1, _) = make_map(&dir, "thumb", 1, false);
+    let t = tex();
+    let opts = Options::default();
+    let mut proj = Project::open(&p1, &t, &opts).unwrap();
+    let doc = &mut proj.planes[0];
+    let first = thumbnail(&doc.rendered, true, 5, None, None);
+    assert_eq!((first.w, first.h, first.k), (5, 3, 4));
+    doc.paint_begin("Paint area");
+    let rect = doc.paint(1, 12, 5, 2, &t, &opts).unwrap();
+    doc.paint_end(&t, &opts);
+    let touched = doc.rendered.touched;
+    let full = thumbnail(&doc.rendered, true, 5, None, None);
+    let dirty = Rect {
+        x0: rect.x0.min(touched.x0),
+        y0: rect.y0.min(touched.y0),
+        x1: rect.x1.max(touched.x1),
+        y1: rect.y1.max(touched.y1),
+    };
+    let inc = thumbnail(&doc.rendered, true, 5, Some(first), Some(dirty));
+    assert_eq!(full.rgba, inc.rgba);
+}

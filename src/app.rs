@@ -175,52 +175,27 @@ impl Overlay {
         let Some(r) = doc.bbox(prov) else {
             return;
         };
-        let w = doc.width();
-        let h = doc.height();
-        let owners = &doc.d6m.owners;
-        let (hw, vw) = (doc.hwrap(), doc.vwrap());
-        let inside = |x: i32, y: i32| {
-            let x = if hw { x.rem_euclid(w) } else { x };
-            let y = if vw { y.rem_euclid(h) } else { y };
-            x >= 0 && y >= 0 && x < w && y < h && owners[(y * w + x) as usize] as u32 == prov
-        };
-        for y in r.y0..=r.y1 {
-            for x in r.x0..=r.x1 {
-                if !inside(x, y) {
-                    continue;
-                }
-                let mut edge = 0;
-                for (dx, dy) in [
-                    (-1, 0),
-                    (1, 0),
-                    (0, -1),
-                    (0, 1),
-                    (-2, 0),
-                    (2, 0),
-                    (0, -2),
-                    (0, 2),
-                    (-1, -1),
-                    (1, 1),
-                    (-1, 1),
-                    (1, -1),
-                ] {
-                    if !inside(x + dx, y + dy) {
-                        edge += 1;
-                    }
-                }
-                let i = ((y * w + x) * 4) as usize;
-                let (c, a) = if edge > 0 {
-                    (theme::SELECT_EDGE, 235u8)
-                } else {
-                    (theme::SELECT_FILL, 46u8)
-                };
-                self.rgba[i] = c[0];
-                self.rgba[i + 1] = c[1];
-                self.rgba[i + 2] = c[2];
-                self.rgba[i + 3] = a;
-            }
-        }
+        crate::render::selection_rows(&doc.plane(), prov, r, &mut self.rgba);
         self.painted = Some(r);
+        self.tiles.mark(r);
+    }
+
+    fn paint_selection_in(&mut self, doc: &PlaneDoc, prov: u32, rect: Rect) {
+        let (w, h) = (doc.width(), doc.height());
+        let mut r = rect.expand(2, w, h);
+        if doc.hwrap() && (r.x0 <= 2 || r.x1 >= w - 3) {
+            r.x0 = 0;
+            r.x1 = w - 1;
+        }
+        if doc.vwrap() && (r.y0 <= 2 || r.y1 >= h - 3) {
+            r.y0 = 0;
+            r.y1 = h - 1;
+        }
+        if r.is_empty() {
+            return;
+        }
+        crate::render::selection_rows(&doc.plane(), prov, r, &mut self.rgba);
+        self.painted = union(self.painted, Some(r));
         self.tiles.mark(r);
     }
 }
@@ -591,8 +566,11 @@ pub struct App {
     relief_range: Vec<(f32, f32)>,
     relief_stale: Vec<bool>,
     thumbs: Vec<Option<egui::TextureHandle>>,
+    thumb_img: Vec<Option<crate::render::Thumb>>,
     thumb_stale: Vec<bool>,
+    thumb_dirty: Vec<Option<Rect>>,
     thumb_at: web_time::Instant,
+    rendered_opts: Vec<Options>,
     relief_in_height: bool,
     keep_rivers: bool,
     terrain_follows_height: bool,
@@ -683,8 +661,11 @@ impl App {
             relief_range: Vec::new(),
             relief_stale: Vec::new(),
             thumbs: Vec::new(),
+            thumb_img: Vec::new(),
             thumb_stale: Vec::new(),
+            thumb_dirty: Vec::new(),
             thumb_at: web_time::Instant::now(),
+            rendered_opts: Vec::new(),
             relief_in_height: true,
             keep_rivers: true,
             terrain_follows_height: true,
@@ -776,7 +757,10 @@ impl App {
         self.relief_range = p.planes.iter().map(|_| (-1.0, 1.0)).collect();
         self.relief_stale = p.planes.iter().map(|_| true).collect();
         self.thumbs = p.planes.iter().map(|_| None).collect();
+        self.thumb_img = p.planes.iter().map(|_| None).collect();
         self.thumb_stale = p.planes.iter().map(|_| true).collect();
+        self.thumb_dirty = p.planes.iter().map(|_| None).collect();
+        self.rendered_opts = p.planes.iter().map(|_| self.opts).collect();
         self.project = Some(p);
         self.active = 0;
         self.selected = None;
@@ -1110,6 +1094,15 @@ impl App {
         }
     }
 
+    fn refresh_selection_in(&mut self, rect: Rect) {
+        if let Some(p) = self.selected {
+            let active = self.active;
+            if let (Some(project), Some(ov)) = (&self.project, self.overlays.get_mut(active)) {
+                ov.paint_selection_in(&project.planes[active], p, rect);
+            }
+        }
+    }
+
     fn mark_tiles(&mut self, rect: Option<Rect>) {
         let active = self.active;
         let touched = rect.map(|r| self.doc().map(|d| d.rendered.touched.union(r)).unwrap_or(r));
@@ -1127,14 +1120,25 @@ impl App {
         } else if let Some(st) = self.relief_stale.get_mut(active) {
             *st = true;
         }
-        if let Some(st) = self.thumb_stale.get_mut(active) {
-            *st = true;
+        match touched {
+            Some(r) => {
+                if let Some(d) = self.thumb_dirty.get_mut(active) {
+                    *d = union(*d, Some(r));
+                }
+            }
+            None => {
+                if let Some(st) = self.thumb_stale.get_mut(active) {
+                    *st = true;
+                }
+            }
         }
     }
 
     fn refresh_thumb(&mut self, ctx: &egui::Context) {
         let active = self.active;
-        if !self.thumb_stale.get(active).copied().unwrap_or(false) {
+        let full = self.thumb_stale.get(active).copied().unwrap_or(false);
+        let dirty = self.thumb_dirty.get(active).copied().flatten();
+        if !full && dirty.is_none() {
             return;
         }
         let has = self
@@ -1155,49 +1159,23 @@ impl App {
         if w == 0 || h == 0 || doc.rendered.rgba.len() != w * h * 4 {
             return;
         }
-        let k = w.div_ceil(THUMB_W).max(1);
-        let (ow, oh) = ((w / k).max(1), (h / k).max(1));
-        let decor = if self.opts.decor && doc.rendered.decor.len() == w * h * 4 {
-            Some(&doc.rendered.decor)
-        } else {
-            None
-        };
-        let map = &doc.rendered.rgba;
-        let mut out = vec![0u8; ow * oh * 4];
-        let n = (k * k) as u32;
-        for oy in 0..oh {
-            for ox in 0..ow {
-                let mut acc = [0u32; 3];
-                for yy in 0..k {
-                    let row = ((oy * k + yy) * w + ox * k) * 4;
-                    for xx in 0..k {
-                        let i = row + xx * 4;
-                        let ma = map[i + 3] as u32;
-                        let (mut r, mut g, mut b) = (
-                            map[i] as u32 * ma / 255,
-                            map[i + 1] as u32 * ma / 255,
-                            map[i + 2] as u32 * ma / 255,
-                        );
-                        if let Some(d) = decor {
-                            let da = d[i + 3] as u32;
-                            r = r * (255 - da) / 255 + d[i] as u32;
-                            g = g * (255 - da) / 255 + d[i + 1] as u32;
-                            b = b * (255 - da) / 255 + d[i + 2] as u32;
-                        }
-                        acc[0] += r;
-                        acc[1] += g;
-                        acc[2] += b;
-                    }
-                }
-                let o = (oy * ow + ox) * 4;
-                out[o] = (acc[0] / n).min(255) as u8;
-                out[o + 1] = (acc[1] / n).min(255) as u8;
-                out[o + 2] = (acc[2] / n).min(255) as u8;
-                out[o + 3] = 255;
-            }
-        }
-        let top = crate::render::flip_to_top_down(ow as i32, oh as i32, &out);
+        let prev = self.thumb_img.get_mut(active).and_then(Option::take);
+        let thumb = crate::render::thumbnail(
+            &doc.rendered,
+            self.opts.decor,
+            THUMB_W,
+            prev,
+            if full { None } else { dirty },
+        );
+        let (ow, oh) = (thumb.w, thumb.h);
+        let top = crate::render::flip_to_top_down(ow as i32, oh as i32, &thumb.rgba);
         let image = egui::ColorImage::from_rgba_unmultiplied([ow, oh], &top);
+        if let Some(slot) = self.thumb_img.get_mut(active) {
+            *slot = Some(thumb);
+        }
+        if let Some(d) = self.thumb_dirty.get_mut(active) {
+            *d = None;
+        }
         let name = format!("thumb{}", doc.index);
         match self.thumbs.get_mut(active) {
             Some(Some(t)) => t.set(image, egui::TextureOptions::LINEAR),
@@ -1348,6 +1326,75 @@ impl App {
         for st in &mut self.thumb_stale {
             *st = true;
         }
+        for o in &mut self.rendered_opts {
+            *o = opts;
+        }
+    }
+
+    fn apply_view(&mut self, i: usize) {
+        let to = self.opts;
+        let Some(from) = self.rendered_opts.get(i).copied() else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let winter = from.winter != to.winter;
+        let grey = from.grey_no_start != to.grey_no_start;
+        let ground = from.borders != to.borders
+            || from.dirt != to.dirt
+            || from.edge_fade != to.edge_fade
+            || from.rivers != to.rivers
+            || from.border_percent != to.border_percent;
+        let tex = std::mem::replace(&mut self.tex, TexSet::from_images(Vec::new()));
+        let mut ground_changed = false;
+        let mut decor_changed = false;
+        if let Some(d) = self.project.as_mut().and_then(|p| p.planes.get_mut(i)) {
+            if winter {
+                d.rerender(&tex, &to);
+                ground_changed = true;
+                decor_changed = true;
+            } else if grey {
+                d.rerender_quick(&tex, &to);
+                ground_changed = true;
+                decor_changed = true;
+            } else if ground {
+                d.rerender_ground(&tex, &to);
+                ground_changed = true;
+            } else if from.capitals != to.capitals {
+                d.set_capitals(to.capitals);
+                ground_changed = true;
+            }
+            if to.decor && d.decor_stale() {
+                d.refresh_decor_full(&tex, &to);
+                decor_changed = true;
+            }
+        }
+        self.tex = tex;
+        self.rendered_opts[i] = to;
+        if ground_changed {
+            if let Some(t) = self.tiles.get_mut(i) {
+                t.mark_all();
+            }
+            if let Some(st) = self.relief_stale.get_mut(i) {
+                *st = true;
+            }
+        }
+        if decor_changed {
+            if let Some(t) = self.decor_tiles.get_mut(i) {
+                t.mark_all();
+            }
+        }
+        if ground_changed || decor_changed || from.decor != to.decor {
+            if let Some(st) = self.thumb_stale.get_mut(i) {
+                *st = true;
+            }
+        }
+    }
+
+    fn view_changed(&mut self) {
+        let i = self.active;
+        self.apply_view(i);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1717,6 +1764,7 @@ impl App {
             return;
         }
         self.active = i;
+        self.apply_view(i);
         self.fit_pending = true;
         self.selected = None;
         self.name_for = None;
@@ -1959,7 +2007,10 @@ impl App {
                     self.relief_range.push((-1.0, 1.0));
                     self.relief_stale.push(true);
                     self.thumbs.push(None);
+                    self.thumb_img.push(None);
                     self.thumb_stale.push(true);
+                    self.thumb_dirty.push(None);
+                    self.rendered_opts.push(self.opts);
                     let last = p.planes.len() - 1;
                     self.switch_plane(last);
                 }
@@ -1984,7 +2035,10 @@ impl App {
                 self.relief_range.pop();
                 self.relief_stale.pop();
                 self.thumbs.pop();
+                self.thumb_img.pop();
                 self.thumb_stale.pop();
+                self.thumb_dirty.pop();
+                self.rendered_opts.pop();
                 let n = self.project.as_ref().map(|p| p.planes.len()).unwrap_or(0);
                 if self.active >= n {
                     self.active = n.saturating_sub(1);
@@ -2077,25 +2131,20 @@ impl App {
                 return;
             }
             let spacing = (r as f32 / 2.0).max(1.0);
-            let points = self.stroke_points(x, y, spacing);
-            let mut acc: Option<Rect> = None;
-            for (sx, sy, _) in points {
-                let got = if remove {
-                    self.with_doc(|d, tex, opts| d.paint_restore(sx, sy, r, tex, opts))
-                        .flatten()
-                } else {
-                    self.with_doc(|d, tex, opts| d.paint(prov, sx, sy, r, tex, opts))
-                        .flatten()
-                };
-                acc = union(acc, got);
-            }
-            acc
+            let points: Vec<(i32, i32)> = self
+                .stroke_points(x, y, spacing)
+                .into_iter()
+                .map(|(sx, sy, _)| (sx, sy))
+                .collect();
+            let target = if remove { None } else { Some(prov) };
+            self.with_doc(|d, tex, opts| d.paint_many(target, &points, r, tex, opts))
+                .flatten()
         };
         if let Some(rect) = res {
             self.mark_tiles(Some(rect));
             self.stroke_decor = union(self.stroke_decor, Some(rect));
             if self.tool == Tool::Paint {
-                self.refresh_selection();
+                self.refresh_selection_in(rect);
             }
         }
     }
@@ -3786,7 +3835,7 @@ impl App {
                     ui.end_row();
                 });
             if changed {
-                self.rerender_all();
+                self.view_changed();
             }
             ui.horizontal(|ui| {
                 if theme::boxed_button(ui, "Fit", self.project.is_some()) {

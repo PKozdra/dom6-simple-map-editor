@@ -1267,47 +1267,7 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<Rect> {
-        let n = self.d6m.provinces.len();
-        if prov as usize > n {
-            return None;
-        }
-        let mut changes = Vec::new();
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy > radius * radius {
-                    continue;
-                }
-                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
-                    continue;
-                };
-                let old = self.d6m.owners[i];
-                if old as i32 == prov as i32 {
-                    continue;
-                }
-                changes.push((i as u32, old, prov as i16));
-            }
-        }
-        if changes.is_empty() {
-            return None;
-        }
-        let r = self.brush_rect(cx, cy, radius);
-        let step = Edit {
-            owners: changes,
-            rect: Some(r),
-            ..Default::default()
-        };
-        self.commit(&step, false, tex, opts);
-        if let Some(s) = &mut self.stroke {
-            s.owners.extend(step.owners);
-            s.rect = union(s.rect, Some(r));
-        } else {
-            self.redo.clear();
-            self.undo.push(Edit {
-                label: "Paint area".to_string(),
-                ..step
-            });
-        }
-        Some(r)
+        self.paint_many(Some(prov), &[(cx, cy)], radius, tex, opts)
     }
 
     pub fn paint_restore(
@@ -1318,27 +1278,53 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<Rect> {
-        let mut changes = Vec::new();
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy > radius * radius {
-                    continue;
-                }
-                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
-                    continue;
-                };
-                let old = self.d6m.owners[i];
-                let back = self.baseline[i];
-                if old == back {
-                    continue;
-                }
-                changes.push((i as u32, old, back));
-            }
-        }
-        if changes.is_empty() {
+        self.paint_many(None, &[(cx, cy)], radius, tex, opts)
+    }
+
+    pub fn paint_many(
+        &mut self,
+        target: Option<u32>,
+        points: &[(i32, i32)],
+        radius: i32,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<Rect> {
+        let n = self.d6m.provinces.len();
+        if target.is_some_and(|p| p as usize > n) {
             return None;
         }
-        let r = self.brush_rect(cx, cy, radius);
+        let mut changes = Vec::new();
+        let mut rect: Option<Rect> = None;
+        for &(cx, cy) in points {
+            let before = changes.len();
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > radius * radius {
+                        continue;
+                    }
+                    let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
+                        continue;
+                    };
+                    let old = self.d6m.owners[i];
+                    let new = match target {
+                        Some(p) => p as i16,
+                        None => self.baseline[i],
+                    };
+                    if old == new {
+                        continue;
+                    }
+                    changes.push((i as u32, old, new));
+                }
+            }
+            if changes.len() > before {
+                rect = union(rect, Some(self.brush_rect(cx, cy, radius)));
+            }
+        }
+        if points.len() > 1 {
+            changes.sort_unstable_by_key(|c| c.0);
+            changes.dedup_by_key(|c| c.0);
+        }
+        let r = rect?;
         let step = Edit {
             owners: changes,
             rect: Some(r),
@@ -1351,7 +1337,11 @@ impl PlaneDoc {
         } else {
             self.redo.clear();
             self.undo.push(Edit {
-                label: "Remove area".to_string(),
+                label: if target.is_some() {
+                    "Paint area".to_string()
+                } else {
+                    "Remove area".to_string()
+                },
                 ..step
             });
         }
@@ -1954,10 +1944,16 @@ impl PlaneDoc {
             }
         }
         if !e.owners.is_empty() {
+            let w = self.d6m.width;
+            let mut rescan_all = self.rendered.bboxes.len() != self.flags.len();
+            let mut shrunk: Vec<usize> = Vec::new();
             for k in order(e.owners.len()) {
                 let (i, old, new) = e.owners[k];
                 let v = if reverse { old } else { new };
                 let prev = self.d6m.owners[i as usize];
+                if prev == v {
+                    continue;
+                }
                 if prev > 0 && (prev as usize) < self.pixel_counts.len() {
                     self.pixel_counts[prev as usize] -= 1;
                 }
@@ -1965,9 +1961,42 @@ impl PlaneDoc {
                     self.pixel_counts[v as usize] += 1;
                 }
                 self.d6m.owners[i as usize] = v;
+                if rescan_all {
+                    continue;
+                }
+                let (x, y) = (i as i32 % w, i as i32 / w);
+                let (vi, pi) = (v.max(0) as usize, prev.max(0) as usize);
+                if vi == pi {
+                    continue;
+                }
+                match self.rendered.bboxes.get_mut(vi) {
+                    Some(b) => {
+                        b[0] = b[0].min(x);
+                        b[1] = b[1].max(x);
+                        b[2] = b[2].min(y);
+                        b[3] = b[3].max(y);
+                    }
+                    None => rescan_all = true,
+                }
+                match self.rendered.bboxes.get(pi) {
+                    Some(b) => {
+                        if x == b[0] || x == b[1] || y == b[2] || y == b[3] {
+                            shrunk.push(pi);
+                        }
+                    }
+                    None => rescan_all = true,
+                }
             }
             self.owners_changed = true;
-            self.rendered.bboxes = province_bboxes(&self.plane());
+            if rescan_all {
+                self.rendered.bboxes = province_bboxes(&self.plane());
+            } else {
+                shrunk.sort_unstable();
+                shrunk.dedup();
+                for p in shrunk {
+                    self.rescan_bbox(p);
+                }
+            }
         }
         for c in &e.map {
             match c {
@@ -2074,11 +2103,67 @@ impl PlaneDoc {
         Some(label)
     }
 
+    fn rescan_bbox(&mut self, p: usize) {
+        let Some(&b) = self.rendered.bboxes.get(p) else {
+            return;
+        };
+        if b[1] < 0 || b[3] < 0 {
+            return;
+        }
+        let w = self.d6m.width;
+        let owners = &self.d6m.owners;
+        let mut n = [32001, -1, 32001, -1];
+        for y in b[2]..=b[3] {
+            let row = (y * w) as usize;
+            let line = &owners[row + b[0] as usize..=row + b[1] as usize];
+            let Some(first) = line.iter().position(|&o| o as usize == p) else {
+                continue;
+            };
+            let last = line.iter().rposition(|&o| o as usize == p).unwrap_or(first);
+            n[0] = n[0].min(b[0] + first as i32);
+            n[1] = n[1].max(b[0] + last as i32);
+            n[2] = n[2].min(y);
+            n[3] = n[3].max(y);
+        }
+        self.rendered.bboxes[p] = n;
+    }
+
     pub fn rerender(&mut self, tex: &TexSet, opts: &Options) {
         let rect = Rect::full(self.d6m.width, self.d6m.height);
         let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
         r.render(&self.plane(), tex, opts, rect);
         self.rendered = r;
+    }
+
+    pub fn rerender_quick(&mut self, tex: &TexSet, opts: &Options) {
+        let rect = Rect::full(self.d6m.width, self.d6m.height);
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.render_quick(&self.plane(), tex, opts, rect);
+        self.rendered = r;
+    }
+
+    pub fn rerender_ground(&mut self, tex: &TexSet, opts: &Options) {
+        let rect = Rect::full(self.d6m.width, self.d6m.height);
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.render_ground(&self.plane(), tex, opts, rect);
+        self.rendered = r;
+    }
+
+    pub fn refresh_decor_full(&mut self, tex: &TexSet, opts: &Options) {
+        let rect = Rect::full(self.d6m.width, self.d6m.height);
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.refresh_decor(&self.plane(), tex, opts, rect);
+        self.rendered = r;
+    }
+
+    pub fn set_capitals(&mut self, on: bool) {
+        let mut r = std::mem::replace(&mut self.rendered, Rendered::empty());
+        r.set_capitals(&self.plane(), on);
+        self.rendered = r;
+    }
+
+    pub fn decor_stale(&self) -> bool {
+        self.rendered.decor_stale || self.rendered.decor.len() != self.rendered.rgba.len()
     }
 
     pub fn area_warning(&self) -> Option<String> {

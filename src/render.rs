@@ -911,6 +911,13 @@ pub fn relief_rows(p: &Plane, heights: &[f32], rect: Rect, lo: f32, hi: f32, out
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DecorPass {
+    Scatter,
+    Redraw,
+    Keep,
+}
+
 pub struct Rendered {
     pub w: i32,
     pub h: i32,
@@ -923,6 +930,9 @@ pub struct Rendered {
     pub sprites: Vec<Vec<Sprite>>,
     pub mountains: Vec<Vec<Sprite>>,
     pub touched: Rect,
+    pub decor_stale: bool,
+    pub capitals_on: bool,
+    pub capital_backup: Vec<[u8; 4]>,
 }
 
 impl Rendered {
@@ -939,6 +949,9 @@ impl Rendered {
             sprites: Vec::new(),
             mountains: Vec::new(),
             touched: Rect::full(0, 0),
+            decor_stale: true,
+            capitals_on: false,
+            capital_backup: Vec::new(),
         }
     }
 
@@ -956,6 +969,9 @@ impl Rendered {
             sprites: Vec::new(),
             mountains: Vec::new(),
             touched: Rect::full(p.w, p.h),
+            decor_stale: true,
+            capitals_on: false,
+            capital_backup: Vec::new(),
         };
         r.render(p, tex, opts, Rect::full(p.w, p.h));
         r
@@ -966,11 +982,52 @@ impl Rendered {
     }
 
     pub fn render(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
-        self.render_with(p, tex, opts, rect, true);
+        self.render_with(p, tex, opts, rect, DecorPass::Scatter);
     }
 
     pub fn render_quick(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
-        self.render_with(p, tex, opts, rect, false);
+        self.render_with(p, tex, opts, rect, DecorPass::Redraw);
+    }
+
+    pub fn render_ground(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
+        self.render_with(p, tex, opts, rect, DecorPass::Keep);
+    }
+
+    pub fn set_capitals(&mut self, p: &Plane, on: bool) {
+        let none = Rect {
+            x0: 0,
+            y0: 0,
+            x1: -1,
+            y1: -1,
+        };
+        self.apply_capitals(p, on, none);
+    }
+
+    fn apply_capitals(&mut self, p: &Plane, on: bool, fresh: Rect) {
+        let w = self.w;
+        let h = self.h;
+        if self.capital_backup.len() != p.capitals.len() {
+            self.capital_backup.resize(p.capitals.len(), [0; 4]);
+        }
+        const WHITE: [u8; 4] = [255, 255, 255, 255];
+        for (k, &(x, y)) in p.capitals.iter().enumerate() {
+            let (x, y) = (x as i32, y as i32);
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            let o = ((y * w + x) * 4) as usize;
+            let inside = x >= fresh.x0 && x <= fresh.x1 && y >= fresh.y0 && y <= fresh.y1;
+            let px: [u8; 4] = self.rgba[o..o + 4].try_into().unwrap_or(WHITE);
+            if on {
+                if inside || px != WHITE {
+                    self.capital_backup[k] = px;
+                    self.rgba[o..o + 4].copy_from_slice(&WHITE);
+                }
+            } else if !inside && px == WHITE {
+                self.rgba[o..o + 4].copy_from_slice(&self.capital_backup[k]);
+            }
+        }
+        self.capitals_on = on;
     }
 
     pub fn refresh_decor(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
@@ -985,7 +1042,14 @@ impl Rendered {
         }
     }
 
-    fn render_with(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect, scatter: bool) {
+    fn render_with(
+        &mut self,
+        p: &Plane,
+        tex: &TexSet,
+        opts: &Options,
+        rect: Rect,
+        pass: DecorPass,
+    ) {
         if rect.is_empty() {
             return;
         }
@@ -1021,9 +1085,6 @@ impl Rendered {
             draw_border_rows(p, &self.mask, self.width, 15, inner, &mut self.rgba);
             draw_border_rows(p, &self.mask, self.width, 30, inner, &mut self.rgba);
         }
-        if opts.capitals {
-            mark_capitals(p, &mut self.rgba);
-        }
         hide_unknown_rows(p, tex, inner, &mut self.rgba);
         if opts.edge_fade {
             edge_fade_rows(p, inner, &mut self.rgba);
@@ -1031,10 +1092,13 @@ impl Rendered {
         if opts.grey_no_start {
             grey_no_start_rows(p, inner, &mut self.rgba);
         }
+        self.apply_capitals(p, opts.capitals, inner);
         self.touched = inner;
-        if opts.decor {
+        if !opts.decor {
+            self.decor_stale = true;
+        } else if pass != DecorPass::Keep {
             let full = rect.x0 <= 0 && rect.y0 <= 0 && rect.x1 >= p.w - 1 && rect.y1 >= p.h - 1;
-            if scatter || full || self.decor.len() != (p.w * p.h * 4) as usize {
+            if pass == DecorPass::Scatter || full || self.decor.len() != (p.w * p.h * 4) as usize {
                 self.decorate(p, tex, inner, full, opts.winter);
             } else {
                 self.redraw_decor(p, tex, inner);
@@ -1182,13 +1246,28 @@ impl Rendered {
             self.mountains[i] = rocks;
         }
         let redraw = redraw.clamp_to(p.w, p.h);
-        let mut all: Vec<Sprite> = Vec::with_capacity(self.sprite_count());
+        let (dx, dy) = (if p.hwrap { p.w } else { 0 }, if p.vwrap { p.h } else { 0 });
+        let mut near: Vec<Sprite> = Vec::new();
         for v in self.sprites.iter().chain(self.mountains.iter()) {
-            all.extend_from_slice(v);
+            for s in v {
+                let r = s.rect();
+                let wide = Rect {
+                    x0: r.x0 - dx,
+                    y0: r.y0 - dy,
+                    x1: r.x1 + dx,
+                    y1: r.y1 + dy,
+                };
+                if wide.intersects(redraw) {
+                    near.push(*s);
+                }
+            }
         }
-        decor::order(&mut all);
-        decor::draw_sprites(p, tex, &all, redraw, &mut self.decor);
+        decor::order(&mut near);
+        decor::draw_sprites(p, tex, &near, redraw, &mut self.decor);
         self.touched = self.touched.union(redraw).clamp_to(p.w, p.h);
+        if full {
+            self.decor_stale = false;
+        }
     }
 
     fn dirtify(&mut self, p: &Plane, rect: Rect, season: bool) {
@@ -1254,4 +1333,126 @@ pub fn flip_to_top_down(w: i32, h: i32, rgba: &[u8]) -> Vec<u8> {
         out[y * stride..(y + 1) * stride].copy_from_slice(&rgba[src..src + stride]);
     }
     out
+}
+
+pub fn selection_rows(p: &Plane, prov: u32, rect: Rect, out: &mut [u8]) {
+    let (w, h) = (p.w, p.h);
+    let rect = rect.clamp_to(w, h);
+    if rect.is_empty() {
+        return;
+    }
+    let owners = p.owners;
+    let (hw, vw) = (p.hwrap, p.vwrap);
+    let inside = |x: i32, y: i32| {
+        let x = if hw { x.rem_euclid(w) } else { x };
+        let y = if vw { y.rem_euclid(h) } else { y };
+        x >= 0 && y >= 0 && x < w && y < h && owners[(y * w + x) as usize] as u32 == prov
+    };
+    const RING: [(i32, i32); 12] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-2, 0),
+        (2, 0),
+        (0, -2),
+        (0, 2),
+        (-1, -1),
+        (1, 1),
+        (-1, 1),
+        (1, -1),
+    ];
+    for y in rect.y0..=rect.y1 {
+        for x in rect.x0..=rect.x1 {
+            let i = ((y * w + x) * 4) as usize;
+            if !inside(x, y) {
+                out[i..i + 4].fill(0);
+                continue;
+            }
+            let edge = RING.iter().any(|&(dx, dy)| !inside(x + dx, y + dy));
+            let (c, a) = if edge {
+                (crate::theme::SELECT_EDGE, 235u8)
+            } else {
+                (crate::theme::SELECT_FILL, 46u8)
+            };
+            out[i] = c[0];
+            out[i + 1] = c[1];
+            out[i + 2] = c[2];
+            out[i + 3] = a;
+        }
+    }
+}
+
+pub struct Thumb {
+    pub w: usize,
+    pub h: usize,
+    pub k: usize,
+    pub rgba: Vec<u8>,
+}
+
+pub fn thumbnail(
+    r: &Rendered,
+    decor: bool,
+    max_w: usize,
+    prev: Option<Thumb>,
+    dirty: Option<Rect>,
+) -> Thumb {
+    let (w, h) = (r.w as usize, r.h as usize);
+    let k = w.div_ceil(max_w.max(1)).max(1);
+    let (ow, oh) = ((w / k).max(1), (h / k).max(1));
+    let decor = if decor && r.decor.len() == w * h * 4 {
+        Some(&r.decor)
+    } else {
+        None
+    };
+    let map = &r.rgba;
+    let n = (k * k) as u32;
+    let (mut out, cells) = match (prev, dirty) {
+        (Some(t), Some(d)) if t.w == ow && t.h == oh && t.k == k => {
+            let cx0 = (d.x0.max(0) as usize / k).min(ow - 1);
+            let cx1 = (d.x1.max(0) as usize / k).min(ow - 1);
+            let cy0 = (d.y0.max(0) as usize / k).min(oh - 1);
+            let cy1 = (d.y1.max(0) as usize / k).min(oh - 1);
+            (t.rgba, (cx0, cy0, cx1, cy1))
+        }
+        _ => (vec![0u8; ow * oh * 4], (0, 0, ow - 1, oh - 1)),
+    };
+    let (cx0, cy0, cx1, cy1) = cells;
+    for oy in cy0..=cy1 {
+        for ox in cx0..=cx1 {
+            let mut acc = [0u32; 3];
+            for yy in 0..k {
+                let row = ((oy * k + yy) * w + ox * k) * 4;
+                for xx in 0..k {
+                    let i = row + xx * 4;
+                    let ma = map[i + 3] as u32;
+                    let (mut cr, mut cg, mut cb) = (
+                        map[i] as u32 * ma / 255,
+                        map[i + 1] as u32 * ma / 255,
+                        map[i + 2] as u32 * ma / 255,
+                    );
+                    if let Some(d) = decor {
+                        let da = d[i + 3] as u32;
+                        cr = cr * (255 - da) / 255 + d[i] as u32;
+                        cg = cg * (255 - da) / 255 + d[i + 1] as u32;
+                        cb = cb * (255 - da) / 255 + d[i + 2] as u32;
+                    }
+                    acc[0] += cr;
+                    acc[1] += cg;
+                    acc[2] += cb;
+                }
+            }
+            let o = (oy * ow + ox) * 4;
+            out[o] = (acc[0] / n).min(255) as u8;
+            out[o + 1] = (acc[1] / n).min(255) as u8;
+            out[o + 2] = (acc[2] / n).min(255) as u8;
+            out[o + 3] = 255;
+        }
+    }
+    Thumb {
+        w: ow,
+        h: oh,
+        k,
+        rgba: out,
+    }
 }
