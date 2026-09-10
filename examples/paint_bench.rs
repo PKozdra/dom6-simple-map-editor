@@ -53,7 +53,8 @@ fn largest_province(doc: &PlaneDoc) -> u32 {
 
 fn selection_pixels(doc: &PlaneDoc, prov: u32, out: &mut [u8]) -> Option<Rect> {
     let r = doc.bbox(prov)?;
-    render::selection_rows(&doc.plane(), prov, r, out);
+    let full = Rect::full(doc.d6m.width, doc.d6m.height);
+    render::selection_rows(&doc.plane(), prov, r, full, out);
     Some(r)
 }
 
@@ -160,7 +161,13 @@ fn main() {
         let t = Instant::now();
         if batched {
             if let Some(r) = acc {
-                render::selection_rows(&doc.plane(), prov, r.expand(2, w, h), &mut overlay);
+                render::selection_rows(
+                    &doc.plane(),
+                    prov,
+                    r.expand(2, w, h),
+                    Rect::full(w, h),
+                    &mut overlay,
+                );
             }
         } else {
             for _ in 0..points.len() {

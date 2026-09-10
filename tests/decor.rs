@@ -31,6 +31,7 @@ struct World {
     w: i32,
     h: i32,
     heights: Vec<f32>,
+    stored: Vec<i16>,
     owners: Vec<i16>,
     flags: Vec<u64>,
     capitals: Vec<(i16, i16)>,
@@ -50,10 +51,12 @@ impl World {
                 heights.push(100.0);
             }
         }
+        let stored = heights.iter().map(|&h| (h * 16.0) as i16).collect();
         World {
             w,
             h,
             heights,
+            stored,
             owners,
             flags: vec![0, left, right],
             capitals: vec![(40, 60), (120, 60)],
@@ -66,7 +69,7 @@ impl World {
         Plane {
             w: self.w,
             h: self.h,
-            heights: &self.heights,
+            heights: &self.stored,
             owners: &self.owners,
             flags: &self.flags,
             scale: 30.0,

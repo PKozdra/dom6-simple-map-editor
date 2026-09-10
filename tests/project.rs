@@ -225,7 +225,6 @@ fn removing_a_river_lifts_its_trench_and_repair_fixes_scars() {
     }
     for &i in &scarred {
         doc.d6m.heights[i] = -STORED_LIMIT;
-        doc.heights[i] = -2000.0;
     }
     assert_eq!(doc.scar_count(), scarred.len());
     assert!(doc.set_spec(1, 2, 0, &t, &opts));

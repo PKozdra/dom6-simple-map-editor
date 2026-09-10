@@ -11,7 +11,7 @@ pub const EDGE_FADE: i32 = 25;
 pub struct Plane<'a> {
     pub w: i32,
     pub h: i32,
-    pub heights: &'a [f32],
+    pub heights: &'a [i16],
     pub owners: &'a [i16],
     pub flags: &'a [u64],
     pub scale: f32,
@@ -993,6 +993,11 @@ impl Rendered {
         self.render_with(p, tex, opts, rect, DecorPass::Keep);
     }
 
+    pub fn drop_decor(&mut self) {
+        self.decor = Vec::new();
+        self.decor_stale = true;
+    }
+
     pub fn set_capitals(&mut self, p: &Plane, on: bool) {
         let none = Rect {
             x0: 0,
@@ -1062,7 +1067,9 @@ impl Rendered {
         for y in reach.y0..=reach.y1 {
             let row = (y * p.w) as usize;
             let (a, b) = (row + reach.x0 as usize, row + reach.x1 as usize + 1);
-            self.carved[a..b].copy_from_slice(&p.heights[a..b]);
+            for (dst, &src) in self.carved[a..b].iter_mut().zip(&p.heights[a..b]) {
+                *dst = crate::d6m::units_from_stored(src);
+            }
         }
         if opts.rivers {
             let within = if full { None } else { Some(reach) };
@@ -1335,12 +1342,19 @@ pub fn flip_to_top_down(w: i32, h: i32, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn selection_rows(p: &Plane, prov: u32, rect: Rect, out: &mut [u8]) {
+pub fn selection_rows(p: &Plane, prov: u32, rect: Rect, dst: Rect, out: &mut [u8]) {
     let (w, h) = (p.w, p.h);
-    let rect = rect.clamp_to(w, h);
+    let rect = Rect {
+        x0: rect.x0.max(dst.x0),
+        y0: rect.y0.max(dst.y0),
+        x1: rect.x1.min(dst.x1),
+        y1: rect.y1.min(dst.y1),
+    }
+    .clamp_to(w, h);
     if rect.is_empty() {
         return;
     }
+    let dw = (dst.x1 - dst.x0 + 1) as usize;
     let owners = p.owners;
     let (hw, vw) = (p.hwrap, p.vwrap);
     let inside = |x: i32, y: i32| {
@@ -1364,7 +1378,7 @@ pub fn selection_rows(p: &Plane, prov: u32, rect: Rect, out: &mut [u8]) {
     ];
     for y in rect.y0..=rect.y1 {
         for x in rect.x0..=rect.x1 {
-            let i = ((y * w + x) * 4) as usize;
+            let i = ((y - dst.y0) as usize * dw + (x - dst.x0) as usize) * 4;
             if !inside(x, y) {
                 out[i..i + 4].fill(0);
                 continue;

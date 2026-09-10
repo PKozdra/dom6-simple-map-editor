@@ -20,10 +20,17 @@ fn flat_textures() -> TexSet {
     TexSet::from_images(imgs)
 }
 
+fn stored(units: &[f32]) -> Vec<i16> {
+    units
+        .iter()
+        .map(|&u| dom6_simple_map_editor::d6m::stored_from_units(u))
+        .collect()
+}
+
 fn plane<'a>(
     w: i32,
     h: i32,
-    heights: &'a [f32],
+    heights: &'a [i16],
     owners: &'a [i16],
     flags: &'a [u64],
     rivers: &'a [(u32, u32)],
@@ -74,7 +81,7 @@ fn water_bands_follow_depth() {
     let tex = flat_textures();
     let w = 8;
     let h = 1;
-    let heights: Vec<f32> = vec![5.0, -1.0, -9.9, -10.0, -30.0, -33.0, -36.0, -100.0];
+    let heights = stored(&[5.0, -1.0, -9.9, -10.0, -30.0, -33.0, -36.0, -100.0]);
     let owners: Vec<i16> = vec![1; 8];
     let flags = vec![0u64, SEA];
     let p = plane(w, h, &heights, &owners, &flags, &[]);
@@ -111,7 +118,7 @@ fn water_bands_follow_depth() {
 #[test]
 fn unowned_pixels_stay_transparent_and_gorge_darkens() {
     let tex = flat_textures();
-    let heights = vec![-20.0f32, -20.0, -20.0];
+    let heights = stored(&[-20.0, -20.0, -20.0]);
     let owners = vec![0i16, 1, 2];
     let flags = vec![0u64, SEA, SEA | HIGHLAND];
     let p = plane(3, 1, &heights, &owners, &flags, &[]);
@@ -145,7 +152,7 @@ fn rivers_carve_only_land_between_the_pair() {
             owners[y * 6 + x] = if x < 3 { 1 } else { 2 };
         }
     }
-    let heights = vec![20.0f32; 36];
+    let heights = stored(&[20.0; 36]);
     let flags = vec![0u64, 0, 0];
     let rivers = vec![(1u32, 2u32)];
     let p = plane(w, h, &heights, &owners, &flags, &rivers);
@@ -181,7 +188,7 @@ fn borders_brighten_the_seam() {
             owners[y * 12 + x] = if x < 6 { 1 } else { 2 };
         }
     }
-    let heights = vec![20.0f32; 48];
+    let heights = stored(&[20.0; 48]);
     let flags = vec![0u64, 0, 0];
     let p = plane(w, h, &heights, &owners, &flags, &[]);
     let base = Options {
@@ -226,7 +233,8 @@ fn partial_rerender_matches_full() {
     }
     let flags = vec![0u64; 13];
     let opts = Options::default();
-    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let hs = stored(&heights);
+    let p = plane(w, h, &hs, &owners, &flags, &[]);
     let mut r = Rendered::new(&p, &tex, &opts);
     let mut heights2 = heights.clone();
     for i in 0..heights2.len() {
@@ -234,7 +242,8 @@ fn partial_rerender_matches_full() {
             heights2[i] = -40.0;
         }
     }
-    let p2 = plane(w, h, &heights2, &owners, &flags, &[]);
+    let hs2 = stored(&heights2);
+    let p2 = plane(w, h, &hs2, &owners, &flags, &[]);
     r.render(
         &p2,
         &tex,
@@ -278,7 +287,8 @@ fn winter_repaints_land_and_shallow_water() {
     let heights: Vec<f32> = vec![5.0, 5.0, 5.0, -1.0, -50.0, -50.0];
     let owners: Vec<i16> = vec![1, 2, 3, 4, 4, 5];
     let flags = vec![0u64, 0, FARM, WARMER, FRESH_WATER, SEA | DEEP_SEA];
-    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let hs = stored(&heights);
+    let p = plane(w, h, &hs, &owners, &flags, &[]);
     let opts = Options {
         rivers: false,
         borders: false,
@@ -326,7 +336,8 @@ fn dirt_darkens_land_and_leaves_unowned_alone() {
         .collect();
     let owners: Vec<i16> = (0..w * h).map(|i| if i % w < 4 { 0 } else { 1 }).collect();
     let flags = vec![0u64, 0];
-    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let hs = stored(&heights);
+    let p = plane(w, h, &hs, &owners, &flags, &[]);
     let base = Options {
         rivers: false,
         borders: false,
@@ -365,7 +376,8 @@ fn dirt_partial_rerender_matches_full() {
     let heights: Vec<f32> = vec![20.0; (w * h) as usize];
     let owners: Vec<i16> = vec![1; (w * h) as usize];
     let flags = vec![0u64, 0];
-    let p = plane(w, h, &heights, &owners, &flags, &[]);
+    let hs = stored(&heights);
+    let p = plane(w, h, &hs, &owners, &flags, &[]);
     let opts = Options {
         rivers: false,
         borders: false,

@@ -42,6 +42,9 @@ pub const REPO_URL: &str = "https://github.com/PKozdra/dom6-simple-map-editor";
 struct TileGrid {
     w: usize,
     h: usize,
+    ox: usize,
+    oy: usize,
+    map_h: usize,
     cols: usize,
     rows: usize,
     handles: Vec<Option<egui::TextureHandle>>,
@@ -52,11 +55,18 @@ const FULL_TILE: [usize; 4] = [0, 0, usize::MAX, usize::MAX];
 
 impl TileGrid {
     fn new(w: i32, h: i32) -> TileGrid {
-        let cols = (w as usize).div_ceil(TILE);
-        let rows = (h as usize).div_ceil(TILE);
+        TileGrid::new_at(0, 0, w as usize, h as usize, h as usize)
+    }
+
+    fn new_at(ox: usize, oy: usize, w: usize, h: usize, map_h: usize) -> TileGrid {
+        let cols = w.div_ceil(TILE).max(1);
+        let rows = h.div_ceil(TILE).max(1);
         TileGrid {
-            w: w as usize,
-            h: h as usize,
+            w,
+            h,
+            ox,
+            oy,
+            map_h,
             cols,
             rows,
             handles: (0..cols * rows).map(|_| None).collect(),
@@ -65,11 +75,18 @@ impl TileGrid {
     }
 
     fn mark(&mut self, r: Rect) {
-        let h = self.h as i32;
-        let sy0 = (h - 1 - r.y1).max(0) as usize;
-        let sy1 = ((h - 1 - r.y0).max(0) as usize).min(self.h.saturating_sub(1));
-        let sx0 = r.x0.max(0) as usize;
-        let sx1 = (r.x1.max(0) as usize).min(self.w.saturating_sub(1));
+        let mh = self.map_h as i64;
+        let sy0 = (mh - 1 - r.y1 as i64).max(0) - self.oy as i64;
+        let sy1 = (mh - 1 - r.y0 as i64).max(0) - self.oy as i64;
+        let sx0 = (r.x0 as i64).max(0) - self.ox as i64;
+        let sx1 = (r.x1 as i64).max(0) - self.ox as i64;
+        let sx0 = sx0.max(0) as usize;
+        let sy0 = sy0.max(0) as usize;
+        if sx1 < 0 || sy1 < 0 {
+            return;
+        }
+        let sx1 = (sx1 as usize).min(self.w.saturating_sub(1));
+        let sy1 = (sy1 as usize).min(self.h.saturating_sub(1));
         if sx0 > sx1 || sy0 > sy1 {
             return;
         }
@@ -145,39 +162,63 @@ impl TileGrid {
 }
 
 struct Overlay {
+    map_w: i32,
+    map_h: i32,
+    rect: Option<Rect>,
     rgba: Vec<u8>,
-    tiles: TileGrid,
-    painted: Option<Rect>,
+    tiles: Option<TileGrid>,
 }
 
 impl Overlay {
     fn new(w: i32, h: i32) -> Overlay {
         Overlay {
-            rgba: vec![0u8; (w * h * 4) as usize],
-            tiles: TileGrid::new(w, h),
-            painted: None,
+            map_w: w,
+            map_h: h,
+            rect: None,
+            rgba: Vec::new(),
+            tiles: None,
         }
     }
 
     fn clear(&mut self) {
-        if let Some(r) = self.painted.take() {
-            let w = self.tiles.w;
-            for y in r.y0..=r.y1 {
-                let row = y as usize * w;
-                self.rgba[(row + r.x0 as usize) * 4..(row + r.x1 as usize + 1) * 4].fill(0);
+        self.rect = None;
+        self.rgba = Vec::new();
+        self.tiles = None;
+    }
+
+    fn alloc(&mut self, want: Rect) {
+        let span = (want.x1 - want.x0 + 1).max(want.y1 - want.y0 + 1);
+        let r = want.expand((span / 8).max(32), self.map_w, self.map_h);
+        let bw = (r.x1 - r.x0 + 1) as usize;
+        let bh = (r.y1 - r.y0 + 1) as usize;
+        let mut buf = vec![0u8; bw * bh * 4];
+        if let Some(old) = self.rect {
+            let ow = (old.x1 - old.x0 + 1) as usize;
+            for y in old.y0..=old.y1 {
+                let src = (y - old.y0) as usize * ow * 4;
+                let dst = ((y - r.y0) as usize * bw + (old.x0 - r.x0) as usize) * 4;
+                buf[dst..dst + ow * 4].copy_from_slice(&self.rgba[src..src + ow * 4]);
             }
-            self.tiles.mark(r);
         }
+        self.rect = Some(r);
+        self.rgba = buf;
+        self.tiles = Some(TileGrid::new_at(
+            r.x0 as usize,
+            (self.map_h - 1 - r.y1) as usize,
+            bw,
+            bh,
+            self.map_h as usize,
+        ));
     }
 
     fn paint_selection(&mut self, doc: &PlaneDoc, prov: u32) {
         self.clear();
-        let Some(r) = doc.bbox(prov) else {
+        let Some(b) = doc.bbox(prov) else {
             return;
         };
-        crate::render::selection_rows(&doc.plane(), prov, r, &mut self.rgba);
-        self.painted = Some(r);
-        self.tiles.mark(r);
+        self.alloc(b);
+        let dst = self.rect.unwrap_or(b);
+        crate::render::selection_rows(&doc.plane(), prov, b, dst, &mut self.rgba);
     }
 
     fn paint_selection_in(&mut self, doc: &PlaneDoc, prov: u32, rect: Rect) {
@@ -194,9 +235,19 @@ impl Overlay {
         if r.is_empty() {
             return;
         }
-        crate::render::selection_rows(&doc.plane(), prov, r, &mut self.rgba);
-        self.painted = union(self.painted, Some(r));
-        self.tiles.mark(r);
+        let Some(cur) = self.rect else {
+            self.paint_selection(doc, prov);
+            return;
+        };
+        let inside = r.x0 >= cur.x0 && r.y0 >= cur.y0 && r.x1 <= cur.x1 && r.y1 <= cur.y1;
+        if !inside {
+            self.alloc(cur.union(r));
+        }
+        let dst = self.rect.unwrap_or(cur);
+        crate::render::selection_rows(&doc.plane(), prov, r, dst, &mut self.rgba);
+        if let Some(t) = &mut self.tiles {
+            t.mark(r);
+        }
     }
 }
 
@@ -1369,6 +1420,13 @@ impl App {
                 d.refresh_decor_full(&tex, &to);
                 decor_changed = true;
             }
+            if from.decor && !to.decor {
+                d.rendered.drop_decor();
+                let (dw, dh) = (d.width(), d.height());
+                if let Some(t) = self.decor_tiles.get_mut(i) {
+                    *t = TileGrid::new(dw, dh);
+                }
+            }
         }
         self.tex = tex;
         self.rendered_opts[i] = to;
@@ -2438,7 +2496,9 @@ impl App {
                     }
                     if let Some(o) = self.overlays.get_mut(active) {
                         let name = format!("sel{}", doc.index);
-                        o.tiles.upload(ctx, &o.rgba, &name, false);
+                        if let Some(t) = &mut o.tiles {
+                            t.upload(ctx, &o.rgba, &name, false);
+                        }
                     }
                 }
                 let painter = ui.painter_at(canvas);
@@ -2469,17 +2529,19 @@ impl App {
                     if self.opts.decor && !relief_shown {
                         layers.push(&self.decor_tiles[self.active]);
                     }
-                    layers.push(&self.overlays[self.active].tiles);
+                    if let Some(t) = &self.overlays[self.active].tiles {
+                        layers.push(t);
+                    }
                     for grid in layers {
                         for ty in 0..grid.rows {
                             for tx in 0..grid.cols {
                                 let Some(hnd) = &grid.handles[ty * grid.cols + tx] else {
                                     continue;
                                 };
-                                let x0 = (tx * TILE) as f32;
-                                let y0 = (ty * TILE) as f32;
-                                let tw = ((w as usize - tx * TILE).min(TILE)) as f32;
-                                let th = ((h as usize - ty * TILE).min(TILE)) as f32;
+                                let x0 = (grid.ox + tx * TILE) as f32;
+                                let y0 = (grid.oy + ty * TILE) as f32;
+                                let tw = (grid.w.saturating_sub(tx * TILE).min(TILE)) as f32;
+                                let th = (grid.h.saturating_sub(ty * TILE).min(TILE)) as f32;
                                 let mut mesh = egui::Mesh::with_texture(hnd.id());
                                 for shift in &shifts {
                                     let r = egui::Rect::from_min_max(

@@ -51,6 +51,8 @@ mod native {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", shown(dir)))
     }
 
+    pub fn release(_path: &Path) {}
+
     pub fn remove_file(path: &Path) -> Result<(), String> {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -128,6 +130,14 @@ mod web {
     pub fn put(path: &Path, bytes: Vec<u8>, handle: Option<JsValue>) {
         STORE.with(|s| {
             s.borrow_mut().insert(key(path), Entry { bytes, handle });
+        });
+    }
+
+    pub fn release(path: &Path) {
+        STORE.with(|s| {
+            if let Some(e) = s.borrow_mut().get_mut(&key(path)) {
+                e.bytes = Vec::new();
+            }
         });
     }
 

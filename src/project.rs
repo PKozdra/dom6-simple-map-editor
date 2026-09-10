@@ -108,7 +108,6 @@ pub struct PlaneDoc {
     pub map_path: Option<PathBuf>,
     pub d6m: D6m,
     pub map: Option<MapFile>,
-    pub heights: Vec<f32>,
     pub flags: Vec<u64>,
     pub names: Vec<String>,
     pub gates: Vec<i32>,
@@ -191,7 +190,6 @@ impl PlaneDoc {
             }
         }
         let capitals: Vec<(i16, i16)> = d6m.provinces.iter().map(|p| (p.x, p.y)).collect();
-        let heights = d6m.heights_f32();
         let mut pixel_counts = vec![0u32; n + 1];
         for &o in &d6m.owners {
             if o > 0 && (o as usize) <= n {
@@ -204,7 +202,6 @@ impl PlaneDoc {
             map_path,
             d6m,
             map,
-            heights,
             flags,
             names,
             gates,
@@ -226,6 +223,10 @@ impl PlaneDoc {
         doc.baseline = doc.d6m.owners.clone();
         doc.rebuild_links();
         doc.rendered = Rendered::new(&doc.plane(), tex, opts);
+        crate::io::release(&doc.d6m_path);
+        if let Some(m) = &doc.map_path {
+            crate::io::release(m);
+        }
         doc
     }
 
@@ -263,7 +264,7 @@ impl PlaneDoc {
         Plane {
             w: self.d6m.width,
             h: self.d6m.height,
-            heights: &self.heights,
+            heights: &self.d6m.heights,
             owners: &self.d6m.owners,
             flags: &self.flags,
             scale: self.d6m.map_scale(),
@@ -695,7 +696,7 @@ impl PlaneDoc {
                 if self.d6m.owners[i] as u32 != prov {
                     continue;
                 }
-                let h = self.heights[i];
+                let h = units_from_stored(self.d6m.heights[i]);
                 s.pixels += 1;
                 s.min = s.min.min(h);
                 s.max = s.max.max(h);
@@ -1085,7 +1086,12 @@ impl PlaneDoc {
             return Vec::new();
         }
         let scars: Vec<usize> = frontier.clone();
-        let mut work: Vec<f32> = self.heights.clone();
+        let mut work: Vec<f32> = self
+            .d6m
+            .heights
+            .iter()
+            .map(|&h| units_from_stored(h))
+            .collect();
         while !frontier.is_empty() {
             let mut next = Vec::new();
             let mut updates = Vec::new();
@@ -1183,7 +1189,6 @@ impl PlaneDoc {
             let changes = self.repair_in(full, |_| true);
             for &(i, _, new) in &changes {
                 self.d6m.heights[i as usize] = new;
-                self.heights[i as usize] = units_from_stored(new);
             }
             self.river_repair = changes;
             self.river_repair.len()
@@ -1193,7 +1198,6 @@ impl PlaneDoc {
             for &(i, old, new) in &changes {
                 if self.d6m.heights[i as usize] == new {
                     self.d6m.heights[i as usize] = old;
-                    self.heights[i as usize] = units_from_stored(old);
                     n += 1;
                 }
             }
@@ -1912,7 +1916,6 @@ impl PlaneDoc {
             let (i, old, new) = e.heights[k];
             let v = if reverse { old } else { new };
             self.d6m.heights[i as usize] = v;
-            self.heights[i as usize] = units_from_stored(v);
         }
         let mut renumbered = false;
         for c in &e.map {
@@ -2301,6 +2304,11 @@ impl Project {
             ));
         }
         if planes.is_empty() {
+            if crate::io::IS_WEB {
+                return Err(format!(
+                    "{base}.d6m is not open in the browser. Select the .d6m together with its .map in the file picker (Ctrl-click both), or open the .d6m now and the .map already picked will be used; choosing the maps folder first makes the editor read both files itself"
+                ));
+            }
             return Err(format!("no {}.d6m found in {}", base, dir.display()));
         }
         Ok(Project {

@@ -67,11 +67,10 @@ fn main() {
             rivers.push((a, b));
         }
     }
-    let heights = d6m.heights_f32();
     let plane = Plane {
         w: d6m.width,
         h: d6m.height,
-        heights: &heights,
+        heights: &d6m.heights,
         owners: &d6m.owners,
         flags: &flags,
         scale: d6m.map_scale(),
