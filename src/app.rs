@@ -38,6 +38,9 @@ const TILE: usize = 1024;
 
 const ICON_CELL: f32 = 48.0;
 pub const REPO_URL: &str = "https://github.com/PKozdra/dom6-simple-map-editor";
+pub const ILLWINTER_URL: &str = "https://www.illwinter.com/";
+pub const STEAM_URL: &str =
+    "https://store.steampowered.com/app/2511500/Dominions_6__Rise_of_the_Pantokrator/";
 
 struct TileGrid {
     w: usize,
@@ -647,6 +650,7 @@ pub struct App {
     placing_new: bool,
     icons: Vec<(u16, egui::TextureHandle)>,
     github: Option<egui::TextureHandle>,
+    steam: Option<egui::TextureHandle>,
     flatten: bool,
     show_names: bool,
     custom: f32,
@@ -737,7 +741,16 @@ impl App {
             goto: 1,
             placing_new: false,
             icons: load_icons(&cc.egui_ctx),
-            github: load_github_mark(&cc.egui_ctx),
+            github: load_mark(
+                &cc.egui_ctx,
+                "github_mark",
+                include_bytes!("../assets/github.png"),
+            ),
+            steam: load_mark(
+                &cc.egui_ctx,
+                "steam_mark",
+                include_bytes!("../assets/steam.png"),
+            ),
             flatten: false,
             show_names: false,
             custom: -20.0,
@@ -2911,9 +2924,7 @@ impl App {
                     }))
                     .show_separator_line(false)
                     .show_inside(ui, |ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            github_link(ui, self.github.as_ref());
-                        });
+                        self.footer(ui);
                     });
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
@@ -2998,6 +3009,31 @@ impl App {
         });
     }
 
+    /// Right-aligned links to the game's store page and this repo, with the
+    /// fan-project disclaimer underneath. Each row gets a fixed height so the
+    /// bottom panel sizes to its content instead of centering in the leftover
+    /// space.
+    fn footer(&self, ui: &mut egui::Ui) {
+        let right = egui::Layout::right_to_left(egui::Align::Center);
+        let w = ui.available_width();
+        ui.allocate_ui_with_layout(Vec2::new(w, 20.0), right, |ui| {
+            ext_link(ui, self.github.as_ref(), "GitHub", REPO_URL);
+            ui.add_space(14.0);
+            ext_link(ui, self.steam.as_ref(), "Steam", STEAM_URL);
+        });
+        ui.add_space(3.0);
+        ui.allocate_ui_with_layout(Vec2::new(w, 15.0), right, |ui| {
+            ui.label(
+                egui::RichText::new("Unofficial fan-made project.")
+                    .size(12.0)
+                    .color(theme::INK_DIM),
+            );
+        });
+        ui.allocate_ui_with_layout(Vec2::new(w, 15.0), right, |ui| {
+            text_link(ui, "Support Illwinter Game Design", ILLWINTER_URL, 12.0);
+        });
+    }
+
     fn sheet_body(&mut self, ui: &mut egui::Ui, sheet: Sheet) {
         ui.spacing_mut().item_spacing = egui::vec2(10.0, 9.0);
         match sheet {
@@ -3006,9 +3042,7 @@ impl App {
                 ui.add_space(6.0);
                 self.settings_section(ui);
                 ui.add_space(6.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    github_link(ui, self.github.as_ref());
-                });
+                self.footer(ui);
             }
             Sheet::Tools => {
                 self.tools_section(ui);
@@ -4191,28 +4225,29 @@ pub fn default_maps_dir() -> Option<PathBuf> {
     crate::settings::game_maps_dir()
 }
 
-fn load_github_mark(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let img = decode_png(include_bytes!("../assets/github.png")).ok()?;
+fn load_mark(ctx: &egui::Context, name: &str, png: &[u8]) -> Option<egui::TextureHandle> {
+    let img = decode_png(png).ok()?;
     let ci = egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba);
     let opts = egui::TextureOptions {
         mipmap_mode: Some(egui::TextureFilter::Linear),
         ..egui::TextureOptions::LINEAR
     };
-    Some(ctx.load_texture("github_mark", ci, opts))
+    Some(ctx.load_texture(name, ci, opts))
 }
 
-fn github_link(ui: &mut egui::Ui, mark: Option<&egui::TextureHandle>) {
+/// Icon + label that opens `url` in a new tab. Tinted brass, ink when hovered.
+fn ext_link(ui: &mut egui::Ui, mark: Option<&egui::TextureHandle>, label: &str, url: &str) {
     let font = FontId::proportional(16.0);
     let galley = ui
         .painter()
-        .layout_no_wrap("GitHub".to_owned(), font, theme::INK);
+        .layout_no_wrap(label.to_owned(), font, theme::INK);
     let icon = 20.0;
     let gap = 6.0;
     let size = Vec2::new(icon + gap + galley.size().x, icon.max(galley.size().y));
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(REPO_URL);
+        .on_hover_text(url);
     let col = if resp.hovered() {
         theme::INK_HOT
     } else {
@@ -4237,7 +4272,27 @@ fn github_link(ui: &mut egui::Ui, mark: Option<&egui::TextureHandle>) {
     );
     painter.galley(text_pos, galley, col);
     if resp.clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(REPO_URL));
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+    }
+}
+
+/// Plain text that opens `url` in a new tab. Brass, ink when hovered.
+fn text_link(ui: &mut egui::Ui, label: &str, url: &str, size: f32) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), FontId::proportional(size), theme::INK);
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+    let resp = resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(url);
+    let col = if resp.hovered() {
+        theme::INK_HOT
+    } else {
+        theme::BRASS
+    };
+    ui.painter().galley(rect.min, galley, col);
+    if resp.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(url));
     }
 }
 
