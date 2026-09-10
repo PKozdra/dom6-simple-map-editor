@@ -2294,39 +2294,19 @@ impl App {
                         self.pending = Pending::Open(None);
                     }
                     let p = canvas.center();
-                    let (main, sub) = match (self.lay.compact(), crate::io::IS_WEB) {
-                        (true, true) => (
-                            "Tap here to open a map: pick its .d6m and .map together",
-                            None,
-                        ),
-                        (true, false) => ("Tap here to open a map, or use Generate", None),
-                        (false, true) => (
-                            "Drop a map folder here, or its .d6m and .map together",
-                            Some("Open map picks files; Choose folder lets the editor find the pair itself"),
-                        ),
-                        (false, false) => ("Drop a .d6m or .map here, or use Open map", None),
-                    };
-                    let main_pos = if sub.is_some() {
-                        p - Vec2::new(0.0, 12.0)
-                    } else {
-                        p
+                    let main = match (self.lay.compact(), crate::io::IS_WEB) {
+                        (true, true) => "Tap here to open a map: pick its .d6m and .map together",
+                        (true, false) => "Tap here to open a map, or use Generate",
+                        (false, true) => "Drop a map folder here, or its .d6m and .map together",
+                        (false, false) => "Drop a .d6m or .map here, or use Open map",
                     };
                     ui.painter().text(
-                        main_pos,
+                        p,
                         Align2::CENTER_CENTER,
                         main,
                         FontId::proportional(20.0),
                         theme::INK_DIM,
                     );
-                    if let Some(sub) = sub {
-                        ui.painter().text(
-                            p + Vec2::new(0.0, 16.0),
-                            Align2::CENTER_CENTER,
-                            sub,
-                            FontId::proportional(14.0),
-                            theme::INK_DIM,
-                        );
-                    }
                     return;
                 }
                 let size = canvas.size();
