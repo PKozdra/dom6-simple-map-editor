@@ -1,7 +1,5 @@
 # Dominions 6 Simple Map Editor (& Generator)
 
-Fan-made, unofficial. Not affiliated with or endorsed by Illwinter Game Design. The game itself is sold on [Steam](https://store.steampowered.com/app/2511500/Dominions_6__Rise_of_the_Pantokrator/).
-
 Edits `.d6m` maps for Dominions 6. The game's editor won't touch the height data, so this will have to do.
 
 Also allows to generate vanilla random game maps.
@@ -10,7 +8,7 @@ Also allows to generate vanilla random game maps.
 
 ## Run
 
-In the browser: https://pkozdra.github.io/dom6-simple-map-editor/ (Chrome or Edge can open the game's maps folder and save straight back into it; other browsers open files one by one and download the saved ones).
+In the browser: https://pkozdra.github.io/dom6-simple-map-editor/
 
 On the desktop, grab the exe from releases. Open a `.d6m` or `.map`, or drop one on the window, or:
 
