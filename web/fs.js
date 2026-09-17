@@ -214,6 +214,16 @@ export async function writeInDirectory(dir, name, bytes) {
   return handle;
 }
 
+export async function removeInDirectory(dir, name) {
+  try {
+    await ensureWritable(dir);
+    await dir.removeEntry(name);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 export async function readInDirectory(dir, name) {
   try {
     const handle = await dir.getFileHandle(name);

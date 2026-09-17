@@ -214,6 +214,19 @@ mod web {
         false
     }
 
+    pub fn files_in(dir: &Path) -> Vec<PathBuf> {
+        let d = key(dir);
+        let mut out: Vec<PathBuf> = STORE.with(|s| {
+            s.borrow()
+                .keys()
+                .filter(|k| k.parent().map(|p| p == d).unwrap_or(false))
+                .cloned()
+                .collect()
+        });
+        out.sort();
+        out
+    }
+
     pub fn copy(from: &Path, to: &Path) -> Result<(), String> {
         let bytes = read(from).map_err(|e| e.to_string())?;
         put(to, bytes, None);

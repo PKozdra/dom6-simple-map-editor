@@ -22,6 +22,8 @@ extern "C" {
     fn write_handle_js(handle: &JsValue, bytes: &[u8]) -> js_sys::Promise;
     #[wasm_bindgen(js_name = writeInDirectory)]
     fn write_in_directory_js(dir: &JsValue, name: &str, bytes: &[u8]) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = removeInDirectory)]
+    fn remove_in_directory_js(dir: &JsValue, name: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = readInDirectory)]
     fn read_in_directory_js(dir: &JsValue, name: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = listDirectory)]
@@ -649,6 +651,70 @@ fn file_name(path: &Path) -> String {
 
 pub fn download(name: &str, bytes: &[u8]) {
     download_js(name, bytes);
+}
+
+pub fn can_write_folder() -> bool {
+    io::dir().is_some()
+}
+
+pub fn persist_rename(write: Vec<PathBuf>, remove: Vec<String>, ctx: egui::Context) {
+    spawn_local(async move {
+        let Some(dir) = io::dir() else {
+            let files: Vec<(String, Vec<u8>)> = write
+                .iter()
+                .filter(|p| !file_name(p).ends_with(".bak"))
+                .filter_map(|p| io::read(p).ok().map(|b| (file_name(p), b)))
+                .collect();
+            let base = files
+                .iter()
+                .find(|(n, _)| n.to_ascii_lowercase().ends_with(".map"))
+                .and_then(|(n, _)| {
+                    Path::new(n)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+                .map(|stem| strip_plane_suffix(&stem).0)
+                .unwrap_or_else(|| "map".to_string());
+            let archive = format!("{base}.zip");
+            download_js(&archive, &crate::zipfile::build(&files));
+            push(
+                Event::Status(format!(
+                    "Downloaded {archive}: unpack it into a folder called {base} in the game's maps folder and delete the old files"
+                )),
+                &ctx,
+            );
+            return;
+        };
+        if let Err(e) = write_all_into(&dir, &write).await {
+            push(Event::Error(e), &ctx);
+            return;
+        }
+        let mut left = Vec::new();
+        for name in &remove {
+            let gone = JsFuture::from(remove_in_directory_js(&dir, name))
+                .await
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !gone {
+                left.push(name.clone());
+            }
+        }
+        let text = if left.is_empty() {
+            format!(
+                "Renamed {} files in {}",
+                remove.len(),
+                io::dir_name().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "Renamed the map, but these old files could not be deleted: {}",
+                left.join(", ")
+            )
+        };
+        push(Event::Status(text), &ctx);
+        list_directory(ctx);
+    });
 }
 
 async fn write_all_into(dir: &JsValue, paths: &[PathBuf]) -> Result<(), String> {

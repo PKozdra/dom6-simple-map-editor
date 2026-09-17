@@ -4380,6 +4380,12 @@ impl App {
                     ));
                     ui.add_space(4.0);
                     ui.label("Renaming moves every file of the map to the new name in the same folder, keeps the terrain and plane endings, and changes the title and picture lines inside each .map. The old .map stays beside it as .bak. Games already started on the old name will no longer find the map.");
+                    #[cfg(target_arch = "wasm32")]
+                    if crate::web::can_write_folder() {
+                        theme::dim(ui, "The browser writes the renamed files into the open folder and deletes the old ones; it may ask for permission to change the folder first.");
+                    } else {
+                        theme::dim(ui, "This browser cannot change files in the folder, so the renamed map downloads as a zip. Unpack it into a folder with the new name in the game's maps folder and delete the old one.");
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         theme::dim(ui, "New name");
@@ -4417,7 +4423,7 @@ impl App {
                 });
             });
         match action {
-            Some(0) => match rename_map(&ask) {
+            Some(0) => match rename_map(&ask, ctx) {
                 Ok(map) => {
                     self.open_as_it_is(&map);
                     self.status = format!("Renamed {} to {}; {}", ask.old, ask.draft, self.status);
@@ -4606,17 +4612,6 @@ fn look_label(look: crate::imagemap::Look) -> String {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn rename_needed(_path: &Path) -> Option<RenameAsk> {
-    None
-}
-
-#[cfg(target_arch = "wasm32")]
-fn rename_map(_ask: &RenameAsk) -> Result<PathBuf, String> {
-    Err("files cannot be renamed from the browser".to_owned())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn rename_needed(path: &Path) -> Option<RenameAsk> {
     let is_map = path
         .extension()
@@ -4646,8 +4641,7 @@ fn rename_needed(path: &Path) -> Option<RenameAsk> {
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn rename_map(ask: &RenameAsk) -> Result<PathBuf, String> {
+fn rename_plan(ask: &RenameAsk) -> crate::namefix::Plan {
     let dir = ask
         .map
         .parent()
@@ -4659,8 +4653,39 @@ fn rename_map(ask: &RenameAsk) -> Result<PathBuf, String> {
         .filter(|p| crate::io::exists(p))
         .collect();
     let files = crate::io::files_in(&dir);
-    let plan = crate::namefix::plan(&files, &maps, &ask.old, &ask.draft);
-    crate::namefix::apply(&plan)
+    crate::namefix::plan(&files, &maps, &ask.old, &ask.draft)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rename_map(ask: &RenameAsk, _ctx: &egui::Context) -> Result<PathBuf, String> {
+    crate::namefix::apply(&rename_plan(ask))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rename_map(ask: &RenameAsk, ctx: &egui::Context) -> Result<PathBuf, String> {
+    let plan = rename_plan(ask);
+    let first = crate::namefix::apply(&plan)?;
+    let mut write = Vec::new();
+    let mut remove = Vec::new();
+    for (from, to) in &plan.moves {
+        write.push(to.clone());
+        let bak = crate::project::backup_path(from);
+        if crate::io::exists(&bak) {
+            write.push(bak);
+        }
+        if let Some(n) = from.file_name() {
+            remove.push(n.to_string_lossy().into_owned());
+        }
+    }
+    for map in &plan.rewrite {
+        write.push(map.clone());
+        let bak = crate::project::backup_path(map);
+        if crate::io::exists(&bak) {
+            write.push(bak);
+        }
+    }
+    crate::web::persist_rename(write, remove, ctx.clone());
+    Ok(first)
 }
 
 fn terrain_tally(doc: &PlaneDoc) -> String {
