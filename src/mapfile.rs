@@ -345,7 +345,8 @@ impl MapFile {
     }
 
     pub fn renumber(&mut self, map: impl Fn(u32) -> u32) {
-        const FIRST: [&str; 16] = [
+        const FIRST: [&str; 17] = [
+            "#land",
             "#terrain",
             "#landname",
             "#gate",
@@ -471,6 +472,24 @@ impl MapFile {
 
     pub fn has_pb(&self) -> bool {
         self.pb_count > 0
+    }
+
+    pub fn pb_runs(&self) -> Vec<(i32, i32, i32, i32)> {
+        let mut runs = Vec::with_capacity(self.pb_count);
+        for line in &self.lines {
+            let Some(("#pb", rest)) = command_of(line) else {
+                continue;
+            };
+            let v: Vec<i32> = rest
+                .split_whitespace()
+                .take(4)
+                .filter_map(|a| a.parse().ok())
+                .collect();
+            if let [x, y, len, prov] = v[..] {
+                runs.push((x, y, len, prov));
+            }
+        }
+        runs
     }
 
     pub fn replace_pb(&mut self, w: i32, h: i32, owners: &[i16]) {

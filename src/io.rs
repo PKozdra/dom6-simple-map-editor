@@ -37,6 +37,59 @@ mod native {
         path.is_dir()
     }
 
+    pub fn files_in(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn maps_in(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                let map = p
+                    .extension()
+                    .map(|e| e.eq_ignore_ascii_case("map"))
+                    .unwrap_or(false);
+                let first = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| crate::mapfile::strip_plane_suffix(s).1 == 1)
+                    .unwrap_or(false);
+                map && first && p.is_file()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    pub fn maps_under(dir: &Path, depth: u32) -> Vec<std::path::PathBuf> {
+        let mut out = maps_in(dir);
+        if depth > 0 {
+            let mut subs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subs.sort();
+            for sub in subs {
+                out.extend(maps_under(&sub, depth - 1));
+            }
+        }
+        out
+    }
+
     pub fn copy(from: &Path, to: &Path) -> Result<(), String> {
         std::fs::copy(from, to)
             .map(|_| ())

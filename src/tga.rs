@@ -75,6 +75,31 @@ pub fn decode(b: &[u8]) -> Result<Image, String> {
     Ok(img)
 }
 
+pub fn depth(b: &[u8]) -> u8 {
+    match b.get(16) {
+        Some(&d) if d == 24 || d == 32 => d,
+        _ => 32,
+    }
+}
+
+pub fn encode_rgb_bottom_up(w: usize, h: usize, rgb: &[u8], bpp: u8) -> Vec<u8> {
+    let alpha = if bpp == 24 { 0 } else { 8 };
+    let per = if bpp == 24 { 3 } else { 4 };
+    let mut out = Vec::with_capacity(18 + w * h * per);
+    out.extend_from_slice(&[0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.push(if bpp == 24 { 24 } else { 32 });
+    out.push(alpha);
+    for p in rgb.chunks_exact(3) {
+        out.extend_from_slice(&[p[2], p[1], p[0]]);
+        if per == 4 {
+            out.push(255);
+        }
+    }
+    out
+}
+
 pub fn encode_rgba_bottom_up(img: &Image) -> Vec<u8> {
     let mut out = Vec::with_capacity(18 + img.w * img.h * 4);
     out.extend_from_slice(&[0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);

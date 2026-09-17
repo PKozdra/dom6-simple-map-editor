@@ -25,7 +25,9 @@ const KEY_HELP: &[(&[&str], &str)] = &[
 ];
 use crate::layout::{self, Kind, Layout, Sheet};
 use crate::mapfile::plane_file_name;
-use crate::project::{union, wrap_delta, wrap_point, FlagOp, HeightOp, PlaneDoc, Project};
+use crate::project::{
+    union, wrap_delta, wrap_point, FlagOp, HeightOp, PictureBrush, PlaneDoc, Project,
+};
 use crate::render::{Options, Rect};
 use crate::settings::Settings;
 use crate::terrain::{self, *};
@@ -305,6 +307,7 @@ enum Tool {
     Link,
     Paint,
     Height,
+    Picture,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -314,9 +317,17 @@ enum Mode {
 }
 
 #[derive(Clone, PartialEq)]
+struct RenameAsk {
+    map: PathBuf,
+    old: String,
+    word: &'static str,
+    draft: String,
+}
+
 enum Pending {
     None,
     Open(Option<PathBuf>),
+    OpenFile,
     AddPlane,
     Close,
 }
@@ -639,6 +650,10 @@ pub struct App {
     painting: Option<PointerButton>,
     stroke_phys: Option<PointerButton>,
     paint_erase: bool,
+    picture_colour: [u8; 3],
+    picture_stamp: Option<usize>,
+    picture_pick: bool,
+    picture_alt: bool,
     lay: Layout,
     sheet: Option<Sheet>,
     style_kind: Option<Kind>,
@@ -663,6 +678,7 @@ pub struct App {
     status: String,
     error: Option<String>,
     pending: Pending,
+    chooser: Option<crate::map_chooser::MapChooser>,
     confirm_close: bool,
     show_help: bool,
     gen: GeneratorPanel,
@@ -671,6 +687,7 @@ pub struct App {
     confirm_generate: bool,
     settings: Settings,
     confirm_overwrite: bool,
+    rename_ask: Option<RenameAsk>,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     ctx: egui::Context,
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -767,6 +784,7 @@ impl App {
             },
             error: None,
             pending: Pending::None,
+            chooser: None,
             confirm_close: false,
             show_help: false,
             gen: GeneratorPanel::default(),
@@ -779,10 +797,15 @@ impl App {
             confirm_generate: false,
             settings: Settings::load(),
             confirm_overwrite: false,
+            rename_ask: None,
             ctx: cc.egui_ctx.clone(),
             folder_files: Vec::new(),
             stroke_phys: None,
             paint_erase: false,
+            picture_colour: [120, 130, 110],
+            picture_stamp: None,
+            picture_pick: false,
+            picture_alt: false,
             lay: Layout::probe(&cc.egui_ctx),
             sheet: None,
             style_kind: None,
@@ -1016,6 +1039,19 @@ impl App {
     }
 
     fn open(&mut self, path: &Path) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::io::is_dir(path) {
+            self.open_folder(path);
+            return;
+        }
+        if let Some(ask) = rename_needed(path) {
+            self.rename_ask = Some(ask);
+            return;
+        }
+        self.open_as_it_is(path);
+    }
+
+    fn open_as_it_is(&mut self, path: &Path) {
         match Project::open(path, &self.tex, &self.opts) {
             Ok(p) => {
                 let planes = p.planes.len();
@@ -1037,6 +1073,43 @@ impl App {
                 self.status = status;
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn image_plane(&self) -> bool {
+        self.doc().map(PlaneDoc::is_image).unwrap_or(false)
+    }
+
+    fn image_project(&self) -> bool {
+        self.project
+            .as_ref()
+            .map(|p| p.has_image())
+            .unwrap_or(false)
+    }
+
+    fn keep_to_image_tools(&mut self) {
+        if !self.image_plane() {
+            return;
+        }
+        if self.tool == Tool::Height {
+            self.tool = Tool::Select;
+        }
+    }
+
+    fn keep_off_image_tools(&mut self) {
+        if self.tool == Tool::Picture && !self.image_plane() {
+            self.tool = Tool::Select;
+        }
+    }
+
+    fn picture_brush(&self, remove: bool) -> PictureBrush {
+        if remove {
+            PictureBrush::Restore
+        } else {
+            match self.picture_stamp {
+                Some(k) => PictureBrush::Terrain(k),
+                None => PictureBrush::Colour(self.picture_colour),
+            }
         }
     }
 
@@ -1305,6 +1378,10 @@ impl App {
     }
 
     fn after_edit(&mut self, changed: bool, rect: Option<Rect>, label: &str) {
+        let active = self.active;
+        if let Some(p) = &mut self.project {
+            p.fix_starts(active);
+        }
         if changed {
             self.mark_tiles(rect);
             self.refresh_selection();
@@ -1412,6 +1489,7 @@ impl App {
         let winter = from.winter != to.winter;
         let grey = from.grey_no_start != to.grey_no_start;
         let ground = from.borders != to.borders
+            || from.all_looks != to.all_looks
             || from.dirt != to.dirt
             || from.edge_fade != to.edge_fade
             || from.rivers != to.rivers
@@ -1420,6 +1498,11 @@ impl App {
         let mut ground_changed = false;
         let mut decor_changed = false;
         if let Some(d) = self.project.as_mut().and_then(|p| p.planes.get_mut(i)) {
+            if winter || from.all_looks != to.all_looks {
+                if let Some(looks) = &mut d.image {
+                    looks.trim();
+                }
+            }
             if winter {
                 d.rerender(&tex, &to);
                 ground_changed = true;
@@ -1661,6 +1744,13 @@ impl App {
                     self.status = "No folder was chosen".to_owned();
                 }
                 Event::Listed(names) => self.folder_files = names,
+                Event::Chooser(folder, rels) => {
+                    self.error = None;
+                    self.status = format!("{} maps in {folder}, choose one", rels.len());
+                    self.chooser = Some(crate::map_chooser::MapChooser::web(
+                        &self.ctx, &folder, rels,
+                    ));
+                }
                 Event::Status(text) => {
                     self.error = None;
                     self.status = text;
@@ -1668,6 +1758,90 @@ impl App {
                 Event::Error(text) => self.error = Some(text),
             }
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn pick_folder(&mut self) {
+        crate::web::open_folder(self.ctx.clone());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_dir(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.project {
+            return Some(p.dir.clone());
+        }
+        let maps = self.settings.maps_dir();
+        if maps.is_dir() {
+            Some(maps)
+        } else {
+            default_maps_dir()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pick_folder(&mut self) {
+        let mut dlg = rfd::FileDialog::new().set_title("Choose the map's folder");
+        if let Some(d) = self.start_dir() {
+            let d = if self.project.is_some() {
+                d.parent().map(Path::to_path_buf).unwrap_or(d)
+            } else {
+                d
+            };
+            dlg = dlg.set_directory(d);
+        }
+        if let Some(dir) = dlg.pick_folder() {
+            self.open_folder(&dir);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_folder(&mut self, dir: &Path) {
+        let maps = crate::io::maps_under(dir, 3);
+        match maps.len() {
+            0 => {
+                self.status = format!("No .map in {}, choose a file", crate::settings::shown(dir));
+                let dlg = rfd::FileDialog::new()
+                    .add_filter("Dominions 6 map", &["map", "d6m"])
+                    .set_directory(dir);
+                if let Some(path) = dlg.pick_file() {
+                    self.open(&path);
+                }
+            }
+            1 => self.open(&maps[0]),
+            n => {
+                self.status = format!("{} maps in {}, choose one", n, crate::settings::shown(dir));
+                self.chooser = Some(crate::map_chooser::MapChooser::new(&self.ctx, dir, maps));
+            }
+        }
+    }
+
+    fn draw_chooser(&mut self, ctx: &egui::Context) {
+        let mut chooser = match self.chooser.take() {
+            Some(c) => c,
+            None => return,
+        };
+        match chooser.show(ctx) {
+            crate::map_chooser::Outcome::Stay => self.chooser = Some(chooser),
+            crate::map_chooser::Outcome::Close => {}
+            crate::map_chooser::Outcome::Open(path) => {
+                drop(chooser);
+                self.open_chosen(&path);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_chosen(&mut self, path: &Path) {
+        self.open(path);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_chosen(&mut self, path: &Path) {
+        let rel = path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace('\\', "/");
+        crate::web::open_from_source(rel, self.ctx.clone());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1717,19 +1891,28 @@ impl App {
                 i.key_pressed(Key::Tab),
             )
         });
-        let (select_key, link_key, paint_key, height_key, random_key, next_plane, prev_plane) = ctx
-            .input(|i| {
-                let plain = !i.modifiers.command && !i.modifiers.alt;
-                (
-                    plain && i.key_pressed(Key::S),
-                    plain && i.key_pressed(Key::L),
-                    plain && i.key_pressed(Key::P),
-                    plain && i.key_pressed(Key::H),
-                    i.key_pressed(Key::F4),
-                    i.key_pressed(Key::PageDown),
-                    i.key_pressed(Key::PageUp),
-                )
-            });
+        let (
+            select_key,
+            link_key,
+            paint_key,
+            height_key,
+            picture_key,
+            random_key,
+            next_plane,
+            prev_plane,
+        ) = ctx.input(|i| {
+            let plain = !i.modifiers.command && !i.modifiers.alt;
+            (
+                plain && i.key_pressed(Key::S),
+                plain && i.key_pressed(Key::L),
+                plain && i.key_pressed(Key::P),
+                plain && i.key_pressed(Key::H),
+                plain && i.key_pressed(Key::I),
+                i.key_pressed(Key::F4),
+                i.key_pressed(Key::PageDown),
+                i.key_pressed(Key::PageUp),
+            )
+        });
         if height_key {
             self.tool = if self.tool == Tool::Height {
                 Tool::Select
@@ -1739,6 +1922,13 @@ impl App {
         }
         if random_key {
             self.randomize_terrain();
+        }
+        if picture_key && self.image_plane() {
+            self.tool = if self.tool == Tool::Picture {
+                Tool::Select
+            } else {
+                Tool::Picture
+            };
         }
         if select_key {
             self.tool = Tool::Select;
@@ -1801,8 +1991,9 @@ impl App {
             self.tool = match self.tool {
                 Tool::Select => Tool::Link,
                 Tool::Link => Tool::Paint,
+                Tool::Paint if self.image_plane() => Tool::Picture,
                 Tool::Paint => Tool::Height,
-                Tool::Height => Tool::Select,
+                Tool::Picture | Tool::Height => Tool::Select,
             };
         }
         let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1814,7 +2005,11 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn dropped(&mut self, files: Vec<egui::DroppedFile>) {
         if let Some(p) = files.into_iter().filter_map(|f| f.path).next() {
-            self.pending = Pending::Open(Some(p));
+            if p.is_dir() {
+                self.open_folder(&p);
+            } else {
+                self.pending = Pending::Open(Some(p));
+            }
         }
     }
 
@@ -1908,12 +2103,17 @@ impl App {
         }
         let res =
             self.with_doc(|d, tex, opts| (d.set_capital(sel, x, y, tex, opts), d.rendered.touched));
-        if let Some((ok, rect)) = res {
-            self.after_edit(
-                ok,
-                Some(rect),
-                &format!("Moved the capital of {sel} to {x}, {y}"),
-            );
+        if let Some((moved, rect)) = res {
+            if let Some(np) = moved {
+                self.select(Some(np));
+            }
+            let note = match moved {
+                Some(np) if np != sel => format!(
+                    "Moved the capital of {sel} to {x}, {y}; the picture renumbered it to {np}"
+                ),
+                _ => format!("Moved the capital of {sel} to {x}, {y}"),
+            };
+            self.after_edit(moved.is_some(), Some(rect), &note);
         }
     }
 
@@ -1923,8 +2123,17 @@ impl App {
         };
         let res =
             self.with_doc(|d, tex, opts| (d.centre_capital(sel, tex, opts), d.rendered.touched));
-        if let Some((ok, rect)) = res {
-            self.after_edit(ok, Some(rect), &format!("Centred the capital of {sel}"));
+        if let Some((moved, rect)) = res {
+            if let Some(np) = moved {
+                self.select(Some(np));
+            }
+            let note = match moved {
+                Some(np) if np != sel => {
+                    format!("Centred the capital of {sel}; the picture renumbered it to {np}")
+                }
+                _ => format!("Centred the capital of {sel}"),
+            };
+            self.after_edit(moved.is_some(), Some(rect), &note);
         }
     }
 
@@ -1949,6 +2158,7 @@ impl App {
 
     fn canvas_click(&mut self, prov: u32, x: i32, y: i32) {
         match self.tool {
+            Tool::Picture => {}
             Tool::Select => self.select(Some(prov)),
             Tool::Link => {
                 let Some(sel) = self.selected else {
@@ -2179,7 +2389,30 @@ impl App {
 
     fn paint_at(&mut self, x: i32, y: i32, remove: bool) {
         let r = self.brush;
-        let res = if self.tool == Tool::Height {
+        let res = if self.tool == Tool::Picture {
+            if (self.picture_pick || self.picture_alt) && !remove {
+                if let Some(c) = self
+                    .doc()
+                    .and_then(|d| d.image.as_ref())
+                    .map(|l| l.base.pixel(x, y))
+                {
+                    self.picture_colour = c;
+                    self.picture_stamp = None;
+                    self.picture_pick = false;
+                    self.status = format!("Picked {}, {}, {}", c[0], c[1], c[2]);
+                }
+                return;
+            }
+            let spacing = (r as f32 / 2.0).max(1.0);
+            let points: Vec<(i32, i32)> = self
+                .stroke_points(x, y, spacing)
+                .into_iter()
+                .map(|(sx, sy, _)| (sx, sy))
+                .collect();
+            let brush = self.picture_brush(remove);
+            self.with_doc(|d, tex, opts| d.paint_picture(&points, r, brush, tex, opts))
+                .flatten()
+        } else if self.tool == Tool::Height {
             let sign = if remove { -1.0 } else { 1.0 };
             let keep = self.keep_rivers;
             let step = self.step * sign;
@@ -2364,8 +2597,9 @@ impl App {
                         self.offset.y = (canvas.height() - span) * 0.5;
                     }
                 }
-                let paint_tool = matches!(self.tool, Tool::Paint | Tool::Height);
+                let paint_tool = matches!(self.tool, Tool::Paint | Tool::Height | Tool::Picture);
                 let ctrl = ctx.input(|i| i.modifiers.command);
+                self.picture_alt = ctx.input(|i| i.modifiers.alt);
                 let placing = self.placing_capital || self.placing_new;
                 let jump_click = self.tool == Tool::Select
                     && !placing
@@ -2466,6 +2700,7 @@ impl App {
                                     self.stroke_last = None;
                                     let label = match (self.tool, b) {
                                         (Tool::Height, _) => "Height brush",
+                                        (Tool::Picture, _) => "Picture brush",
                                         (_, PointerButton::Primary) => "Paint area",
                                         _ => "Remove area",
                                     };
@@ -3134,16 +3369,7 @@ impl App {
                     }
                 });
             }
-            let maps: Vec<String> = self
-                .folder_files
-                .iter()
-                .filter(|n| n.to_ascii_lowercase().ends_with(".d6m"))
-                .filter(|n| {
-                    let stem = n[..n.len() - 4].to_owned();
-                    crate::mapfile::strip_plane_suffix(&stem).1 == 1
-                })
-                .cloned()
-                .collect();
+            let maps: Vec<String> = crate::web::complete_maps(&self.folder_files);
             if !maps.is_empty() {
                 theme::section(ui, "Maps in the folder");
                 let mut open = None;
@@ -3286,7 +3512,11 @@ impl App {
                     egui::Label::new(egui::RichText::new(&title).size(20.0).color(theme::INK))
                         .sense(Sense::click()),
                 );
-                if self.project.is_some() {
+                if self.image_project() {
+                    label.clone().on_hover_text(
+                        "A picture map keeps its name: the game finds its .tga files by it",
+                    );
+                } else if self.project.is_some() {
                     label.clone().on_hover_text(
                         "Click to rename the map: the title inside the .map and the file names Save uses. Enter keeps the new name, Esc leaves it alone",
                     );
@@ -3373,6 +3603,7 @@ impl App {
                     .iter()
                     .map(|d| plane_label(d.index))
                     .collect();
+                let recipe = !p.has_image();
                 let mut switch = None;
                 ui.horizontal_wrapped(|ui| {
                     theme::dim(ui, "Plane");
@@ -3381,10 +3612,10 @@ impl App {
                             switch = Some(i);
                         }
                     }
-                    if theme::text_button(ui, "+", labels.len() < 9) {
+                    if theme::text_button(ui, "+", recipe && labels.len() < 9) {
                         self.pending = Pending::AddPlane;
                     }
-                    if theme::text_button(ui, "\u{2212}", labels.len() > 1) {
+                    if theme::text_button(ui, "\u{2212}", recipe && labels.len() > 1) {
                         self.remove_last_plane();
                     }
                 })
@@ -3399,8 +3630,11 @@ impl App {
             let can_undo = self.doc().map(|d| !d.undo.is_empty()).unwrap_or(false);
             let can_redo = self.doc().map(|d| !d.redo.is_empty()).unwrap_or(false);
             ui.horizontal_wrapped(|ui| {
-                if theme::boxed_button(ui, "Open", true) {
+                if theme::boxed_button_hint(ui, "Open", true, "Choose the map's folder: the editor reads the .map, every plane and every picture or .d6m beside it") {
                     self.pending = Pending::Open(None);
+                }
+                if theme::text_button(ui, "file", true) {
+                    self.pending = Pending::OpenFile;
                 }
                 if theme::boxed_button(ui, if dirty { "Save *" } else { "Save" }, dirty) {
                     self.save();
@@ -3442,6 +3676,11 @@ impl App {
         let st = doc.stats(prov);
         let gate = doc.gate(prov);
         let has_map = doc.has_map();
+        let image = doc.is_image();
+        let look = doc
+            .image
+            .as_ref()
+            .map(|l| l.look_of(prov as usize, flags, self.opts.winter, self.opts.all_looks));
         let neighbours: Vec<(u32, String, i64)> = doc
             .neighbours(prov)
             .into_iter()
@@ -3469,6 +3708,9 @@ impl App {
                     let cols = icons.len().min(3) as f32;
                     ui.set_width(ui.available_width() - cols * ICON_CELL - 6.0);
                     ui.label(terrain::describe(flags));
+                    if let Some(look) = look {
+                        theme::dim(ui, &look_label(look));
+                    }
                     let look = if st.water_share >= 0.999 {
                 "Painted as water".to_owned()
             } else if st.water_share <= 0.001 {
@@ -3478,8 +3720,9 @@ impl App {
             };
             let flag_water = terrain::is_water(flags);
             let mismatch = (flag_water && st.water_share < 0.5) || (!flag_water && st.water_share > 0.5);
+            if image {
+            } else if mismatch {
             theme::dim(ui, &format!("Height {:.0} to {:.0}", st.min, st.max));
-            if mismatch {
                 ui.label(
                     egui::RichText::new(format!(
                         "{look}, but ruled as {}",
@@ -3488,6 +3731,7 @@ impl App {
                     .color(theme::WARN),
                 );
             } else {
+                theme::dim(ui, &format!("Height {:.0} to {:.0}", st.min, st.max));
                 theme::dim(ui, &look);
             }
                 });
@@ -3538,6 +3782,7 @@ impl App {
                 }
             });
 
+            ui.add_enabled_ui(!image, |ui| {
             theme::section(ui, "Make it look like");
             ui.horizontal(|ui| {
                 for p in [Preset::DeepSea, Preset::Sea, Preset::Shallows] {
@@ -3593,6 +3838,9 @@ impl App {
                     self.apply(HeightOp::Offset(-s), FlagOp::Keep, &format!("Lower {s:.0}"));
                 }
             });
+            })
+            .response
+            .on_disabled_hover_text(IMAGE_HINT);
 
             theme::section(ui, "Terrain");
             let mut new_flags = flags;
@@ -3608,7 +3856,9 @@ impl App {
                         r
                     };
                     if r.clicked() {
-                        if *bit == SEA {
+                        if image {
+                            new_flags = toggle_flag(flags, *bit);
+                        } else if *bit == SEA {
                             water_preset = Some(if on { Preset::Sea } else { Preset::Land });
                         } else if *bit == DEEP_SEA {
                             water_preset = Some(if on { Preset::DeepSea } else { Preset::Sea });
@@ -3746,20 +3996,34 @@ impl App {
                     (Tool::Link, "Link", "L"),
                     (Tool::Paint, "Paint area", "P"),
                     (Tool::Height, "Heights", "H"),
+                    (Tool::Picture, "Picture", "I"),
                 ] {
                     let on = self.tool == tool;
-                    let hit = if compact {
+                    let usable = match tool {
+                        Tool::Height => !self.image_plane(),
+                        Tool::Picture => self.image_plane(),
+                        _ => true,
+                    };
+                    let hit = if !usable {
+                        let why = if tool == Tool::Picture {
+                            RECIPE_HINT
+                        } else {
+                            IMAGE_HINT
+                        };
+                        theme::boxed_button_hint(ui, text, false, why);
+                        false
+                    } else if compact {
                         theme::tab(ui, on, text)
                     } else {
                         keycap::tab(ui, on, text, key, keycap::DEFAULT)
                     };
-                    if hit {
+                    if hit && usable {
                         self.tool = tool;
                     }
                 }
             })
             .response
-            .on_hover_text("Tab cycles the tools; P or H pressed again goes back to Select");
+            .on_hover_text("Tab cycles the tools; P, H or I pressed again goes back to Select");
             match self.tool {
                 Tool::Select => {
                     if compact {
@@ -3789,6 +4053,55 @@ impl App {
                             "Select a province, then click others to connect or disconnect"
                         },
                     );
+                }
+                Tool::Picture => {
+                    let stamps: Vec<(usize, String)> = self
+                        .doc()
+                        .and_then(|d| d.image.as_ref())
+                        .map(|l| {
+                            l.terrain_choices()
+                                .into_iter()
+                                .map(|(k, n)| (k, n.trim_start_matches('_').to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    theme::dim(ui, if compact {
+                        "Drag over the picture to repaint it; capital pixels stay white"
+                    } else {
+                        "Drag over the picture to repaint it; the right button puts back what the picture held when it was opened. Capital pixels stay white"
+                    });
+                    ui.horizontal(|ui| {
+                        theme::dim(ui, "Brush");
+                        ui.add(egui::Slider::new(&mut self.brush, 1..=60).suffix(" px"));
+                    });
+                    ui.horizontal(|ui| {
+                        theme::dim(ui, "Colour");
+                        if ui.color_edit_button_srgb(&mut self.picture_colour).changed() {
+                            self.picture_stamp = None;
+                        }
+                        if theme::boxed_button_hint(ui, "Pick", !self.picture_pick, "Then click the map to take that pixel's colour") {
+                            self.picture_pick = true;
+                            self.picture_stamp = None;
+                            self.status = "Click the picture to take its colour".to_owned();
+                        }
+                    });
+                    if !stamps.is_empty() {
+                        theme::dim(ui, "Stamp a terrain picture");
+                        ui.horizontal_wrapped(|ui| {
+                            if theme::tab(ui, self.picture_stamp.is_none(), "Colour") {
+                                self.picture_stamp = None;
+                            }
+                            for (k, name) in &stamps {
+                                if theme::tab(ui, self.picture_stamp == Some(*k), name) {
+                                    self.picture_stamp = Some(*k);
+                                    self.picture_pick = false;
+                                }
+                            }
+                        });
+                    }
+                    if compact {
+                        self.stroke_direction(ui, "Paint", "Restore");
+                    }
                 }
                 Tool::Height => {
                     ui.horizontal(|ui| {
@@ -3831,7 +4144,7 @@ impl App {
                         self.stroke_direction(ui, "Add", "Remove");
                     }
                     theme::check(ui, &mut self.paint_empty, "Paint no province").on_hover_text("The left button takes pixels away from every province instead of giving them to the selected one; the right button still restores what was there when the map was opened");
-                    if theme::boxed_button_hint(ui, if self.placing_new { "Click the map..." } else { "New province" }, self.project.is_some() && !self.placing_new, "Adds a province numbered after the last one. Click where its capital should be; a disc of the brush size around that point becomes its first area, and it takes the sea or cave marks of the province it was cut from. Then paint the rest of it. Escape cancels") {
+                    if theme::boxed_button_hint(ui, if self.placing_new { "Click the map..." } else { "New province" }, self.project.is_some() && !self.placing_new, "Adds a province. Click where its capital should be; a disc of the brush size around that point becomes its first area, and it takes the sea or cave marks of the province it was cut from. Then paint the rest of it. Escape cancels") {
                         self.placing_new = true;
                         self.placing_capital = false;
                         self.status = "Click on the map where the new province's capital should be".to_owned();
@@ -3912,8 +4225,9 @@ impl App {
                 .num_columns(2)
                 .spacing([16.0, 2.0])
                 .show(ui, |ui| {
+                    let image = self.image_plane();
                     changed |= theme::check(ui, &mut self.opts.borders, "Borders").clicked();
-                    changed |= theme::check(ui, &mut self.opts.decor, "Trees and rocks").on_hover_text("Forests, mountains, huts, sites and other sprites the game scatters over a map. The game places them at random on every load, so they never match exactly").clicked();
+                    changed |= theme::check_enabled(ui, &mut self.opts.decor, "Trees and rocks", !image).on_hover_text(if image { IMAGE_HINT } else { "Forests, mountains, huts, sites and other sprites the game scatters over a map. The game places them at random on every load, so they never match exactly" }).clicked();
                     ui.end_row();
                     theme::check(ui, &mut self.show_names, "Names").on_hover_text("Province names, or the number where a province has no name");
                     if theme::check(ui, &mut self.show_markers, "Markers").on_hover_text("Capital dot and labels for Start, No start, Throne, No throne, Many sites and Gate").clicked() {
@@ -3935,8 +4249,19 @@ impl App {
                     changed |= theme::check(ui, &mut self.opts.grey_no_start, "Grey no-start").on_hover_text("Shows provinces flagged No start in greyscale, the way the game's layout pictures do. The game itself paints them in full colour on the map").clicked();
                     ui.end_row();
                     changed |= theme::check(ui, &mut self.opts.winter, "Winter").on_hover_text("Draws the map the way the game draws it in a winter month: snow ground on every land province the cold scale reaches, and ice on shallow water and river channels. Warmer provinces, caves and deep sea stay as they are").clicked();
-                    changed |= theme::check(ui, &mut self.opts.dirt, "Dirt").on_hover_text("The game's dirtify pass: a few hundred soft earth-coloured blotches over dry land, then a faint dark speckle over every pixel. It is what keeps a game map from looking like flat tiles").clicked();
+                    changed |= theme::check_enabled(ui, &mut self.opts.dirt, "Dirt", !image).on_hover_text(if image { IMAGE_HINT } else { "The game's dirtify pass: a few hundred soft earth-coloured blotches over dry land, then a faint dark speckle over every pixel. It is what keeps a game map from looking like flat tiles" }).clicked();
                     ui.end_row();
+                    if TERRAIN_LOOKS {
+                    let art = self
+                        .doc()
+                        .and_then(|d| d.image.as_ref())
+                        .map(|l| l.has_terrain_art())
+                        .unwrap_or(false);
+                    changed |= theme::check_enabled(ui, &mut self.opts.all_looks, "Terrain looks", art)
+                        .on_hover_text(if art { "Picture maps only. The game shows a province's terrain picture (_forest.tga, _farm.tga and the rest) once its terrain differs from the .map, which happens when a game starts or an event changes it. Ticked, every province is drawn with the picture of the terrain it has now, so each terrain file can be checked" } else { "Needs a picture map with terrain pictures such as _forest.tga beside it" })
+                        .clicked();
+                    ui.end_row();
+                    }
                 });
             if changed {
                 self.view_changed();
@@ -3984,6 +4309,7 @@ impl App {
                 ui.label("Open picks the .d6m and .map files of a map together, or drop them on the window. Choose the game's maps folder once in the Folder box and Save writes back into it; without a folder, Save downloads a zip.");
             } else {
                 ui.label("Saving writes the .d6m and the .map beside it, in place.");
+                ui.label("Open asks for the map's folder and reads everything in it. A map drawn as a picture (.tga) opens too: terrain, names, connections, province areas, capitals and the picture itself can be edited, and Save writes the .map and the .tga, keeping the first originals as .bak. Capitals are the white pixels of the picture, numbered from the bottom row up, so moving, adding or removing one renumbers the provinces and the editor follows that everywhere. The Picture tool (I) repaints the main .tga with a colour, an eyedropper or a stamp from the map own terrain pictures; the right button puts back what the picture held when it was opened. Heights, rivers, trees, dirt and renaming need a .d6m and stay greyed out. Winter under View shows the map's own _winter.tga and winter terrain pictures the way the game would.");
             }
             ui.add_space(6.0);
             if theme::boxed_button(ui, "Close", true) {
@@ -4029,6 +4355,82 @@ impl App {
                 });
             },
         );
+    }
+
+    fn draw_rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut ask) = self.rename_ask.take() else {
+            return;
+        };
+        let mut action = None;
+        let max_h = theme::modal_height(ctx);
+        let legal = !ask.draft.is_empty()
+            && ask
+                .draft
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let trap = crate::namefix::trap_in(&ask.draft);
+        egui::Modal::new(egui::Id::new("d6sme_rename"))
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                theme::scroll_body(ui, 560.0, max_h, |ui| {
+                    theme::title(ui, "This map needs another name");
+                    ui.label(format!(
+                        "The game cannot load {}. Before it looks a picture up, it removes the terrain words _forest, _plain, _kelp, _highland, _farm, _swamp, _waste, _water and _winter from the file name, anywhere in it. This name contains {}, so the game searches for a picture that does not exist and stops with \"imagefile not found\".",
+                        ask.old, ask.word
+                    ));
+                    ui.add_space(4.0);
+                    ui.label("Renaming moves every file of the map to the new name in the same folder, keeps the terrain and plane endings, and changes the title and picture lines inside each .map. The old .map stays beside it as .bak. Games already started on the old name will no longer find the map.");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        theme::dim(ui, "New name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut ask.draft).desired_width(320.0),
+                        );
+                    });
+                    if let Some(w) = trap {
+                        ui.label(
+                            egui::RichText::new(format!("still contains {w}")).color(theme::WARN),
+                        );
+                    } else if !legal {
+                        ui.label(
+                            egui::RichText::new("letters, digits and underscore only")
+                                .color(theme::WARN),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if theme::boxed_button(ui, "Rename and open", legal && trap.is_none()) {
+                            action = Some(0);
+                        }
+                        if theme::boxed_button_hint(
+                            ui,
+                            "Open as it is",
+                            true,
+                            "The editor can work on it, the game cannot load it until it is renamed",
+                        ) {
+                            action = Some(1);
+                        }
+                        if theme::boxed_button(ui, "Cancel", true) {
+                            action = Some(2);
+                        }
+                    });
+                });
+            });
+        match action {
+            Some(0) => match rename_map(&ask) {
+                Ok(map) => {
+                    self.open_as_it_is(&map);
+                    self.status = format!("Renamed {} to {}; {}", ask.old, ask.draft, self.status);
+                }
+                Err(e) => self.error = Some(e),
+            },
+            Some(1) => {
+                let map = ask.map.clone();
+                self.open_as_it_is(&map);
+            }
+            Some(2) => {}
+            _ => self.rename_ask = Some(ask),
+        }
     }
 
     fn draw_overwrite_dialog(&mut self, ctx: &egui::Context) {
@@ -4115,10 +4517,13 @@ impl eframe::App for App {
         #[cfg(target_arch = "wasm32")]
         self.poll_web();
         self.handle_keys(ctx);
+        self.keep_to_image_tools();
+        self.keep_off_image_tools();
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::None => {}
             Pending::Open(Some(p)) => self.open(&p),
-            Pending::Open(None) => self.pick_file(),
+            Pending::Open(None) => self.pick_folder(),
+            Pending::OpenFile => self.pick_file(),
             Pending::AddPlane => self.add_plane(),
             Pending::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
@@ -4174,10 +4579,88 @@ impl eframe::App for App {
         self.draw_close_dialog(ctx);
         self.draw_generate_dialog(ctx);
         self.draw_overwrite_dialog(ctx);
+        self.draw_chooser(ctx);
+        self.draw_rename_dialog(ctx);
         if self.center_pending.is_some() {
             ctx.request_repaint();
         }
     }
+}
+
+const RECIPE_HINT: &str = "Picture maps only: this plane is a .d6m recipe, drawn from its heights and terrain, so there is no picture to paint";
+const TERRAIN_LOOKS: bool = false;
+const IMAGE_HINT: &str = "This plane is a picture (.tga), not a .d6m recipe: it has no height field, and its capitals are the white pixels of the picture";
+
+fn look_label(look: crate::imagemap::Look) -> String {
+    use crate::imagemap::{Look, PASSES};
+    let file = |suffix: &str| format!("Drawn from {suffix}.tga");
+    match look {
+        Look::Base => "Drawn from the main picture".to_owned(),
+        Look::BaseWhitened => "Main picture, whitened for winter".to_owned(),
+        Look::Summer(k, false) => file(PASSES[k].summer.unwrap_or("")),
+        Look::Summer(k, true) => format!(
+            "{}, whitened for winter",
+            file(PASSES[k].summer.unwrap_or(""))
+        ),
+        Look::Winter(k) => file(PASSES[k].winter),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rename_needed(_path: &Path) -> Option<RenameAsk> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn rename_map(_ask: &RenameAsk) -> Result<PathBuf, String> {
+    Err("files cannot be renamed from the browser".to_owned())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rename_needed(path: &Path) -> Option<RenameAsk> {
+    let is_map = path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("map"))
+        .unwrap_or(false);
+    if !is_map {
+        return None;
+    }
+    let map = crate::mapfile::MapFile::load(path).ok()?;
+    let img = map.imagefile?;
+    let img_path = Path::new(&img);
+    let is_tga = img_path
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("tga"))
+        .unwrap_or(false);
+    if !is_tga {
+        return None;
+    }
+    let stem = img_path.file_stem()?.to_str()?;
+    let old = crate::mapfile::strip_plane_suffix(stem).0;
+    let word = crate::namefix::trap_in(&old)?;
+    Some(RenameAsk {
+        map: path.to_path_buf(),
+        draft: crate::namefix::safe_base(&old),
+        old,
+        word,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rename_map(ask: &RenameAsk) -> Result<PathBuf, String> {
+    let dir = ask
+        .map
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let map_base = crate::namefix::base_of(&ask.map).unwrap_or_default();
+    let maps: Vec<PathBuf> = (1..=9u32)
+        .map(|n| dir.join(crate::mapfile::plane_file_name(&map_base, n, "map")))
+        .filter(|p| crate::io::exists(p))
+        .collect();
+    let files = crate::io::files_in(&dir);
+    let plan = crate::namefix::plan(&files, &maps, &ask.old, &ask.draft);
+    crate::namefix::apply(&plan)
 }
 
 fn terrain_tally(doc: &PlaneDoc) -> String {

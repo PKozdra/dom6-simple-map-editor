@@ -407,10 +407,10 @@ fn provinces_can_be_added_and_capitals_moved() {
     ));
     assert!(doc.set_name(3, "Newland", &t, &opts));
     assert!(doc.set_link(3, 1, true, &t, &opts));
-    assert!(!doc.set_capital(3, 0, 0, &t, &opts));
-    assert!(doc.set_capital(3, 11, 6, &t, &opts));
+    assert!(doc.set_capital(3, 0, 0, &t, &opts).is_none());
+    assert!(doc.set_capital(3, 11, 6, &t, &opts).is_some());
     assert_eq!(doc.capital(3), Some((11, 6)));
-    assert!(doc.centre_capital(3, &t, &opts));
+    assert!(doc.centre_capital(3, &t, &opts).is_some());
     assert_eq!(doc.capital(3), Some((10, 6)));
     for _ in 0..6 {
         assert!(doc.undo_last(&t, &opts).is_some());

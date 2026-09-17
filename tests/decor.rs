@@ -80,6 +80,7 @@ impl World {
             mountain_lines: &self.lines,
             bridges: &self.bridges,
             cave_plane: false,
+            image: None,
         }
     }
 }

@@ -226,7 +226,7 @@ fn main() {
             ));
             log.push(format!(
                 "centre capital {}",
-                doc.centre_capital(np, &tex, &opts)
+                doc.centre_capital(np, &tex, &opts).is_some()
             ));
             log.push(format!("capital inside {}", doc.capital_inside(np)));
             log.push(format!(

@@ -60,6 +60,117 @@ export async function pickFiles(accept, multiple, dir) {
   });
 }
 
+export function folderSource(handle) {
+  return handle ? { kind: "handle", root: handle, name: handle.name } : null;
+}
+
+export function pickFolderSource(accept) {
+  const exts = extensions(accept);
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.webkitdirectory = true;
+    input.style.display = "none";
+    input.onchange = () => {
+      const files = new Map();
+      let name = "";
+      for (const f of input.files) {
+        const full = f.webkitRelativePath || f.name;
+        const parts = full.split("/");
+        if (!name && parts.length > 1) {
+          name = parts[0];
+        }
+        const rel = parts.length > 1 ? parts.slice(1).join("/") : full;
+        if (exts.some((e) => f.name.toLowerCase().endsWith(e))) {
+          files.set(rel, f);
+        }
+      }
+      input.remove();
+      resolve(files.size ? { kind: "files", root: null, name, files } : null);
+    };
+    input.oncancel = () => {
+      input.remove();
+      resolve(null);
+    };
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
+export function sourceName(source) {
+  return source ? source.name || "" : "";
+}
+
+export function sourceRoot(source) {
+  return source && source.kind === "handle" ? source.root : null;
+}
+
+async function walkTree(dir, prefix, exts, depth, out) {
+  for await (const [name, entry] of dir.entries()) {
+    const path = prefix ? prefix + "/" + name : name;
+    if (entry.kind === "file") {
+      if (exts.some((e) => name.toLowerCase().endsWith(e))) {
+        out.push(path);
+      }
+    } else if (depth > 0) {
+      await walkTree(entry, path, exts, depth - 1, out);
+    }
+  }
+}
+
+export async function listTree(source, accept, depth) {
+  const exts = extensions(accept);
+  const out = [];
+  if (!source) {
+    return out;
+  }
+  if (source.kind === "handle") {
+    try {
+      await walkTree(source.root, "", exts, depth, out);
+    } catch (e) {
+      return out;
+    }
+  } else {
+    for (const rel of source.files.keys()) {
+      if (rel.split("/").length <= depth + 1 && exts.some((e) => rel.toLowerCase().endsWith(e))) {
+        out.push(rel);
+      }
+    }
+  }
+  out.sort();
+  return out;
+}
+
+export async function readFrom(source, relPath) {
+  if (!source) {
+    return null;
+  }
+  const parts = relPath.split("/").filter((s) => s.length);
+  const name = parts.pop();
+  if (!name) {
+    return null;
+  }
+  if (source.kind === "handle") {
+    try {
+      let dir = source.root;
+      for (const p of parts) {
+        dir = await dir.getDirectoryHandle(p);
+      }
+      const handle = await dir.getFileHandle(name);
+      const file = await handle.getFile();
+      return { name, bytes: new Uint8Array(await file.arrayBuffer()), handle, dir };
+    } catch (e) {
+      return null;
+    }
+  }
+  const f = source.files.get(relPath);
+  if (!f) {
+    return null;
+  }
+  return { name, bytes: new Uint8Array(await f.arrayBuffer()), handle: null, dir: null };
+}
+
 export async function pickDirectory() {
   if (!canPickDirectory()) {
     return null;
@@ -161,7 +272,7 @@ async function readEntryDirectory(dir) {
   }
   const out = [];
   for (const en of all) {
-    if (en.isFile && /\.(d6m|map)$/i.test(en.name)) {
+    if (en.isFile && /\.(d6m|map|tga)$/i.test(en.name)) {
       const f = await fromEntry(en);
       if (f) {
         out.push(f);

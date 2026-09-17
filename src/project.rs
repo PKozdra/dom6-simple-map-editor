@@ -2,6 +2,7 @@ use crate::d6m::{stored_from_units, units_from_stored, D6m, STORED_LIMIT};
 
 pub const DEEP_SEA_FROM: f32 = -36.0;
 use crate::decor::Rng;
+use crate::imagemap::Looks;
 use crate::mapfile::{plane_file_name, strip_plane_suffix, MapFile};
 use crate::render::{province_bboxes, Options, Plane, Rect, Rendered};
 use crate::terrain::{self, BORDER_CARVED, SEA, UNKNOWN};
@@ -24,6 +25,8 @@ pub enum FlagOp {
     Land,
     Set(u64),
 }
+
+pub type PixelEdit = (u32, [u8; 3], [u8; 3]);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MapChange {
@@ -65,6 +68,33 @@ pub enum MapChange {
         y: i16,
         terrain: u64,
     },
+    PictureCapital {
+        p: u32,
+        to: u32,
+        old: (i16, i16),
+        new: (i16, i16),
+        pixels: Vec<PixelEdit>,
+    },
+    PictureAdd {
+        at: u32,
+        x: i16,
+        y: i16,
+        terrain: u64,
+        pixels: Vec<PixelEdit>,
+    },
+    PictureRemove {
+        p: u32,
+        x: i16,
+        y: i16,
+        terrain: u64,
+        original: u64,
+        name: String,
+        gate: i32,
+        links: Vec<(u32, i64)>,
+        pixels: Vec<PixelEdit>,
+        fill: Vec<(u32, i16)>,
+        baseline: Vec<u32>,
+    },
     RemoveProvince {
         p: u32,
         x: i16,
@@ -78,18 +108,66 @@ pub enum MapChange {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PictureBrush {
+    Colour([u8; 3]),
+    Terrain(usize),
+    Restore,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Edit {
     pub label: String,
     pub heights: Vec<(u32, i16, i16)>,
     pub owners: Vec<(u32, i16, i16)>,
+    pub picture: Vec<PixelEdit>,
     pub map: Vec<MapChange>,
     pub rect: Option<Rect>,
 }
 
 impl Edit {
     pub fn is_empty(&self) -> bool {
-        self.heights.is_empty() && self.owners.is_empty() && self.map.is_empty()
+        self.heights.is_empty()
+            && self.owners.is_empty()
+            && self.picture.is_empty()
+            && self.map.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SlotShift {
+    pub from: u32,
+    pub to: u32,
+    pub old_count: u32,
+}
+
+impl SlotShift {
+    pub fn local(&self, q: u32) -> u32 {
+        if self.from == 0 {
+            if q >= self.to {
+                q + 1
+            } else {
+                q
+            }
+        } else if self.to == 0 {
+            match q.cmp(&self.from) {
+                std::cmp::Ordering::Less => q,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => q - 1,
+            }
+        } else {
+            crate::imagemap::slot_after_move(self.from, self.to, q)
+        }
+    }
+
+    pub fn delta(&self) -> i32 {
+        if self.from == 0 {
+            1
+        } else if self.to == 0 {
+            -1
+        } else {
+            0
+        }
     }
 }
 
@@ -108,6 +186,7 @@ pub struct PlaneDoc {
     pub map_path: Option<PathBuf>,
     pub d6m: D6m,
     pub map: Option<MapFile>,
+    pub image: Option<Looks>,
     pub flags: Vec<u64>,
     pub names: Vec<String>,
     pub gates: Vec<i32>,
@@ -121,10 +200,20 @@ pub struct PlaneDoc {
     pub dirty: bool,
     pub edited: bool,
     pub owners_changed: bool,
+    pub picture_dirty: bool,
+    pub slot_shift: Option<SlotShift>,
     pub undo: Vec<Edit>,
     pub redo: Vec<Edit>,
     river_repair: Vec<(u32, i16, i16)>,
     stroke: Option<Edit>,
+}
+
+fn plane_label_short(plane: u32) -> String {
+    if plane <= 1 {
+        "the surface".to_string()
+    } else {
+        format!("plane {plane}")
+    }
 }
 
 fn count_pixels(owners: &[i16], n: usize) -> Vec<u32> {
@@ -165,12 +254,14 @@ pub fn union(a: Option<Rect>, b: Option<Rect>) -> Option<Rect> {
 }
 
 impl PlaneDoc {
+    #[allow(clippy::too_many_arguments)]
     fn build(
         index: u32,
         d6m_path: PathBuf,
         map_path: Option<PathBuf>,
         d6m: D6m,
         map: Option<MapFile>,
+        mut image: Option<Looks>,
         tex: &TexSet,
         opts: &Options,
     ) -> PlaneDoc {
@@ -189,6 +280,9 @@ impl PlaneDoc {
                 gates[i + 1] = m.gate_of(id);
             }
         }
+        if let Some(looks) = &mut image {
+            looks.original = flags.clone();
+        }
         let capitals: Vec<(i16, i16)> = d6m.provinces.iter().map(|p| (p.x, p.y)).collect();
         let mut pixel_counts = vec![0u32; n + 1];
         for &o in &d6m.owners {
@@ -202,6 +296,7 @@ impl PlaneDoc {
             map_path,
             d6m,
             map,
+            image,
             flags,
             names,
             gates,
@@ -216,6 +311,8 @@ impl PlaneDoc {
             dirty: false,
             edited: false,
             owners_changed: false,
+            picture_dirty: false,
+            slot_shift: None,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke: None,
@@ -275,6 +372,7 @@ impl PlaneDoc {
             mountain_lines: &self.mountain_lines,
             bridges: &self.bridges,
             cave_plane: self.index == 2,
+            image: self.image.as_ref(),
         }
     }
 
@@ -389,16 +487,310 @@ impl PlaneDoc {
         best
     }
 
-    pub fn set_capital(&mut self, prov: u32, x: i32, y: i32, tex: &TexSet, opts: &Options) -> bool {
-        let Some(old) = self.capitals.get(prov as usize - 1).copied() else {
-            return false;
+    fn picture_set(&mut self, pixels: &[PixelEdit], reverse: bool) {
+        let Some(l) = &mut self.image else {
+            return;
         };
+        for &(i, old, new) in pixels {
+            l.base.set_at(i as usize, if reverse { old } else { new });
+        }
+        self.picture_dirty = true;
+    }
+
+    fn move_slot(&mut self, from: u32, to: u32) {
+        if from == to {
+            return;
+        }
+        let (f, t) = (from as usize, to as usize);
+        let v = self.flags.remove(f);
+        self.flags.insert(t, v);
+        let v = self.names.remove(f);
+        self.names.insert(t, v);
+        let v = self.gates.remove(f);
+        self.gates.insert(t, v);
+        let v = self.pixel_counts.remove(f);
+        self.pixel_counts.insert(t, v);
+        let v = self.d6m.provinces.remove(f - 1);
+        self.d6m.provinces.insert(t - 1, v);
+        let v = self.capitals.remove(f - 1);
+        self.capitals.insert(t - 1, v);
+        if let Some(l) = &mut self.image {
+            if l.original.len() > f.max(t) {
+                let v = l.original.remove(f);
+                l.original.insert(t, v);
+            }
+        }
+        for o in self.d6m.owners.iter_mut() {
+            *o = crate::imagemap::slot_after_move(from, to, *o as u32) as i16;
+        }
+        for b in self.baseline.iter_mut() {
+            *b = crate::imagemap::slot_after_move(from, to, *b as u32) as i16;
+        }
+        if let Some(m) = &mut self.map {
+            m.renumber(|q| crate::imagemap::slot_after_move(from, to, q));
+        }
+        self.owners_changed = true;
+    }
+
+    fn insert_slot(&mut self, at: u32, x: i16, y: i16, terrain: u64) {
+        let n = at as usize;
+        self.d6m.provinces.insert(
+            n - 1,
+            crate::d6m::Province {
+                x,
+                y,
+                terrain: terrain as i64,
+            },
+        );
+        self.flags.insert(n, terrain);
+        self.names.insert(n, String::new());
+        self.gates.insert(n, 0);
+        self.capitals.insert(n - 1, (x, y));
+        self.pixel_counts.insert(n, 0);
+        if let Some(l) = &mut self.image {
+            if l.original.len() >= n {
+                l.original.insert(n, terrain);
+            }
+        }
+        for o in self.d6m.owners.iter_mut() {
+            if *o as u32 >= at {
+                *o += 1;
+            }
+        }
+        for b in self.baseline.iter_mut() {
+            if *b as u32 >= at {
+                *b += 1;
+            }
+        }
+        if let Some(m) = &mut self.map {
+            m.renumber(|q| if q >= at { q + 1 } else { q });
+            m.set_terrain(at, terrain as i64);
+        }
+        self.owners_changed = true;
+    }
+
+    fn remove_slot(&mut self, at: u32) {
+        let n = at as usize;
+        self.d6m.provinces.remove(n - 1);
+        self.flags.remove(n);
+        self.names.remove(n);
+        self.gates.remove(n);
+        self.capitals.remove(n - 1);
+        self.pixel_counts.remove(n);
+        if let Some(l) = &mut self.image {
+            if l.original.len() > n {
+                l.original.remove(n);
+            }
+        }
+        for o in self.d6m.owners.iter_mut() {
+            if *o as u32 > at {
+                *o -= 1;
+            }
+        }
+        for b in self.baseline.iter_mut() {
+            if *b as u32 > at {
+                *b -= 1;
+            }
+        }
+        if let Some(m) = &mut self.map {
+            m.remove_province(at);
+            m.renumber(|q| if q > at { q - 1 } else { q });
+        }
+        self.owners_changed = true;
+    }
+
+    fn white_swap(
+        &self,
+        old: Option<(i16, i16)>,
+        new: Option<(i16, i16)>,
+    ) -> Option<Vec<PixelEdit>> {
+        let l = self.image.as_ref()?;
+        let mut out = Vec::new();
+        if let Some((x, y)) = old {
+            let i = l.base.index(x as i32, y as i32)?;
+            out.push((
+                i as u32,
+                crate::imagemap::WHITE,
+                l.base.unwhitened(x as i32, y as i32),
+            ));
+        }
+        if let Some((x, y)) = new {
+            let i = l.base.index(x as i32, y as i32)?;
+            if l.base.is_white(x as i32, y as i32) {
+                return None;
+            }
+            out.push((
+                i as u32,
+                l.base.pixel(x as i32, y as i32),
+                crate::imagemap::WHITE,
+            ));
+        }
+        Some(out)
+    }
+
+    pub fn image_set_capital(
+        &mut self,
+        prov: u32,
+        x: i32,
+        y: i32,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<u32> {
+        let old = self.capitals.get(prov as usize - 1).copied()?;
         if self.owner_at(x, y) != prov {
-            return false;
+            return None;
         }
         let new = (x as i16, y as i16);
         if new == old {
+            return None;
+        }
+        let pixels = self.white_swap(Some(old), Some(new))?;
+        let w = self.image.as_ref()?.base.w;
+        let to = crate::imagemap::slot_for(&self.capitals, w, Some(prov), new);
+        let edit = Edit {
+            label: "Move capital".to_string(),
+            map: vec![MapChange::PictureCapital {
+                p: prov,
+                to,
+                old,
+                new,
+                pixels,
+            }],
+            rect: Some(Rect::full(self.d6m.width, self.d6m.height)),
+            ..Default::default()
+        };
+        self.push(edit, tex, opts).then_some(to)
+    }
+
+    pub fn image_add_province(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        radius: i32,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<u32> {
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        if cx < 0 || cy < 0 || cx >= w || cy >= h || self.d6m.provinces.len() >= 32000 {
+            return None;
+        }
+        let new = (cx as i16, cy as i16);
+        let pixels = self.white_swap(None, Some(new))?;
+        let pw = self.image.as_ref()?.base.w;
+        let at = crate::imagemap::slot_for(&self.capitals, pw, None, new);
+        let under = self.owner_at(cx, cy);
+        let inherit = SEA
+            | terrain::DEEP_SEA
+            | terrain::CAVE
+            | terrain::CAVE_LOOK
+            | terrain::WARMER
+            | terrain::COLDER;
+        let terrain = self.flags.get(under as usize).copied().unwrap_or(0) & inherit;
+        let mut owners = Vec::new();
+        let r = radius.max(1);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let Some(i) = self.brush_pixel(cx + dx, cy + dy) else {
+                    continue;
+                };
+                let was = self.d6m.owners[i] as u32;
+                let shifted = if was >= at { was + 1 } else { was };
+                owners.push((i as u32, shifted as i16, at as i16));
+            }
+        }
+        let edit = Edit {
+            label: format!("New province {at}"),
+            owners,
+            map: vec![MapChange::PictureAdd {
+                at,
+                x: new.0,
+                y: new.1,
+                terrain,
+                pixels,
+            }],
+            rect: Some(Rect::full(w, h)),
+            ..Default::default()
+        };
+        self.push(edit, tex, opts).then_some(at)
+    }
+
+    pub fn image_remove_province(&mut self, p: u32, tex: &TexSet, opts: &Options) -> bool {
+        let n = self.d6m.provinces.len() as u32;
+        if p == 0 || p > n || n < 2 || self.image.is_none() {
             return false;
+        }
+        let w = self.d6m.width;
+        let h = self.d6m.height;
+        let rec = self.d6m.provinces[p as usize - 1].clone();
+        let Some(pixels) = self.white_swap(Some((rec.x, rec.y)), None) else {
+            return false;
+        };
+        let (idx, filled) = fill_removed(w, h, &self.d6m.owners, &self.d6m.heights, p);
+        let links: Vec<(u32, i64)> = self
+            .neighbours(p)
+            .into_iter()
+            .map(|q| (q, self.spec(p, q)))
+            .collect();
+        let fill: Vec<(u32, i16)> = idx
+            .iter()
+            .zip(filled.iter())
+            .map(|(&i, &f)| (i as u32, f))
+            .collect();
+        let baseline: Vec<u32> = self
+            .baseline
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b as u32 == p)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let original = self
+            .image
+            .as_ref()
+            .and_then(|l| l.original.get(p as usize).copied())
+            .unwrap_or(self.flags[p as usize]);
+        let edit = Edit {
+            label: format!("Remove province {p}"),
+            map: vec![MapChange::PictureRemove {
+                p,
+                x: rec.x,
+                y: rec.y,
+                terrain: self.flags[p as usize],
+                original,
+                name: self.names[p as usize].clone(),
+                gate: self.gates[p as usize],
+                links,
+                pixels,
+                fill,
+                baseline,
+            }],
+            rect: Some(Rect::full(w, h)),
+            ..Default::default()
+        };
+        self.push(edit, tex, opts)
+    }
+
+    pub fn set_capital(
+        &mut self,
+        prov: u32,
+        x: i32,
+        y: i32,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<u32> {
+        if self.image.is_some() {
+            return self.image_set_capital(prov, x, y, tex, opts);
+        }
+        let old = self.capitals.get(prov as usize - 1).copied()?;
+        if self.owner_at(x, y) != prov {
+            return None;
+        }
+        let new = (x as i16, y as i16);
+        if new == old {
+            return None;
         }
         let around = |(px, py): (i16, i16)| Rect {
             x0: px as i32 - 2,
@@ -416,14 +808,12 @@ impl PlaneDoc {
             ),
             ..Default::default()
         };
-        self.push(edit, tex, opts)
+        self.push(edit, tex, opts).then_some(prov)
     }
 
-    pub fn centre_capital(&mut self, prov: u32, tex: &TexSet, opts: &Options) -> bool {
-        match self.area_centre(prov) {
-            Some((x, y)) => self.set_capital(prov, x, y, tex, opts),
-            None => false,
-        }
+    pub fn centre_capital(&mut self, prov: u32, tex: &TexSet, opts: &Options) -> Option<u32> {
+        let (x, y) = self.area_centre(prov)?;
+        self.set_capital(prov, x, y, tex, opts)
     }
 
     pub fn add_province(
@@ -434,6 +824,9 @@ impl PlaneDoc {
         tex: &TexSet,
         opts: &Options,
     ) -> Option<u32> {
+        if self.image.is_some() {
+            return self.image_add_province(cx, cy, radius, tex, opts);
+        }
         let w = self.d6m.width;
         let h = self.d6m.height;
         if cx < 0 || cy < 0 || cx >= w || cy >= h || self.d6m.provinces.len() >= 32000 {
@@ -487,6 +880,9 @@ impl PlaneDoc {
     }
 
     pub fn remove_province(&mut self, p: u32, tex: &TexSet, opts: &Options) -> bool {
+        if self.image.is_some() {
+            return self.image_remove_province(p, tex, opts);
+        }
         let n = self.d6m.provinces.len() as u32;
         if p == 0 || p > n || n < 2 {
             return false;
@@ -1352,6 +1748,90 @@ impl PlaneDoc {
         Some(r)
     }
 
+    pub fn paint_picture(
+        &mut self,
+        points: &[(i32, i32)],
+        radius: i32,
+        brush: PictureBrush,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Option<Rect> {
+        self.image.as_mut()?.keep_opened();
+        let l = self.image.as_ref()?;
+        let (w, h) = (l.base.w as i32, l.base.h as i32);
+        let r = radius.max(1);
+        let mut changes: Vec<PixelEdit> = Vec::new();
+        let mut rect: Option<Rect> = None;
+        for &(cx, cy) in points {
+            let mut any = false;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy > r * r {
+                        continue;
+                    }
+                    let (x, y) = (cx + dx, cy + dy);
+                    let Some(i) = l.base.index(x, y) else {
+                        continue;
+                    };
+                    let old = l.base.pixel(x, y);
+                    if old == crate::imagemap::WHITE {
+                        continue;
+                    }
+                    let found = match brush {
+                        PictureBrush::Colour(c) => Some(c),
+                        PictureBrush::Terrain(k) => l.terrain_pixel(k, x, y),
+                        PictureBrush::Restore => l.opened_pixel(i),
+                    };
+                    let Some(mut new) = found else {
+                        continue;
+                    };
+                    if new == crate::imagemap::WHITE {
+                        new = crate::imagemap::NEAR_WHITE;
+                    }
+                    if new == old {
+                        continue;
+                    }
+                    changes.push((i as u32, old, new));
+                    any = true;
+                }
+            }
+            if any {
+                rect = union(
+                    rect,
+                    Some(Rect {
+                        x0: (cx - r).max(0),
+                        y0: (cy - r).max(0),
+                        x1: (cx + r).min(w - 1),
+                        y1: (cy + r).min(h - 1),
+                    }),
+                );
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
+        changes.sort_unstable_by_key(|c| c.0);
+        changes.dedup_by_key(|c| c.0);
+        let r = rect?;
+        let step = Edit {
+            picture: changes,
+            rect: Some(r),
+            ..Default::default()
+        };
+        self.commit(&step, false, tex, opts);
+        if let Some(s) = &mut self.stroke {
+            s.picture.extend(step.picture);
+            s.rect = union(s.rect, Some(r));
+        } else {
+            self.redo.clear();
+            self.undo.push(Edit {
+                label: "Picture brush".to_string(),
+                ..step
+            });
+        }
+        Some(r)
+    }
+
     pub fn paint_height_stamps(
         &mut self,
         stamps: &[(i32, i32, f32)],
@@ -1917,11 +2397,122 @@ impl PlaneDoc {
             let v = if reverse { old } else { new };
             self.d6m.heights[i as usize] = v;
         }
+        if !e.picture.is_empty() {
+            if reverse {
+                let back: Vec<PixelEdit> = e.picture.iter().rev().copied().collect();
+                self.picture_set(&back, true);
+            } else {
+                self.picture_set(&e.picture, false);
+            }
+        }
         let mut renumbered = false;
         for c in &e.map {
             match c {
                 MapChange::AddProvince { p, x, y, terrain } if !reverse => {
                     self.grow_province(*p, *x, *y, *terrain);
+                }
+                MapChange::PictureCapital {
+                    p,
+                    to,
+                    old,
+                    new,
+                    pixels,
+                } => {
+                    let i = *p as usize - 1;
+                    if reverse {
+                        self.move_slot(*to, *p);
+                        if let Some(c) = self.capitals.get_mut(i) {
+                            *c = *old;
+                        }
+                        if let Some(rec) = self.d6m.provinces.get_mut(i) {
+                            rec.x = old.0;
+                            rec.y = old.1;
+                        }
+                        self.picture_set(pixels, true);
+                        self.slot_shift = Some(SlotShift {
+                            from: *to,
+                            to: *p,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                    } else {
+                        self.picture_set(pixels, false);
+                        if let Some(c) = self.capitals.get_mut(i) {
+                            *c = *new;
+                        }
+                        if let Some(rec) = self.d6m.provinces.get_mut(i) {
+                            rec.x = new.0;
+                            rec.y = new.1;
+                        }
+                        self.move_slot(*p, *to);
+                        self.slot_shift = Some(SlotShift {
+                            from: *p,
+                            to: *to,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                    }
+                    renumbered = true;
+                }
+                MapChange::PictureAdd {
+                    at,
+                    x,
+                    y,
+                    terrain,
+                    pixels,
+                } => {
+                    if !reverse {
+                        self.picture_set(pixels, false);
+                        self.slot_shift = Some(SlotShift {
+                            from: 0,
+                            to: *at,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                        self.insert_slot(*at, *x, *y, *terrain);
+                    }
+                    renumbered = true;
+                }
+                MapChange::PictureRemove {
+                    p,
+                    x,
+                    y,
+                    terrain,
+                    original,
+                    name,
+                    gate,
+                    links,
+                    pixels,
+                    fill,
+                    baseline,
+                } => {
+                    if reverse {
+                        self.slot_shift = Some(SlotShift {
+                            from: 0,
+                            to: *p,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                        self.restore_province(
+                            *p, *x, *y, *terrain, name, *gate, links, fill, baseline,
+                        );
+                        if let Some(l) = &mut self.image {
+                            if l.original.len() >= *p as usize {
+                                l.original.insert(*p as usize, *original);
+                            }
+                        }
+                        self.picture_set(pixels, true);
+                    } else {
+                        self.slot_shift = Some(SlotShift {
+                            from: *p,
+                            to: 0,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                        self.picture_set(pixels, false);
+                        self.drop_province(*p, fill, baseline);
+                        if let Some(l) = &mut self.image {
+                            if l.original.len() > *p as usize {
+                                l.original.remove(*p as usize);
+                            }
+                        }
+                    }
+                    renumbered = true;
                 }
                 MapChange::RemoveProvince {
                     p,
@@ -2057,7 +2648,11 @@ impl PlaneDoc {
                         rec.y = v.1;
                     }
                 }
-                MapChange::AddProvince { .. } | MapChange::RemoveProvince { .. } => {}
+                MapChange::AddProvince { .. }
+                | MapChange::RemoveProvince { .. }
+                | MapChange::PictureCapital { .. }
+                | MapChange::PictureAdd { .. }
+                | MapChange::PictureRemove { .. } => {}
             }
         }
         if renumbered {
@@ -2066,14 +2661,26 @@ impl PlaneDoc {
         }
         if reverse {
             for c in e.map.iter().rev() {
-                if let MapChange::AddProvince { p, .. } = c {
-                    self.shrink_province(*p);
+                match c {
+                    MapChange::AddProvince { p, .. } => self.shrink_province(*p),
+                    MapChange::PictureAdd { at, pixels, .. } => {
+                        self.slot_shift = Some(SlotShift {
+                            from: *at,
+                            to: 0,
+                            old_count: self.d6m.provinces.len() as u32,
+                        });
+                        self.remove_slot(*at);
+                        self.picture_set(pixels, true);
+                    }
+                    _ => {}
                 }
             }
-            if e.map
-                .iter()
-                .any(|c| matches!(c, MapChange::AddProvince { .. }))
-            {
+            if e.map.iter().any(|c| {
+                matches!(
+                    c,
+                    MapChange::AddProvince { .. } | MapChange::PictureAdd { .. }
+                )
+            }) {
                 self.rendered.bboxes = province_bboxes(&self.plane());
             }
         }
@@ -2082,7 +2689,7 @@ impl PlaneDoc {
         }
         self.dirty = true;
         self.edited = true;
-        let pixels = !e.heights.is_empty() || !e.owners.is_empty();
+        let pixels = !e.heights.is_empty() || !e.owners.is_empty() || !e.picture.is_empty();
         if full || (pixels && rect.is_none()) {
             Some(Rect::full(self.d6m.width, self.d6m.height))
         } else {
@@ -2165,7 +2772,14 @@ impl PlaneDoc {
         self.rendered = r;
     }
 
+    pub fn is_image(&self) -> bool {
+        self.image.is_some()
+    }
+
     pub fn decor_stale(&self) -> bool {
+        if self.image.is_some() {
+            return false;
+        }
         self.rendered.decor_stale || self.rendered.decor.len() != self.rendered.rgba.len()
     }
 
@@ -2188,15 +2802,28 @@ impl PlaneDoc {
 
     pub fn save(&mut self) -> Result<Vec<PathBuf>, String> {
         let mut written = Vec::new();
-        let bytes = self.d6m.to_bytes();
-        write_replace(&self.d6m_path, &bytes)?;
-        written.push(self.d6m_path.clone());
+        if self.picture_dirty {
+            if let Some(l) = &self.image {
+                write_with_backup(&l.base_path, &l.encode())?;
+                written.push(l.base_path.clone());
+            }
+            self.picture_dirty = false;
+        }
+        if self.image.is_none() {
+            let bytes = self.d6m.to_bytes();
+            write_replace(&self.d6m_path, &bytes)?;
+            written.push(self.d6m_path.clone());
+        }
         if let (Some(m), Some(p)) = (&mut self.map, &self.map_path) {
-            if self.owners_changed && m.has_pb() {
+            if self.owners_changed && (m.has_pb() || self.image.is_some()) {
                 m.replace_pb(self.d6m.width, self.d6m.height, &self.d6m.owners);
             }
             if m.modified {
-                write_replace(p, m.to_text().as_bytes())?;
+                if self.image.is_some() {
+                    write_with_backup(p, m.to_text().as_bytes())?;
+                } else {
+                    write_replace(p, m.to_text().as_bytes())?;
+                }
                 m.modified = false;
                 written.push(p.clone());
             }
@@ -2264,10 +2891,7 @@ impl Project {
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 if iext != "d6m" {
-                    return Err(format!(
-                        "{} uses an image map ({img}); only .d6m recipes carry height data",
-                        path.display()
-                    ));
+                    return Project::open_image(dir, strip_plane_suffix(&stem).0, tex, opts);
                 }
                 base = strip_plane_suffix(&istem).0;
             }
@@ -2303,6 +2927,7 @@ impl Project {
                 Some(map_path),
                 d6m,
                 Some(map),
+                None,
                 tex,
                 opts,
             ));
@@ -2322,6 +2947,130 @@ impl Project {
             notes,
             unsaved: false,
         })
+    }
+
+    fn open_image(
+        dir: PathBuf,
+        base: String,
+        tex: &TexSet,
+        opts: &Options,
+    ) -> Result<Project, String> {
+        let mut planes = Vec::new();
+        let mut notes = Vec::new();
+        for plane in 1..=9u32 {
+            let map_path = dir.join(plane_file_name(&base, plane, "map"));
+            if !crate::io::exists(&map_path) {
+                continue;
+            }
+            let map =
+                MapFile::load(&map_path).map_err(|e| format!("{}: {e}", map_path.display()))?;
+            let img = map
+                .imagefile
+                .clone()
+                .ok_or_else(|| format!("{} has no #imagefile line", map_path.display()))?;
+            let img_path = dir.join(&img);
+            let iext = img_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !crate::io::exists(&img_path) {
+                if crate::io::IS_WEB {
+                    return Err(format!(
+                        "{img} is not open in the browser. Open the map's folder, or pick the .map together with all of its .tga pictures"
+                    ));
+                }
+                return Err(format!("no {img} beside {}", map_path.display()));
+            }
+            if iext == "d6m" {
+                let d6m =
+                    D6m::load(&img_path).map_err(|e| format!("{}: {e}", img_path.display()))?;
+                planes.push(PlaneDoc::build(
+                    plane,
+                    img_path,
+                    Some(map_path),
+                    d6m,
+                    Some(map),
+                    None,
+                    tex,
+                    opts,
+                ));
+                continue;
+            }
+            if iext != "tga" {
+                return Err(format!(
+                    "{img}: only .tga pictures and .d6m recipes can be opened"
+                ));
+            }
+            if let Some(word) = crate::imagemap::name_trap(&img) {
+                notes.push(format!(
+                    "the game cannot find {img}: it strips {word} out of picture names, rename the map's files"
+                ));
+            }
+            let looks = Looks::open(&img_path)?;
+            let capitals = looks.base.white_pixels();
+            if capitals.is_empty() {
+                return Err(format!(
+                    "{img} has no pure white pixels, so it marks no province capitals"
+                ));
+            }
+            let (w, h) = (looks.base.w as i32, looks.base.h as i32);
+            let owners = if map.has_pb() {
+                crate::imagemap::owners_from_runs(w, h, &map.pb_runs())
+            } else {
+                notes.push(format!(
+                    "{} has no #pb lines, province areas are guessed from the capitals",
+                    plane_label_short(plane)
+                ));
+                crate::imagemap::guess_owners(w, h, &capitals, map.hwrap, map.vwrap)
+            };
+            let n = capitals.len();
+            let scale = (0.39 * ((w as f32 * h as f32) / n as f32).sqrt()).clamp(20.0, 100.0);
+            let d6m = D6m {
+                version: 3,
+                width: w,
+                height: h,
+                passthrough: 0,
+                scale_frac: 0,
+                scale_int: scale as i32,
+                provinces: capitals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(x, y))| crate::d6m::Province {
+                        x,
+                        y,
+                        terrain: map.terrain.get(&(i as u32 + 1)).copied().unwrap_or(0),
+                    })
+                    .collect(),
+                heights: vec![0i16; (w * h) as usize],
+                owners,
+                trailing: Vec::new(),
+            };
+            planes.push(PlaneDoc::build(
+                plane,
+                img_path,
+                Some(map_path),
+                d6m,
+                Some(map),
+                Some(looks),
+                tex,
+                opts,
+            ));
+        }
+        if planes.is_empty() {
+            return Err(format!("no {base}.map found in {}", dir.display()));
+        }
+        Ok(Project {
+            dir,
+            base,
+            planes,
+            notes,
+            unsaved: false,
+        })
+    }
+
+    pub fn has_image(&self) -> bool {
+        self.planes.iter().any(PlaneDoc::is_image)
     }
 
     pub fn generator_settings(&self) -> Vec<String> {
@@ -2380,8 +3129,16 @@ impl Project {
         let mut docs = Vec::new();
         for (index, d6m_path, map_path, d6m, mut map) in parsed {
             map.modified = true;
-            let mut doc =
-                PlaneDoc::build(index, d6m_path, Some(map_path), d6m, Some(map), tex, opts);
+            let mut doc = PlaneDoc::build(
+                index,
+                d6m_path,
+                Some(map_path),
+                d6m,
+                Some(map),
+                None,
+                tex,
+                opts,
+            );
             doc.dirty = true;
             docs.push(doc);
         }
@@ -2419,7 +3176,7 @@ impl Project {
 
     pub fn rename(&mut self, base: &str) {
         let base = strip_plane_suffix(base).0;
-        if base.is_empty() || base == self.base {
+        if base.is_empty() || base == self.base || self.has_image() {
             return;
         }
         if self.unsaved {
@@ -2507,6 +3264,7 @@ impl Project {
             Some(map_path),
             d6m,
             Some(map),
+            None,
             tex,
             opts,
         ));
@@ -2526,6 +3284,48 @@ impl Project {
         }
         self.planes.pop();
         Ok(moved)
+    }
+
+    pub fn fix_starts(&mut self, plane: usize) {
+        let Some(s) = self.planes.get_mut(plane).and_then(|d| d.slot_shift.take()) else {
+            return;
+        };
+        if plane == 0 {
+            return;
+        }
+        let lo = self.plane_offset(plane);
+        let hi = lo + s.old_count;
+        let shift = |g: u32| -> Option<u32> {
+            if g <= lo {
+                Some(g)
+            } else if g <= hi {
+                let l = s.local(g - lo);
+                (l != 0).then_some(lo + l)
+            } else {
+                Some((g as i32 + s.delta()) as u32)
+            }
+        };
+        let Some(d) = self.planes.first_mut() else {
+            return;
+        };
+        let Some(m) = &mut d.map else {
+            return;
+        };
+        let spec: Vec<(u32, u32)> = m
+            .specstarts
+            .iter()
+            .filter_map(|&(n, g)| shift(g).map(|g| (n, g)))
+            .collect();
+        let generic: Vec<u32> = m.starts.iter().filter_map(|&g| shift(g)).collect();
+        if spec != m.specstarts {
+            m.set_specstarts(&spec);
+        }
+        if generic != m.starts {
+            m.set_starts(&generic);
+        }
+        if m.modified {
+            d.dirty = true;
+        }
     }
 
     pub fn plane_offset(&self, plane: usize) -> u32 {

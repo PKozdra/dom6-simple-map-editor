@@ -22,6 +22,7 @@ pub struct Plane<'a> {
     pub mountain_lines: &'a [(u32, u32)],
     pub bridges: &'a [(u32, u32)],
     pub cave_plane: bool,
+    pub image: Option<&'a crate::imagemap::Looks>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,6 +36,7 @@ pub struct Options {
     pub winter: bool,
     pub grey_no_start: bool,
     pub border_percent: i32,
+    pub all_looks: bool,
 }
 
 impl Default for Options {
@@ -49,6 +51,7 @@ impl Default for Options {
             winter: false,
             grey_no_start: false,
             border_percent: 100,
+            all_looks: false,
         }
     }
 }
@@ -965,7 +968,11 @@ impl Rendered {
             mask: vec![0u8; n],
             bboxes: province_bboxes(p),
             width: border_width(p.scale, opts.border_percent),
-            decor: vec![0u8; n * 4],
+            decor: if p.image.is_some() {
+                Vec::new()
+            } else {
+                vec![0u8; n * 4]
+            },
             sprites: Vec::new(),
             mountains: Vec::new(),
             touched: Rect::full(p.w, p.h),
@@ -1036,7 +1043,7 @@ impl Rendered {
     }
 
     pub fn refresh_decor(&mut self, p: &Plane, tex: &TexSet, opts: &Options, rect: Rect) {
-        if !opts.decor || rect.is_empty() {
+        if !opts.decor || rect.is_empty() || p.image.is_some() {
             return;
         }
         let inner = rect.expand(self.margin(), p.w, p.h);
@@ -1063,21 +1070,25 @@ impl Rendered {
         let outer = rect.expand(m * 2, p.w, p.h);
         let inner = rect.expand(m, p.w, p.h);
         let full = outer.x0 <= 0 && outer.y0 <= 0 && outer.x1 >= p.w - 1 && outer.y1 >= p.h - 1;
-        let reach = outer.expand((p.scale * 0.05) as i32 + 1, p.w, p.h);
-        for y in reach.y0..=reach.y1 {
-            let row = (y * p.w) as usize;
-            let (a, b) = (row + reach.x0 as usize, row + reach.x1 as usize + 1);
-            for (dst, &src) in self.carved[a..b].iter_mut().zip(&p.heights[a..b]) {
-                *dst = crate::d6m::units_from_stored(src);
+        if let Some(image) = p.image {
+            image.paint(p, inner, opts.winter, opts.all_looks, &mut self.rgba);
+        } else {
+            let reach = outer.expand((p.scale * 0.05) as i32 + 1, p.w, p.h);
+            for y in reach.y0..=reach.y1 {
+                let row = (y * p.w) as usize;
+                let (a, b) = (row + reach.x0 as usize, row + reach.x1 as usize + 1);
+                for (dst, &src) in self.carved[a..b].iter_mut().zip(&p.heights[a..b]) {
+                    *dst = crate::d6m::units_from_stored(src);
+                }
             }
-        }
-        if opts.rivers {
-            let within = if full { None } else { Some(reach) };
-            carve_rivers(p, &mut self.carved, &self.bboxes, within);
-        }
-        self.color(p, tex, inner, opts.winter);
-        if opts.dirt {
-            self.dirtify(p, inner, opts.winter);
+            if opts.rivers {
+                let within = if full { None } else { Some(reach) };
+                carve_rivers(p, &mut self.carved, &self.bboxes, within);
+            }
+            self.color(p, tex, inner, opts.winter);
+            if opts.dirt {
+                self.dirtify(p, inner, opts.winter);
+            }
         }
         for y in inner.y0..=inner.y1 {
             let row = (y * p.w) as usize;
@@ -1092,16 +1103,20 @@ impl Rendered {
             draw_border_rows(p, &self.mask, self.width, 15, inner, &mut self.rgba);
             draw_border_rows(p, &self.mask, self.width, 30, inner, &mut self.rgba);
         }
-        hide_unknown_rows(p, tex, inner, &mut self.rgba);
-        if opts.edge_fade {
-            edge_fade_rows(p, inner, &mut self.rgba);
+        if p.image.is_none() {
+            hide_unknown_rows(p, tex, inner, &mut self.rgba);
+            if opts.edge_fade {
+                edge_fade_rows(p, inner, &mut self.rgba);
+            }
         }
         if opts.grey_no_start {
             grey_no_start_rows(p, inner, &mut self.rgba);
         }
         self.apply_capitals(p, opts.capitals, inner);
         self.touched = inner;
-        if !opts.decor {
+        if p.image.is_some() {
+            self.decor_stale = false;
+        } else if !opts.decor {
             self.decor_stale = true;
         } else if pass != DecorPass::Keep {
             let full = rect.x0 <= 0 && rect.y0 <= 0 && rect.x1 >= p.w - 1 && rect.y1 >= p.h - 1;
