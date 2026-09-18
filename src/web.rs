@@ -37,7 +37,16 @@ extern "C" {
     #[wasm_bindgen(js_name = sourceRoot)]
     fn source_root_js(source: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = listTree)]
-    fn list_tree_js(source: &JsValue, accept: &str, depth: u32) -> js_sys::Promise;
+    fn list_tree_js(
+        source: &JsValue,
+        accept: &str,
+        depth: u32,
+        progress: &Closure<dyn FnMut(JsValue)>,
+    ) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = lastScanStats)]
+    fn last_scan_stats_js() -> JsValue;
+    #[wasm_bindgen(js_name = logInfo)]
+    fn log_info_js(text: &str);
     #[wasm_bindgen(js_name = readFrom)]
     fn read_from_js(source: &JsValue, rel: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name = download)]
@@ -77,6 +86,7 @@ thread_local! {
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
     static SOURCE: RefCell<Option<JsValue>> = const { RefCell::new(None) };
     static TREE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static SCAN: RefCell<Option<String>> = const { RefCell::new(None) };
     static CARDS: RefCell<Vec<(usize, crate::map_chooser::Card)>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -253,6 +263,50 @@ fn tree_maps(tree: &[String]) -> Vec<String> {
         .collect()
 }
 
+struct ScanStats {
+    folders: u32,
+    files: u32,
+    mods: u32,
+    found: u32,
+    ms: f64,
+}
+
+impl ScanStats {
+    fn from(v: &JsValue) -> ScanStats {
+        let num = |k: &str| {
+            Reflect::get(v, &JsValue::from_str(k))
+                .ok()
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0)
+        };
+        ScanStats {
+            folders: num("folders") as u32,
+            files: num("files") as u32,
+            mods: num("mods") as u32,
+            found: num("found") as u32,
+            ms: num("ms"),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let mods = if self.mods > 0 {
+            format!(", skipped {} mod folders", self.mods)
+        } else {
+            String::new()
+        };
+        format!(
+            "scanned {} folders and {} files in {:.1} s{mods}",
+            self.folders,
+            self.files,
+            self.ms / 1000.0
+        )
+    }
+}
+
+pub fn take_scan_summary() -> Option<String> {
+    SCAN.with(|s| s.borrow_mut().take())
+}
+
 fn top_level(tree: &[String]) -> Vec<String> {
     tree.iter().filter(|p| !p.contains('/')).cloned().collect()
 }
@@ -274,7 +328,28 @@ async fn use_source(source: JsValue, ctx: egui::Context) {
             );
         }
     }
-    let tree: Vec<String> = match JsFuture::from(list_tree_js(&source, MAP_FILES, 3)).await {
+    let progress = {
+        let ctx = ctx.clone();
+        let name = name.clone();
+        Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| {
+            let s = ScanStats::from(&v);
+            push(
+                Event::Status(format!(
+                    "Scanning {name}: {} folders, {} files, {} maps so far ({:.1} s)",
+                    s.folders,
+                    s.files,
+                    s.found,
+                    s.ms / 1000.0
+                )),
+                &ctx,
+            );
+        })
+    };
+    let listed = JsFuture::from(list_tree_js(&source, MAP_FILES, 3, &progress)).await;
+    drop(progress);
+    let scan = ScanStats::from(&last_scan_stats_js());
+    SCAN.with(|s| *s.borrow_mut() = Some(scan.summary()));
+    let tree: Vec<String> = match listed {
         Ok(v) => Array::from(&v)
             .iter()
             .filter_map(|n| n.as_string())
@@ -415,14 +490,28 @@ pub fn spawn_cards(
     spawn_local(async move {
         let tex = crate::textures::TexSet::embedded();
         let tree = TREE.with(|t| t.borrow().clone());
+        let started = web_time::Instant::now();
+        let mut slowest = (0.0f64, String::new());
+        let total = rels.len();
         for (index, rel) in rels.into_iter().enumerate() {
             if cancel.get() {
                 return;
             }
+            let one = web_time::Instant::now();
             let card = card_for(&rel, &tree, &tex).await;
+            let took = one.elapsed().as_secs_f64();
+            if took > slowest.0 {
+                slowest = (took, rel.clone());
+            }
             CARDS.with(|c| c.borrow_mut().push((index, card)));
             ctx.request_repaint();
         }
+        log_info_js(&format!(
+            "previews: {total} maps in {:.1} s, slowest {} ({:.2} s)",
+            started.elapsed().as_secs_f64(),
+            slowest.1,
+            slowest.0
+        ));
     });
 }
 

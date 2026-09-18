@@ -1747,6 +1747,9 @@ impl App {
                 Event::Chooser(folder, rels) => {
                     self.error = None;
                     self.status = format!("{} maps in {folder}, choose one", rels.len());
+                    if let Some(scan) = crate::web::take_scan_summary() {
+                        self.status = format!("{}; {scan}", self.status);
+                    }
                     self.chooser = Some(crate::map_chooser::MapChooser::web(
                         &self.ctx, &folder, rels,
                     ));

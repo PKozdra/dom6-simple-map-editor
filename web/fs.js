@@ -106,39 +106,126 @@ export function sourceRoot(source) {
   return source && source.kind === "handle" ? source.root : null;
 }
 
-async function walkTree(dir, prefix, exts, depth, out) {
-  for await (const [name, entry] of dir.entries()) {
-    const path = prefix ? prefix + "/" + name : name;
-    if (entry.kind === "file") {
-      if (exts.some((e) => name.toLowerCase().endsWith(e))) {
-        out.push(path);
-      }
-    } else if (depth > 0) {
-      await walkTree(entry, path, exts, depth - 1, out);
-    }
-  }
+let scanStats = { folders: 0, files: 0, mods: 0, found: 0, ms: 0 };
+
+export function lastScanStats() {
+  return scanStats;
 }
 
-export async function listTree(source, accept, depth) {
+export function logInfo(text) {
+  console.info(text);
+}
+
+function isModFolder(names) {
+  let dm = false;
+  for (const n of names) {
+    const l = n.toLowerCase();
+    if (l.endsWith(".map") || l.endsWith(".d6m")) {
+      return false;
+    }
+    if (l.endsWith(".dm")) {
+      dm = true;
+    }
+  }
+  return dm;
+}
+
+async function walkParallel(root, exts, depth, out, stats, tick) {
+  const queue = [{ dir: root, prefix: "", depth }];
+  let active = 0;
+  return new Promise((resolve, reject) => {
+    const next = () => {
+      if (!queue.length && active === 0) {
+        resolve();
+        return;
+      }
+      while (queue.length && active < 16) {
+        const job = queue.shift();
+        active += 1;
+        visit(job)
+          .then(() => {
+            active -= 1;
+            next();
+          })
+          .catch(reject);
+      }
+    };
+    const visit = async ({ dir, prefix, depth }) => {
+      const files = [];
+      const dirs = [];
+      for await (const [name, entry] of dir.entries()) {
+        if (entry.kind === "file") {
+          files.push(name);
+        } else {
+          dirs.push([name, entry]);
+        }
+      }
+      stats.folders += 1;
+      stats.files += files.length;
+      for (const name of files) {
+        if (exts.some((e) => name.toLowerCase().endsWith(e))) {
+          out.push(prefix ? prefix + "/" + name : name);
+          if (name.toLowerCase().endsWith(".map")) {
+            stats.found += 1;
+          }
+        }
+      }
+      if (depth > 0 && dirs.length) {
+        if (isModFolder(files)) {
+          stats.mods += 1;
+        } else {
+          for (const [name, entry] of dirs) {
+            queue.push({ dir: entry, prefix: prefix ? prefix + "/" + name : name, depth: depth - 1 });
+          }
+        }
+      }
+      tick();
+    };
+    next();
+  });
+}
+
+export async function listTree(source, accept, depth, progress) {
   const exts = extensions(accept);
   const out = [];
+  const started = performance.now();
+  const stats = { folders: 0, files: 0, mods: 0, found: 0, ms: 0 };
+  scanStats = stats;
   if (!source) {
     return out;
   }
+  let last = 0;
+  const tick = () => {
+    const now = performance.now();
+    if (progress && now - last > 150) {
+      last = now;
+      stats.ms = now - started;
+      progress(stats);
+    }
+  };
   if (source.kind === "handle") {
     try {
-      await walkTree(source.root, "", exts, depth, out);
+      await walkParallel(source.root, exts, depth, out, stats, tick);
     } catch (e) {
+      stats.ms = performance.now() - started;
       return out;
     }
   } else {
     for (const rel of source.files.keys()) {
+      stats.files += 1;
       if (rel.split("/").length <= depth + 1 && exts.some((e) => rel.toLowerCase().endsWith(e))) {
         out.push(rel);
+        if (rel.toLowerCase().endsWith(".map")) {
+          stats.found += 1;
+        }
       }
     }
   }
   out.sort();
+  stats.ms = performance.now() - started;
+  console.info(
+    `scan ${source.name}: ${stats.folders} folders, ${stats.files} files, ${stats.found} .map, ${stats.mods} mod folders skipped, ${stats.ms.toFixed(0)} ms`,
+  );
   return out;
 }
 
