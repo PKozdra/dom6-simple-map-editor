@@ -6,3 +6,4 @@ release = true
 
 [serve]
 port = 8790
+headers = { "Cache-Control" = "no-store" }

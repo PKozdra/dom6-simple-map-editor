@@ -106,7 +106,7 @@ export function sourceRoot(source) {
   return source && source.kind === "handle" ? source.root : null;
 }
 
-let scanStats = { folders: 0, files: 0, mods: 0, found: 0, ms: 0 };
+let scanStats = { folders: 0, files: 0, mods: 0, found: 0, skipped: 0, ms: 0, error: "" };
 
 export function lastScanStats() {
   return scanStats;
@@ -143,6 +143,16 @@ async function walkParallel(root, exts, depth, out, stats, tick) {
         const job = queue.shift();
         active += 1;
         visit(job)
+          .catch((e) => {
+            if (!job.prefix) {
+              throw e;
+            }
+            stats.skipped += 1;
+            if (!stats.error) {
+              stats.error = `${job.prefix}: ${e && e.message ? e.message : e}`;
+            }
+            console.warn(`scan skipped ${job.prefix}: ${e && e.message ? e.message : e}`);
+          })
           .then(() => {
             active -= 1;
             next();
@@ -189,7 +199,7 @@ export async function listTree(source, accept, depth, progress) {
   const exts = extensions(accept);
   const out = [];
   const started = performance.now();
-  const stats = { folders: 0, files: 0, mods: 0, found: 0, ms: 0 };
+  const stats = { folders: 0, files: 0, mods: 0, found: 0, skipped: 0, ms: 0, error: "" };
   scanStats = stats;
   if (!source) {
     return out;
@@ -208,7 +218,7 @@ export async function listTree(source, accept, depth, progress) {
       await walkParallel(source.root, exts, depth, out, stats, tick);
     } catch (e) {
       stats.ms = performance.now() - started;
-      return out;
+      throw new Error(`cannot read ${source.name}: ${e && e.message ? e.message : e}`);
     }
   } else {
     for (const rel of source.files.keys()) {
@@ -224,7 +234,7 @@ export async function listTree(source, accept, depth, progress) {
   out.sort();
   stats.ms = performance.now() - started;
   console.info(
-    `scan ${source.name}: ${stats.folders} folders, ${stats.files} files, ${stats.found} .map, ${stats.mods} mod folders skipped, ${stats.ms.toFixed(0)} ms`,
+    `scan ${source.name}: ${stats.folders} folders, ${stats.files} files, ${stats.found} .map, ${stats.mods} mod folders skipped, ${stats.skipped} unreadable, ${stats.ms.toFixed(0)} ms`,
   );
   return out;
 }

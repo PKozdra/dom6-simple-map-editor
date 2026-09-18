@@ -268,7 +268,9 @@ struct ScanStats {
     files: u32,
     mods: u32,
     found: u32,
+    skipped: u32,
     ms: f64,
+    error: String,
 }
 
 impl ScanStats {
@@ -284,7 +286,12 @@ impl ScanStats {
             files: num("files") as u32,
             mods: num("mods") as u32,
             found: num("found") as u32,
+            skipped: num("skipped") as u32,
             ms: num("ms"),
+            error: Reflect::get(v, &JsValue::from_str("error"))
+                .ok()
+                .and_then(|x| x.as_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -294,8 +301,16 @@ impl ScanStats {
         } else {
             String::new()
         };
+        let skipped = if self.skipped > 0 {
+            format!(
+                ", {} folders could not be read (first: {})",
+                self.skipped, self.error
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "scanned {} folders and {} files in {:.1} s{mods}",
+            "scanned {} folders and {} files in {:.1} s{mods}{skipped}",
             self.folders,
             self.files,
             self.ms / 1000.0
@@ -348,7 +363,8 @@ async fn use_source(source: JsValue, ctx: egui::Context) {
     let listed = JsFuture::from(list_tree_js(&source, MAP_FILES, 3, &progress)).await;
     drop(progress);
     let scan = ScanStats::from(&last_scan_stats_js());
-    SCAN.with(|s| *s.borrow_mut() = Some(scan.summary()));
+    let summary = scan.summary();
+    SCAN.with(|s| *s.borrow_mut() = Some(summary.clone()));
     let tree: Vec<String> = match listed {
         Ok(v) => Array::from(&v)
             .iter()
@@ -367,7 +383,7 @@ async fn use_source(source: JsValue, ctx: egui::Context) {
     match maps.len() {
         0 => push(
             Event::Error(format!(
-                "{name} holds no map: a map is a .map file with its .d6m or .tga beside it"
+                "{name} holds no map: a map is a .map file with its .d6m or .tga beside it ({summary})"
             )),
             &ctx,
         ),
